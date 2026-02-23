@@ -3,7 +3,7 @@ import sys
 import time
 from pathlib import Path
 
-from transcribe.core import save_json, save_txt, transcribe_video
+from transcribe.core import save_txt, transcribe_video
 
 
 def main():
@@ -26,12 +26,6 @@ def main():
         "--output-dir",
         default=None,
         help="Output directory (default: same as video file)",
-    )
-    parser.add_argument(
-        "--format",
-        default="all",
-        choices=["txt", "json", "all"],
-        help="Output format (default: all)",
     )
     args = parser.parse_args()
 
@@ -60,16 +54,8 @@ def main():
     print(f"Segments: {len(result['segments'])}")
     print(f"Time: {elapsed:.1f}s")
 
-    saved = []
-    if args.format in ("txt", "all"):
-        path = save_txt(result, output_dir / f"{stem}.txt")
-        saved.append(str(path))
-    if args.format in ("json", "all"):
-        path = save_json(result, output_dir / f"{stem}.json")
-        saved.append(str(path))
-
-    for p in saved:
-        print(f"Saved: {p}")
+    path = save_txt(result, output_dir / f"{stem}.txt")
+    print(f"Saved: {path}")
 
 
 if __name__ == "__main__":

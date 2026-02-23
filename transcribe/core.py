@@ -1,4 +1,3 @@
-import json
 import shutil
 import subprocess
 import time
@@ -187,14 +186,4 @@ def save_txt(result: dict, output_path: str | Path) -> Path:
     """Save transcription as plain text."""
     output_path = Path(output_path)
     output_path.write_text(result["text"], encoding="utf-8")
-    return output_path
-
-
-def save_json(result: dict, output_path: str | Path) -> Path:
-    """Save transcription as JSON with segment timestamps."""
-    output_path = Path(output_path)
-    output_path.write_text(
-        json.dumps(result, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
     return output_path

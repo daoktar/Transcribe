@@ -1,4 +1,3 @@
-import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +9,6 @@ from transcribe.core import (
     _detect_language,
     _format_eta,
     _get_media_duration,
-    save_json,
     save_txt,
     transcribe_video,
 )
@@ -106,7 +104,7 @@ class TestDetectLanguage:
 
 
 # ---------------------------------------------------------------------------
-# save_txt / save_json
+# save_txt
 # ---------------------------------------------------------------------------
 
 class TestSaveTxt:
@@ -122,26 +120,6 @@ class TestSaveTxt:
 
     def test_returns_path_object(self, tmp_path, sample_result):
         out = save_txt(sample_result, str(tmp_path / "out.txt"))
-        assert isinstance(out, Path)
-
-
-class TestSaveJson:
-    def test_writes_valid_json(self, tmp_path, sample_result):
-        out = save_json(sample_result, tmp_path / "out.json")
-        assert out.exists()
-        data = json.loads(out.read_text(encoding="utf-8"))
-        assert data["language"] == "en"
-        assert len(data["segments"]) == 2
-        assert data["segments"][0]["start"] == 0.0
-
-    def test_unicode_content(self, tmp_path):
-        result = {"text": "Привет мир", "segments": [], "language": "ru"}
-        out = save_json(result, tmp_path / "out.json")
-        data = json.loads(out.read_text(encoding="utf-8"))
-        assert data["text"] == "Привет мир"
-
-    def test_returns_path_object(self, tmp_path, sample_result):
-        out = save_json(sample_result, str(tmp_path / "out.json"))
         assert isinstance(out, Path)
 
 

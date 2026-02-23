@@ -6,7 +6,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from transcribe.core import save_json, save_txt, transcribe_video
+from transcribe.core import save_txt, transcribe_video
 
 MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
 
@@ -69,8 +69,8 @@ def run_transcription(video_file, model_size, language):
         if item is None:
             break
         fraction, message = item
-        # Yield: transcript, txt_file, json_file, info, progress_bar
-        yield gr.update(), gr.update(), gr.update(), gr.update(), _render_progress(fraction, message)
+        # Yield: transcript, txt_file, info, progress_bar
+        yield gr.update(), gr.update(), gr.update(), _render_progress(fraction, message)
 
     thread.join()
 
@@ -82,12 +82,11 @@ def run_transcription(video_file, model_size, language):
     stem = Path(video_file).stem
 
     txt_path = save_txt(result, tmp_path / f"{stem}.txt")
-    json_path = save_json(result, tmp_path / f"{stem}.json")
 
     info = f"Language: {result['language']} | Segments: {len(result['segments'])}"
 
     # Final yield — populate results and clear progress bar
-    yield result["text"], str(txt_path), str(json_path), info, ""
+    yield result["text"], str(txt_path), info, ""
 
 
 def create_app():
@@ -117,12 +116,11 @@ def create_app():
                     interactive=False,
                 )
                 txt_download = gr.File(label="Download TXT")
-                json_download = gr.File(label="Download JSON")
 
         transcribe_btn.click(
             fn=run_transcription,
             inputs=[video_input, model_dropdown, language_input],
-            outputs=[transcript_output, txt_download, json_download, info_text, progress_bar],
+            outputs=[transcript_output, txt_download, info_text, progress_bar],
         )
 
     return app

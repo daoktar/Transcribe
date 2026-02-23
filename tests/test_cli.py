@@ -31,15 +31,8 @@ class TestCliArgParsing:
                 main()
             assert exc_info.value.code == 2
 
-    def test_invalid_format_exits(self):
-        """CLI should reject invalid format names."""
-        with patch("sys.argv", ["cli", "video.mp4", "--format", "srt"]):
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-            assert exc_info.value.code == 2
-
     def test_successful_transcription(self, tmp_path, capsys):
-        """CLI should call transcribe_video and save files."""
+        """CLI should call transcribe_video and save a .txt file."""
         video = tmp_path / "video.mp4"
         video.touch()
 
@@ -58,51 +51,9 @@ class TestCliArgParsing:
         captured = capsys.readouterr()
         assert "Detected language: en" in captured.out
         assert "Segments: 1" in captured.out
-        assert "Saved:" in captured.out
-
-    def test_txt_only_format(self, tmp_path, capsys):
-        """--format txt should only save .txt file."""
-        video = tmp_path / "video.mp4"
-        video.touch()
-
-        fake_result = {
-            "text": "Test.",
-            "segments": [{"start": 0.0, "end": 1.0, "text": "Test."}],
-            "language": "en",
-        }
-
-        with patch("sys.argv", [
-            "cli", str(video), "--model", "tiny", "--language", "en", "--format", "txt",
-        ]):
-            with patch("transcribe.cli.transcribe_video", return_value=fake_result):
-                main()
-
-        captured = capsys.readouterr()
         saved_lines = [l for l in captured.out.splitlines() if l.startswith("Saved:")]
         assert len(saved_lines) == 1
         assert saved_lines[0].endswith(".txt")
-
-    def test_json_only_format(self, tmp_path, capsys):
-        """--format json should only save .json file."""
-        video = tmp_path / "video.mp4"
-        video.touch()
-
-        fake_result = {
-            "text": "Test.",
-            "segments": [{"start": 0.0, "end": 1.0, "text": "Test."}],
-            "language": "en",
-        }
-
-        with patch("sys.argv", [
-            "cli", str(video), "--model", "tiny", "--language", "en", "--format", "json",
-        ]):
-            with patch("transcribe.cli.transcribe_video", return_value=fake_result):
-                main()
-
-        captured = capsys.readouterr()
-        saved_lines = [l for l in captured.out.splitlines() if l.startswith("Saved:")]
-        assert len(saved_lines) == 1
-        assert saved_lines[0].endswith(".json")
 
     def test_custom_output_dir(self, tmp_path, capsys):
         """--output-dir should save files to the specified directory."""

@@ -26,8 +26,8 @@ python -m transcribe.cli video.mp4
 # Specify model and language
 python -m transcribe.cli video.mp4 --model base --language en
 
-# Output only JSON to a specific directory
-python -m transcribe.cli video.mp4 --format json --output-dir ./output
+# Output to a specific directory
+python -m transcribe.cli video.mp4 --output-dir ./output
 ```
 
 ### Web UI
@@ -41,4 +41,3 @@ Opens a Gradio interface at `http://localhost:7860` with drag-and-drop video upl
 ## Output Formats
 
 - **TXT** — Plain text transcript
-- **JSON** — Full transcript with per-segment timestamps (`start`, `end`, `text`) and detected language
