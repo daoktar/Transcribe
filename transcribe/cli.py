@@ -8,7 +8,7 @@ from transcribe.core import save_json, save_txt, transcribe_video
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transcribe video files using faster-whisper.",
+        description="Transcribe video files using whisper.cpp.",
     )
     parser.add_argument("video", help="Path to the video file")
     parser.add_argument(

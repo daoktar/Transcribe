@@ -1,11 +1,13 @@
 # Transcribe
 
-Video transcription tool using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). Supports CLI and web UI.
+Video transcription tool using [whisper.cpp](https://github.com/ggml-org/whisper.cpp) via [pywhispercpp](https://github.com/absadiki/pywhispercpp). Supports CLI and web UI.
+
+Automatically uses **Metal GPU acceleration** on Apple Silicon Macs for fast local transcription.
 
 ## Prerequisites
 
 - Python 3.10+
-- [ffmpeg](https://ffmpeg.org/) installed and on PATH
+- [ffmpeg](https://ffmpeg.org/) installed and on PATH (`brew install ffmpeg`)
 
 ## Install
 

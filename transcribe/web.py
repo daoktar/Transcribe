@@ -42,7 +42,7 @@ def run_transcription(video_file, model_size, language, progress=gr.Progress()):
 
 def create_app():
     with gr.Blocks(title="Video Transcriber") as app:
-        gr.Markdown("# Video Transcriber\nUpload a video file to transcribe using faster-whisper.")
+        gr.Markdown("# Video Transcriber\nUpload a video file to transcribe using whisper.cpp.")
 
         with gr.Row():
             with gr.Column():
