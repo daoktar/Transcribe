@@ -1,20 +1,18 @@
 # Transcribe
 
-Local video/audio transcription powered by [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Runs entirely on your machine — no API keys, no cloud, no data leaves your computer.
+Local video/audio transcription powered by [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
 
-Includes a **CLI** and a **web UI** (Gradio). Automatically uses **Metal GPU acceleration** on Apple Silicon Macs.
+- Runs on your machine (no cloud API required)
+- CLI and web UI (Gradio)
+- Speech-region detection (WebRTC VAD) to reduce silence/music hallucinations
+- Apple Silicon acceleration via Metal (when available)
 
-## Features
+## Quick Start
 
-- **Voice Activity Detection (VAD)** — Preprocesses audio with WebRTC VAD to detect speech regions before transcription, eliminating hallucinated/repeated text on silence and music sections
-- **Real-time progress** — ETA, model loading time, and per-chunk transcription status
-- **Auto language detection** — Detects the spoken language automatically, or specify it manually
-- **Multiple model sizes** — From `tiny` (fast, lower quality) to `large-v3` (slow, best quality)
+### 1. Install prerequisites
 
-## Prerequisites
-
-- **Python 3.10+**
-- **ffmpeg** installed and available on PATH
+- Python 3.10+
+- `ffmpeg` on your `PATH`
 
 ```bash
 # macOS
@@ -23,101 +21,90 @@ brew install ffmpeg
 # Ubuntu / Debian
 sudo apt install ffmpeg
 
-# Windows (via Chocolatey)
+# Windows (Chocolatey)
 choco install ffmpeg
 ```
 
-## Installation
+### 2. Install project
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/Transcribe.git
 cd Transcribe
 
 python -m venv .venv
-source .venv/bin/activate   # macOS / Linux
-# .venv\Scripts\activate    # Windows
+source .venv/bin/activate      # macOS/Linux
+# .venv\Scripts\activate      # Windows PowerShell
 
 pip install -r requirements.txt
 ```
 
-## Usage
-
-### CLI
+### 3. Run transcription
 
 ```bash
-# Transcribe with defaults (large-v3 model, auto-detect language)
-python -m transcribe.cli video.mp4
-
-# Specify model and language
-python -m transcribe.cli video.mp4 --model base --language en
-
-# Output to a specific directory
-python -m transcribe.cli video.mp4 --output-dir ./output
+python -m transcribe.cli /path/to/video.mp4
 ```
 
-Output is saved as a `.txt` file next to the video (or in `--output-dir`).
+Output is a `.txt` transcript saved next to the input file (or in `--output-dir` if provided).
 
-### Web UI
+## CLI Usage
+
+```bash
+# Default model (large-v3), auto language detect
+python -m transcribe.cli video.mp4
+
+# Faster model + fixed language
+python -m transcribe.cli video.mp4 --model base --language en
+
+# Write output to a specific directory
+python -m transcribe.cli video.mp4 --output-dir ./outputs
+```
+
+Available models: `tiny`, `base`, `small`, `medium`, `large-v3`.
+
+## Web UI Usage
 
 ```bash
 python -m transcribe.web
 ```
 
-Opens a Gradio interface at [http://localhost:7860](http://localhost:7860) with:
-- Drag-and-drop video upload
-- Model and language selection
-- Live progress bar with ETA
-- Downloadable transcript file
+Open [http://127.0.0.1:7860](http://127.0.0.1:7860).
+
+Security default: the web app is bound to `127.0.0.1` with `share=False`, so it is local-only unless you explicitly change code/settings.
 
 ## How It Works
 
-```
-Video file
-  │
-  ├─ ffmpeg ──► Extract 16kHz mono audio
-  │
-  ├─ WebRTC VAD ──► Detect speech regions (skip silence/music)
-  │
-  ├─ whisper.cpp ──► Transcribe each speech region
-  │
-  └─ Post-processing ──► Deduplicate, merge, output text
-```
+1. `ffmpeg` extracts 16 kHz mono PCM audio.
+2. WebRTC VAD finds speech regions.
+3. whisper.cpp transcribes only speech chunks.
+4. Post-processing deduplicates repeated hallucinated segments.
 
-1. **Audio extraction** — ffmpeg converts the video to 16kHz mono PCM
-2. **VAD preprocessing** — WebRTC VAD detects where speech actually is, merges nearby regions into ~30s chunks, and filters noise
-3. **Transcription** — Only speech chunks are sent to whisper.cpp (via pywhispercpp), preventing hallucination on silent sections
-4. **Post-processing** — A deduplication filter removes any remaining repeated segments
+## Privacy and Security
 
-## Model Sizes
+- No external transcription API keys are required.
+- Media is processed locally.
+- See [SECURITY.md](SECURITY.md) for vulnerability reporting and hardening guidance.
 
-| Model | Size | Speed | Quality | Use case |
-|-------|------|-------|---------|----------|
-| `tiny` | ~75 MB | Fastest | Low | Quick drafts, testing |
-| `base` | ~142 MB | Fast | Fair | Short clips |
-| `small` | ~466 MB | Medium | Good | General use |
-| `medium` | ~1.5 GB | Slow | Great | Longer content |
-| `large-v3` | ~3 GB | Slowest | Best | Final transcriptions |
+Important: this project depends on external binaries/libraries (`ffmpeg`, whisper runtime). Keep your OS packages and Python dependencies up to date.
 
-Models are downloaded automatically on first use.
+## What Is Ignored In Git
 
-## Project Structure
+The repository is configured to avoid committing local/user artifacts:
 
-```
-transcribe/
-  core.py    # Transcription engine (VAD + whisper.cpp + post-processing)
-  cli.py     # Command-line interface
-  web.py     # Gradio web UI
-tests/
-  test_core.py   # Unit and integration tests
-  test_cli.py    # CLI argument parsing tests
-```
+- Media files (`*.mp4`, `*.wav`, etc.)
+- Transcript outputs (`*.txt`, `*.srt`, `*.vtt`)
+- Working/cache dirs (`output/`, `outputs/`, `data/`, `tmp/`, `cache/`, etc.)
+- Local secrets (`.env*`, key/cert files)
 
-## Running Tests
+If you need to version a specific artifact for docs/tests, add an explicit exception rule in `.gitignore`.
+
+## Development
+
+Run tests:
 
 ```bash
-pytest tests/ -v
+pytest -v
 ```
 
 ## License
 
-MIT
+MIT (see [LICENSE](LICENSE))

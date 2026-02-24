@@ -6,6 +6,7 @@ __pycache__/
 dist/
 build/
 *.egg
+pip-wheel-metadata/
 
 # Virtual environment
 .venv/
@@ -26,8 +27,32 @@ env/
 
 # Testing / Coverage
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.cache/
 .coverage
+.coverage.*
 htmlcov/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+
+# Secrets and local credentials
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
 
 # Media files (videos, audio)
 *.mp4
@@ -43,14 +68,27 @@ htmlcov/
 # Transcription output
 *.txt
 !requirements.txt
+*.srt
+*.vtt
 
 # Whisper models (downloaded at runtime)
 *.bin
 ggml-*.bin
+*.gguf
+models/
 
-# Temp files
-*.tmp
-*.bak
+# Cache / working directories
+output/
+outputs/
+transcripts/
+data/
+uploads/
+downloads/
+tmp/
+temp/
+work/
+workspace/
+cache/
 
 # Claude Code local settings (contains machine-specific paths)
 .claude/

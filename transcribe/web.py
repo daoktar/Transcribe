@@ -128,7 +128,8 @@ def create_app():
 
 def main():
     app = create_app()
-    app.launch()
+    # Force local-only hosting by default for safer operation.
+    app.launch(server_name="127.0.0.1", share=False)
 
 
 if __name__ == "__main__":
