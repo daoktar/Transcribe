@@ -20,6 +20,9 @@ pip install -r requirements.txt
 ### CLI
 
 ```bash
+# activate env
+source .venv/bin/activate
+
 # Transcribe with defaults (large-v3 model, auto-detect language, output TXT + JSON)
 python -m transcribe.cli video.mp4
 

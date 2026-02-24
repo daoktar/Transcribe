@@ -1,10 +1,15 @@
+import collections
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
+import webrtcvad
 from pywhispercpp.model import Model
+
+SAMPLE_RATE = 16000
 
 
 def _format_eta(seconds: float) -> str:
@@ -53,6 +58,238 @@ def _detect_language(model: Model, media_path: str) -> tuple[str, str | None]:
         return "unknown", f"Language detection failed: {type(exc).__name__}: {exc}"
 
 
+def _deduplicate_segments(segments: list[dict], max_repeats: int = 2) -> list[dict]:
+    """Remove consecutive duplicate segments caused by whisper hallucination.
+
+    When whisper encounters silence, music, or unclear audio it often
+    hallucinates by repeating the same phrase over and over.  This function
+    keeps at most *max_repeats* consecutive segments with identical text and
+    drops the rest.
+
+    Args:
+        segments: List of segment dicts with at least a ``text`` key.
+        max_repeats: Maximum allowed identical consecutive segments.
+
+    Returns:
+        Filtered list of segments.
+    """
+    if not segments:
+        return segments
+
+    deduped: list[dict] = [segments[0]]
+    repeat_count = 1
+
+    for seg in segments[1:]:
+        if seg["text"] == deduped[-1]["text"]:
+            repeat_count += 1
+            if repeat_count <= max_repeats:
+                deduped.append(seg)
+            # else: drop this duplicate
+        else:
+            repeat_count = 1
+            deduped.append(seg)
+
+    return deduped
+
+
+# ---------------------------------------------------------------------------
+# VAD (Voice Activity Detection) preprocessing
+# ---------------------------------------------------------------------------
+
+def _extract_audio_pcm(file_path: str) -> np.ndarray:
+    """Extract audio from a media file as a 16 kHz float32 mono numpy array.
+
+    Uses ffmpeg to decode the media file and pipe raw PCM to stdout,
+    then converts to the float32 format expected by pywhispercpp.
+
+    Args:
+        file_path: Path to the media file (video or audio).
+
+    Returns:
+        numpy array of float32 samples at 16 kHz, normalized to [-1, 1].
+
+    Raises:
+        RuntimeError: If ffmpeg fails to extract audio.
+    """
+    result = subprocess.run(
+        [
+            "ffmpeg", "-i", str(file_path),
+            "-vn",                    # no video
+            "-acodec", "pcm_s16le",   # 16-bit signed little-endian PCM
+            "-ar", str(SAMPLE_RATE),  # 16 kHz
+            "-ac", "1",               # mono
+            "-f", "s16le",            # raw PCM format (no container header)
+            "pipe:1",                 # pipe to stdout
+        ],
+        capture_output=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed to extract audio (exit code {result.returncode}): "
+            f"{result.stderr[:500]}"
+        )
+    if not result.stdout:
+        return np.array([], dtype=np.float32)
+
+    audio_int16 = np.frombuffer(result.stdout, dtype=np.int16)
+    return audio_int16.astype(np.float32) / 32768.0
+
+
+def _detect_speech_regions(
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    aggressiveness: int = 2,
+    frame_duration_ms: int = 30,
+    padding_duration_ms: int = 300,
+) -> list[tuple[float, float]]:
+    """Detect speech regions in audio using WebRTC VAD.
+
+    Processes audio frame-by-frame through the VAD and uses a ring-buffer
+    state machine to group per-frame detections into contiguous speech
+    regions with start/end timestamps.
+
+    Args:
+        audio: Float32 numpy array at the given sample_rate.
+        sample_rate: Audio sample rate in Hz (must be 8000, 16000, 32000, or 48000).
+        aggressiveness: VAD aggressiveness mode (0–3). Higher = more aggressive
+            filtering of non-speech. 2 is recommended for transcription.
+        frame_duration_ms: Frame size in milliseconds (10, 20, or 30).
+        padding_duration_ms: Ring-buffer window size in ms for smoothing
+            speech/silence transitions.
+
+    Returns:
+        List of (start_seconds, end_seconds) tuples for each speech region.
+        Returns empty list if no speech is detected.
+    """
+    if len(audio) == 0:
+        return []
+
+    # Convert float32 → int16 PCM bytes for webrtcvad
+    pcm_bytes = (audio * 32767).astype(np.int16).tobytes()
+
+    vad = webrtcvad.Vad(aggressiveness)
+
+    # Frame parameters
+    frame_samples = int(sample_rate * frame_duration_ms / 1000)  # 480 for 30ms@16kHz
+    frame_bytes = frame_samples * 2  # 16-bit = 2 bytes per sample
+    frame_duration_s = frame_duration_ms / 1000.0
+
+    # Ring buffer for smoothing transitions
+    num_padding_frames = int(padding_duration_ms / frame_duration_ms)
+    ring_buffer = collections.deque(maxlen=num_padding_frames)
+
+    triggered = False
+    speech_regions: list[tuple[float, float]] = []
+    region_start = 0.0
+
+    offset = 0
+    frame_index = 0
+
+    while offset + frame_bytes <= len(pcm_bytes):
+        frame = pcm_bytes[offset:offset + frame_bytes]
+        is_speech = vad.is_speech(frame, sample_rate)
+        timestamp = frame_index * frame_duration_s
+
+        if not triggered:
+            ring_buffer.append((timestamp, is_speech))
+            num_voiced = sum(1 for _, s in ring_buffer if s)
+            if num_voiced > 0.9 * ring_buffer.maxlen:
+                triggered = True
+                # Region starts at the beginning of the ring buffer window
+                region_start = ring_buffer[0][0]
+                ring_buffer.clear()
+        else:
+            ring_buffer.append((timestamp, is_speech))
+            num_unvoiced = sum(1 for _, s in ring_buffer if not s)
+            if num_unvoiced > 0.9 * ring_buffer.maxlen:
+                triggered = False
+                # Region ends at current position
+                region_end = timestamp + frame_duration_s
+                speech_regions.append((region_start, region_end))
+                ring_buffer.clear()
+
+        offset += frame_bytes
+        frame_index += 1
+
+    # Close any open region at end of audio
+    if triggered:
+        region_end = frame_index * frame_duration_s
+        speech_regions.append((region_start, region_end))
+
+    return speech_regions
+
+
+def _merge_speech_regions(
+    regions: list[tuple[float, float]],
+    max_gap: float = 5.0,
+    max_segment: float = 30.0,
+    padding: float = 0.5,
+    min_duration: float = 1.0,
+    total_duration: float | None = None,
+) -> list[tuple[float, float]]:
+    """Merge adjacent speech regions into Whisper-friendly chunks.
+
+    Combines regions that are close together, applies padding, filters
+    very short regions, and splits overly long regions.
+
+    Args:
+        regions: List of (start, end) speech region timestamps in seconds.
+        max_gap: Maximum gap in seconds between regions to merge them.
+        max_segment: Maximum segment duration in seconds (Whisper works
+            best with <=30s chunks).
+        padding: Padding in seconds to add before/after each region.
+        min_duration: Minimum region duration in seconds. Shorter regions
+            are filtered out (likely noise, not meaningful speech).
+        total_duration: Total audio duration for clamping padding.
+
+    Returns:
+        List of merged (start, end) tuples.
+    """
+    if not regions:
+        return []
+
+    # Filter out very short regions (noise, not speech)
+    filtered = [(s, e) for s, e in regions if (e - s) >= min_duration]
+    if not filtered:
+        return []
+
+    # Sort by start time
+    filtered.sort(key=lambda r: r[0])
+
+    # Merge regions separated by less than max_gap
+    merged: list[list[float]] = [list(filtered[0])]
+    for start, end in filtered[1:]:
+        prev_start, prev_end = merged[-1]
+        if start - prev_end <= max_gap:
+            merged[-1][1] = max(prev_end, end)
+        else:
+            merged.append([start, end])
+
+    # Split any region longer than max_segment
+    split: list[tuple[float, float]] = []
+    for start, end in merged:
+        while (end - start) > max_segment:
+            split.append((start, start + max_segment))
+            start += max_segment
+        split.append((start, end))
+
+    # Apply padding (clamped to valid range)
+    padded: list[tuple[float, float]] = []
+    for start, end in split:
+        padded_start = max(0.0, start - padding)
+        padded_end = end + padding
+        if total_duration is not None:
+            padded_end = min(padded_end, total_duration)
+        padded.append((padded_start, padded_end))
+
+    return padded
+
+
+# ---------------------------------------------------------------------------
+# Main transcription function
+# ---------------------------------------------------------------------------
+
 def transcribe_video(
     video_path: str,
     model_size: str = "large-v3",
@@ -61,6 +298,9 @@ def transcribe_video(
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict:
     """Transcribe a video file using whisper.cpp via pywhispercpp.
+
+    Uses WebRTC VAD to detect speech regions first, then transcribes only
+    those regions to avoid hallucination on silence/music/noise sections.
 
     Args:
         video_path: Path to the video file.
@@ -104,80 +344,147 @@ def transcribe_video(
     # --- Get media duration for ETA calculation ---
     duration = _get_media_duration(str(video_path))
 
-    # --- Detect language if not specified ---
+    # --- Extract audio for VAD analysis ---
+    _report(0.03, "Extracting audio for speech detection...")
+    t0 = time.monotonic()
+    audio_pcm = _extract_audio_pcm(str(video_path))
+    extract_time = time.monotonic() - t0
+    _report(0.06, f"Audio extracted in {_format_eta(extract_time)}.")
+
+    # --- Run VAD to find speech regions ---
+    _report(0.06, "Detecting speech regions...")
+    t0 = time.monotonic()
+    raw_regions = _detect_speech_regions(audio_pcm)
+    speech_regions = _merge_speech_regions(raw_regions, total_duration=duration)
+    vad_time = time.monotonic() - t0
+    _report(0.10, f"Found {len(speech_regions)} speech regions in {_format_eta(vad_time)}.")
+
+    # --- Edge case: no speech detected ---
+    if not speech_regions:
+        total_time = time.monotonic() - overall_start
+        _report(1.0, f"No speech detected. Done in {_format_eta(total_time)}.")
+        return {
+            "text": "",
+            "segments": [],
+            "language": language or "unknown",
+        }
+
+    # --- Detect language if not specified (on original file) ---
     if language is None:
-        _report(0.04, "Detecting language...")
+        _report(0.10, "Detecting language...")
         t0 = time.monotonic()
         detected_language, lang_error = _detect_language(model, str(video_path))
         detect_time = time.monotonic() - t0
         if lang_error:
-            _report(0.05, f"Language: unknown (detection failed, {_format_eta(detect_time)}). Transcribing...")
+            _report(0.12, f"Language: unknown (detection failed, {_format_eta(detect_time)}). Transcribing...")
         else:
-            _report(0.05, f"Language: {detected_language} (detected in {_format_eta(detect_time)}). Transcribing...")
+            _report(0.12, f"Language: {detected_language} (detected in {_format_eta(detect_time)}). Transcribing...")
     else:
         detected_language = language
-        _report(0.05, f"Language: {language}. Transcribing...")
+        _report(0.12, f"Language: {language}. Transcribing...")
 
-    # --- Transcribe using new_segment_callback for real-time progress ---
+    # --- Transcribe each speech region ---
     transcribe_start = time.monotonic()
-    segments: list[dict] = []
-    full_text_parts: list[str] = []
-    seg_count = 0
+    all_segments: list[dict] = []
 
-    def _on_new_segment(segment):
-        nonlocal seg_count
-        try:
-            # pywhispercpp timestamps are in centiseconds (10ms units)
-            seg_start = segment.t0 / 100.0
-            seg_end = segment.t1 / 100.0
-            seg_text = segment.text.strip()
+    # Total speech duration for progress tracking
+    total_speech_duration = sum(end - start for start, end in speech_regions)
+    cumulative_speech = 0.0
 
-            # Skip empty or malformed segments
-            if not seg_text or seg_end <= seg_start:
-                return
-
-            segments.append({
-                "start": round(seg_start, 3),
-                "end": round(seg_end, 3),
-                "text": seg_text,
-            })
-            full_text_parts.append(seg_text)
-            seg_count += 1
-
-            # Report progress with ETA
-            elapsed = time.monotonic() - transcribe_start
-            if duration and duration > 0:
-                fraction = min(seg_end / duration, 0.99)
-                scaled = 0.05 + fraction * 0.95
-                if fraction > 0.01 and elapsed > 0.5:
-                    eta_seconds = elapsed / fraction * (1.0 - fraction)
-                    eta_str = _format_eta(eta_seconds)
-                    _report(scaled, f"Transcribing... {fraction:.0%} — ~{eta_str} remaining")
-                else:
-                    _report(scaled, "Transcribing...")
-            else:
-                # No duration available — report segment count instead
-                _report(0.05, f"Transcribing... {seg_count} segments processed ({_format_eta(elapsed)} elapsed)")
-        except Exception:
-            # Never let a progress reporting error abort the transcription
-            pass
-
-    transcribe_kwargs = {}
+    transcribe_kwargs = {
+        # --- Anti-hallucination / anti-repetition parameters ---
+        "no_context": True,
+        "no_speech_thold": 0.3,
+        "entropy_thold": 2.4,
+        "max_tokens": 100,
+        "suppress_blank": True,
+    }
     if language is not None:
         transcribe_kwargs["language"] = language
 
-    model.transcribe(
-        str(video_path),
-        new_segment_callback=_on_new_segment,
-        **transcribe_kwargs,
-    )
+    for chunk_idx, (chunk_start, chunk_end) in enumerate(speech_regions):
+        # Slice the audio numpy array for this chunk
+        start_sample = int(chunk_start * SAMPLE_RATE)
+        end_sample = int(chunk_end * SAMPLE_RATE)
+        chunk_audio = audio_pcm[start_sample:end_sample]
+
+        chunk_segments: list[dict] = []
+        chunk_duration = chunk_end - chunk_start
+
+        def _on_new_segment(
+            segment,
+            _offset=chunk_start,
+            _chunk_dur=chunk_duration,
+            _chunk_idx=chunk_idx,
+        ):
+            nonlocal cumulative_speech
+            try:
+                # pywhispercpp timestamps are in centiseconds (10ms units)
+                # Add chunk offset to get absolute timestamps
+                seg_start = segment.t0 / 100.0 + _offset
+                seg_end = segment.t1 / 100.0 + _offset
+                seg_text = segment.text.strip()
+
+                # Skip empty or malformed segments
+                if not seg_text or seg_end <= seg_start:
+                    return
+
+                chunk_segments.append({
+                    "start": round(seg_start, 3),
+                    "end": round(seg_end, 3),
+                    "text": seg_text,
+                })
+
+                # Report progress across all chunks
+                elapsed = time.monotonic() - transcribe_start
+                if total_speech_duration > 0:
+                    chunk_progress = min(
+                        (segment.t1 / 100.0) / _chunk_dur, 1.0
+                    ) if _chunk_dur > 0 else 1.0
+                    current_speech = cumulative_speech + _chunk_dur * chunk_progress
+                    fraction = min(current_speech / total_speech_duration, 0.99)
+                    scaled = 0.12 + fraction * 0.88
+                    if elapsed > 0.5 and fraction > 0.01:
+                        eta_seconds = elapsed / fraction * (1.0 - fraction)
+                        eta_str = _format_eta(eta_seconds)
+                        _report(
+                            scaled,
+                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}"
+                            f"... {fraction:.0%} — ~{eta_str} remaining",
+                        )
+                    else:
+                        _report(
+                            scaled,
+                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}...",
+                        )
+            except Exception:
+                # Never let a progress reporting error abort the transcription
+                pass
+
+        model.transcribe(
+            chunk_audio,
+            new_segment_callback=_on_new_segment,
+            **transcribe_kwargs,
+        )
+
+        all_segments.extend(chunk_segments)
+        cumulative_speech += chunk_duration
+
+    # --- Post-processing: remove hallucinated repetition ---
+    # Deduplication remains as a second safety net after VAD filtering.
+    cleaned_segments = _deduplicate_segments(all_segments, max_repeats=2)
+    removed = len(all_segments) - len(cleaned_segments)
 
     total_time = time.monotonic() - overall_start
-    _report(1.0, f"Done in {_format_eta(total_time)}.")
+    done_msg = f"Done in {_format_eta(total_time)}."
+    if removed:
+        done_msg += f" ({removed} duplicate segments removed)"
+    done_msg += f" ({len(speech_regions)} speech regions transcribed)"
+    _report(1.0, done_msg)
 
     return {
-        "text": " ".join(full_text_parts),
-        "segments": segments,
+        "text": " ".join(seg["text"] for seg in cleaned_segments),
+        "segments": cleaned_segments,
         "language": detected_language,
     }
 
