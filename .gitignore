@@ -1,2 +1,57 @@
-tests/.DS_Store
-*/.DS_Store
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Testing / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Media files (videos, audio)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.mp3
+*.wav
+*.flac
+*.ogg
+
+# Transcription output
+*.txt
+!requirements.txt
+
+# Whisper models (downloaded at runtime)
+*.bin
+ggml-*.bin
+
+# Temp files
+*.tmp
+*.bak
+
+# Claude Code local settings (contains machine-specific paths)
+.claude/settings.local.json
+.claude/plans/
