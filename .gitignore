@@ -53,5 +53,4 @@ ggml-*.bin
 *.bak
 
 # Claude Code local settings (contains machine-specific paths)
-.claude/settings.local.json
-.claude/plans/
+.claude/
