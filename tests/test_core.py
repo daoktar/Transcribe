@@ -417,7 +417,7 @@ class TestTranscribeVideoValidation:
 
     def test_missing_video_file(self):
         with patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"):
-            with pytest.raises(FileNotFoundError, match="Video file not found"):
+            with pytest.raises(FileNotFoundError, match="Media file not found"):
                 transcribe_video("/nonexistent/video.mp4")
 
     def test_output_dir_created(self, tmp_path):

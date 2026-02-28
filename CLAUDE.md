@@ -8,8 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pip install -r requirements.txt
 
-# CLI transcription
-python -m transcribe.cli <video_file> [--model large-v3] [--language en] [--output-dir ./out]
+# CLI transcription (video or audio)
+python -m transcribe.cli <media_file> [--model large-v3] [--language en] [--output-dir ./out]
 
 # Launch Gradio web UI
 python -m transcribe.web
@@ -22,7 +22,7 @@ pytest tests/ -v
 
 The project is a Python package (`transcribe/`) with three modules:
 
-- **`core.py`** — Transcription engine. The main pipeline in `transcribe_video()`:
+- **`core.py`** — Transcription engine. Supports video (mp4, mkv, avi, mov, webm, flv, wmv) and audio (mp3, wav, ogg, flac, aac, m4a, wma, opus) files. The main pipeline in `transcribe_media()`:
   1. Loads a whisper.cpp model via pywhispercpp (auto-detects Metal on Apple Silicon)
   2. Extracts audio as 16 kHz float32 numpy array via ffmpeg
   3. Runs WebRTC VAD (`_detect_speech_regions`) to find speech timestamps, then merges/pads them into ~30s chunks (`_merge_speech_regions`)
@@ -37,8 +37,8 @@ The project is a Python package (`transcribe/`) with three modules:
   - Closure-in-loop: segment callbacks use default arguments (`_offset=chunk_start`) to capture per-chunk values
   - Anti-hallucination params: `no_context=True`, `no_speech_thold=0.3`, `entropy_thold=2.4`, `max_tokens=100`
 
-- **`cli.py`** — CLI entry point via `argparse`. Calls `core.transcribe_video()` and saves TXT output.
-- **`web.py`** — Gradio web UI. Uses `gr.Blocks` layout with video upload, model/language selection, custom HTML progress bar (threading + queue + generator pattern), and downloadable TXT file.
+- **`cli.py`** — CLI entry point via `argparse`. Calls `core.transcribe_media()` and saves TXT output.
+- **`web.py`** — Gradio web UI. Uses `gr.Blocks` layout with media file upload (video + audio), model/language selection, custom HTML progress bar (threading + queue + generator pattern), and downloadable TXT file.
 
 All transcription logic lives in `core.py`. Both CLI and web UI are thin wrappers around it.
 

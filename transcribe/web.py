@@ -6,7 +6,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from transcribe.core import save_txt, transcribe_video
+from transcribe.core import SUPPORTED_EXTENSIONS, save_txt, transcribe_media
 
 MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
 
@@ -31,9 +31,16 @@ def _render_progress(fraction: float, message: str) -> str:
     )
 
 
-def run_transcription(video_file, model_size, language):
-    if video_file is None:
-        raise gr.Error("Please upload a video file.")
+def run_transcription(media_file, model_size, language):
+    if media_file is None:
+        raise gr.Error("Please upload a video or audio file.")
+
+    ext = Path(media_file).suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise gr.Error(
+            f"Unsupported file format '{ext}'. "
+            f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
 
     lang = language if language else None
 
@@ -46,8 +53,8 @@ def run_transcription(video_file, model_size, language):
 
     def _run():
         try:
-            result = transcribe_video(
-                video_file,
+            result = transcribe_media(
+                media_file,
                 model_size=model_size,
                 language=lang,
                 progress_callback=on_progress,
@@ -79,7 +86,7 @@ def run_transcription(video_file, model_size, language):
 
     result = result_holder[0]
     tmp_path = Path(_tmp_dir.name)
-    stem = Path(video_file).stem
+    stem = Path(media_file).stem
 
     txt_path = save_txt(result, tmp_path / f"{stem}.txt")
 
@@ -90,12 +97,17 @@ def run_transcription(video_file, model_size, language):
 
 
 def create_app():
-    with gr.Blocks(title="Video Transcriber") as app:
-        gr.Markdown("# Video Transcriber\nUpload a video file to transcribe using whisper.cpp.")
+    _file_types = sorted(SUPPORTED_EXTENSIONS)
+
+    with gr.Blocks(title="Media Transcriber") as app:
+        gr.Markdown("# Media Transcriber\nUpload a video or audio file to transcribe using whisper.cpp.")
 
         with gr.Row():
             with gr.Column():
-                video_input = gr.Video(label="Upload Video")
+                media_input = gr.File(
+                    label="Upload Video or Audio",
+                    file_types=_file_types,
+                )
                 model_dropdown = gr.Dropdown(
                     choices=MODEL_CHOICES,
                     value="large-v3",
@@ -119,7 +131,7 @@ def create_app():
 
         transcribe_btn.click(
             fn=run_transcription,
-            inputs=[video_input, model_dropdown, language_input],
+            inputs=[media_input, model_dropdown, language_input],
             outputs=[transcript_output, txt_download, info_text, progress_bar],
         )
 

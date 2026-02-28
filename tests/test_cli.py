@@ -45,7 +45,7 @@ class TestCliArgParsing:
         with patch("sys.argv", [
             "cli", str(video), "--model", "tiny", "--language", "en",
         ]):
-            with patch("transcribe.cli.transcribe_video", return_value=fake_result):
+            with patch("transcribe.cli.transcribe_media", return_value=fake_result):
                 main()
 
         captured = capsys.readouterr()
@@ -72,7 +72,7 @@ class TestCliArgParsing:
             "cli", str(video), "--model", "tiny", "--language", "en",
             "--output-dir", str(out_dir),
         ]):
-            with patch("transcribe.cli.transcribe_video", return_value=fake_result) as mock_tv:
+            with patch("transcribe.cli.transcribe_media", return_value=fake_result) as mock_tv:
                 main()
 
         # Verify output_dir was passed to transcribe_video

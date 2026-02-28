@@ -290,23 +290,31 @@ def _merge_speech_regions(
 # Main transcription function
 # ---------------------------------------------------------------------------
 
-def transcribe_video(
-    video_path: str,
+SUPPORTED_EXTENSIONS = {
+    # Video
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv",
+    # Audio
+    ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".opus",
+}
+
+
+def transcribe_media(
+    media_path: str,
     model_size: str = "large-v3",
     language: str | None = None,
     output_dir: str | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict:
-    """Transcribe a video file using whisper.cpp via pywhispercpp.
+    """Transcribe a media file (video or audio) using whisper.cpp via pywhispercpp.
 
     Uses WebRTC VAD to detect speech regions first, then transcribes only
     those regions to avoid hallucination on silence/music/noise sections.
 
     Args:
-        video_path: Path to the video file.
+        media_path: Path to the media file (video or audio).
         model_size: Whisper model size (tiny, base, small, medium, large-v3).
         language: Language code (e.g. "en"). Auto-detected if None.
-        output_dir: Directory for output files. Defaults to video's directory.
+        output_dir: Directory for output files. Defaults to file's directory.
         progress_callback: Optional callback ``(progress_fraction, message) -> None``
             called during transcription to report progress (0.0–1.0).
 
@@ -318,12 +326,19 @@ def transcribe_video(
             "ffmpeg not found on PATH. Install it with: brew install ffmpeg"
         )
 
-    video_path = Path(video_path)
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
+    media_path = Path(media_path)
+    if not media_path.exists():
+        raise FileNotFoundError(f"Media file not found: {media_path}")
+
+    ext = media_path.suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file format '{ext}'. "
+            f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
 
     if output_dir is None:
-        output_dir = video_path.parent
+        output_dir = media_path.parent
     else:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -342,12 +357,12 @@ def transcribe_video(
     _report(0.03, f"Model loaded in {_format_eta(load_time)}.")
 
     # --- Get media duration for ETA calculation ---
-    duration = _get_media_duration(str(video_path))
+    duration = _get_media_duration(str(media_path))
 
     # --- Extract audio for VAD analysis ---
     _report(0.03, "Extracting audio for speech detection...")
     t0 = time.monotonic()
-    audio_pcm = _extract_audio_pcm(str(video_path))
+    audio_pcm = _extract_audio_pcm(str(media_path))
     extract_time = time.monotonic() - t0
     _report(0.06, f"Audio extracted in {_format_eta(extract_time)}.")
 
@@ -373,7 +388,7 @@ def transcribe_video(
     if language is None:
         _report(0.10, "Detecting language...")
         t0 = time.monotonic()
-        detected_language, lang_error = _detect_language(model, str(video_path))
+        detected_language, lang_error = _detect_language(model, str(media_path))
         detect_time = time.monotonic() - t0
         if lang_error:
             _report(0.12, f"Language: unknown (detection failed, {_format_eta(detect_time)}). Transcribing...")
@@ -487,6 +502,10 @@ def transcribe_video(
         "segments": cleaned_segments,
         "language": detected_language,
     }
+
+
+# Backward-compatible alias
+transcribe_video = transcribe_media
 
 
 def save_txt(result: dict, output_path: str | Path) -> Path:
