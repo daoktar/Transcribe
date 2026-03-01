@@ -71,6 +71,58 @@ Open [http://127.0.0.1:7860](http://127.0.0.1:7860).
 
 Security default: the web app is bound to `127.0.0.1` with `share=False`, so it is local-only unless you explicitly change code/settings.
 
+## Speaker Detection
+
+Optional speaker diarization identifies and labels different speakers in your transcription.
+
+```bash
+# CLI — token via environment variable only (never as CLI arg)
+export HF_TOKEN=hf_YourTokenHere
+python -m transcribe.cli recording.mp4 --speakers
+
+# Auto-detect speaker count, or force it:
+python -m transcribe.cli recording.mp4 --speakers --num-speakers 3
+```
+
+In the **Web UI**, check "Detect Speakers" and paste your token into the password field that appears.
+
+Output format with speakers enabled:
+
+```
+[00:01] Speaker 1: Hello, how are you?
+[00:03] Speaker 2: I'm doing great, thanks for asking!
+[00:05] Speaker 1: That's wonderful to hear.
+```
+
+<details>
+<summary>What is the HuggingFace token and how do I get one?</summary>
+
+### What token do I need?
+
+The speaker diarization feature uses **pyannote.audio** (`pyannote/speaker-diarization-3.1`), a model hosted on HuggingFace that is **gated** — you must agree to its license terms before downloading. This requires a HuggingFace access token.
+
+### How to get the token
+
+1. **Create a free HuggingFace account** at [huggingface.co/join](https://huggingface.co/join)
+2. **Accept the model's license terms** by visiting [huggingface.co/pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and clicking "Agree and access repository"
+3. **Generate an access token** at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) — create a token with **read** permission
+
+The token looks like: `hf_AbCdEfGhIjKl...`
+
+### How the token is used
+
+The token is used **once** to authenticate the initial model download via `Pipeline.from_pretrained(...)`. After the first run, model files are cached locally in `~/.cache/huggingface/hub/` and the download is not repeated (though the token is still needed for authentication).
+
+### Token security
+
+- The raw token is **never stored** in memory after use — only a SHA-256 hash is kept for cache invalidation
+- The token is **never printed**, logged, or written to any output file
+- In the web UI the token field is a **password input** (masked)
+- On CLI there is **no `--hf-token` flag** — the `HF_TOKEN` environment variable is the only way to provide it, keeping the token out of `ps` output and shell history
+- If the pyannote pipeline fails to load, the error is **re-raised without the token** in the traceback
+
+</details>
+
 ## How It Works
 
 1. `ffmpeg` extracts 16 kHz mono PCM audio.

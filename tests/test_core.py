@@ -12,8 +12,10 @@ from transcribe.core import (
     _detect_speech_regions,
     _extract_audio_pcm,
     _format_eta,
+    _format_timestamp,
     _get_media_duration,
     _merge_speech_regions,
+    retry_diarize,
     save_txt,
     transcribe_video,
 )
@@ -42,6 +44,27 @@ class TestFormatEta:
     def test_fractional_seconds(self):
         assert _format_eta(0.7) == "0s"
         assert _format_eta(5.9) == "5s"
+
+
+# ---------------------------------------------------------------------------
+# _format_timestamp
+# ---------------------------------------------------------------------------
+
+class TestFormatTimestamp:
+    def test_zero(self):
+        assert _format_timestamp(0.0) == "00:00"
+
+    def test_seconds_only(self):
+        assert _format_timestamp(45.0) == "00:45"
+
+    def test_minutes_and_seconds(self):
+        assert _format_timestamp(125.0) == "02:05"
+
+    def test_hours(self):
+        assert _format_timestamp(3661.0) == "01:01:01"
+
+    def test_fractional_truncated(self):
+        assert _format_timestamp(90.9) == "01:30"
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +403,103 @@ class TestSaveTxt:
     def test_returns_path_object(self, tmp_path, sample_result):
         out = save_txt(sample_result, str(tmp_path / "out.txt"))
         assert isinstance(out, Path)
+
+    def test_writes_speaker_format(self, tmp_path):
+        result = {
+            "text": "Hello. World.",
+            "segments": [
+                {"start": 0.0, "end": 1.5, "text": "Hello.", "speaker": "Speaker 1"},
+                {"start": 65.0, "end": 67.0, "text": "World.", "speaker": "Speaker 2"},
+            ],
+            "language": "en",
+            "speakers": 2,
+        }
+        out = save_txt(result, tmp_path / "out.txt")
+        content = out.read_text(encoding="utf-8")
+        assert content == "Speaker 1: Hello.\nSpeaker 2: World."
+
+    def test_no_speaker_field_uses_plain_text(self, tmp_path, sample_result):
+        """When segments lack 'speaker' field, save plain text as before."""
+        out = save_txt(sample_result, tmp_path / "out.txt")
+        content = out.read_text(encoding="utf-8")
+        assert content == "Hello world. This is a test."
+
+
+# ---------------------------------------------------------------------------
+# retry_diarize
+# ---------------------------------------------------------------------------
+
+
+class TestRetryDiarize:
+    """Tests for retry_diarize — retries only diarization on an existing result."""
+
+    def _base_result(self):
+        return {
+            "text": "Hello. World.",
+            "segments": [
+                {"start": 0.0, "end": 1.5, "text": "Hello."},
+                {"start": 2.0, "end": 3.5, "text": "World."},
+            ],
+            "language": "en",
+            "speakers": 0,
+            "diarize_error": "Bad token",
+        }
+
+    def test_success_removes_error(self):
+        """On success, diarize_error should be removed from result."""
+        labeled = [
+            {"start": 0.0, "end": 1.5, "text": "Hello.", "speaker": "Speaker 1"},
+            {"start": 2.0, "end": 3.5, "text": "World.", "speaker": "Speaker 2"},
+        ]
+
+        with patch("transcribe.core._extract_audio_pcm", return_value=np.zeros(16000 * 5, dtype=np.float32)):
+            with patch("transcribe.diarize.diarize", return_value=(labeled, 2)):
+                result = retry_diarize("fake.mp4", self._base_result(), "new-token")
+
+        assert "diarize_error" not in result
+        assert result["speakers"] == 2
+        assert result["segments"][0]["speaker"] == "Speaker 1"
+
+    def test_failure_returns_error(self):
+        """On failure, result should have diarize_error and preserve segments."""
+        with patch("transcribe.core._extract_audio_pcm", return_value=np.zeros(16000 * 5, dtype=np.float32)):
+            with patch("transcribe.diarize.diarize", side_effect=RuntimeError("Invalid token")):
+                result = retry_diarize("fake.mp4", self._base_result(), "bad-token")
+
+        assert "diarize_error" in result
+        assert "Invalid token" in result["diarize_error"]
+        # Original segments preserved without speaker labels
+        assert result["segments"][0]["text"] == "Hello."
+        assert "speaker" not in result["segments"][0]
+
+    def test_empty_segments_returns_original(self):
+        """If result has no segments, return it unchanged."""
+        empty = {"text": "", "segments": [], "language": "en"}
+        result = retry_diarize("fake.mp4", empty, "token")
+        assert result is empty
+
+    def test_progress_callback_called(self):
+        """Progress callback should receive increasing fractions."""
+        labeled = [
+            {"start": 0.0, "end": 1.5, "text": "Hello.", "speaker": "Speaker 1"},
+        ]
+        fractions = []
+
+        def on_progress(frac, msg):
+            fractions.append(frac)
+
+        with patch("transcribe.core._extract_audio_pcm", return_value=np.zeros(16000 * 5, dtype=np.float32)):
+            with patch("transcribe.diarize.diarize", return_value=(labeled, 1)):
+                retry_diarize(
+                    "fake.mp4",
+                    self._base_result(),
+                    "tok",
+                    progress_callback=on_progress,
+                )
+
+        assert len(fractions) >= 2
+        assert fractions[0] == 0.0
+        assert fractions[-1] == 1.0
 
 
 # ---------------------------------------------------------------------------

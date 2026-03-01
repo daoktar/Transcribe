@@ -23,6 +23,16 @@ def _format_eta(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
+def _format_timestamp(seconds: float) -> str:
+    """Format seconds as MM:SS or HH:MM:SS timestamp."""
+    total = int(seconds)
+    h, remainder = divmod(total, 3600)
+    m, s = divmod(remainder, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 def _get_media_duration(file_path: str) -> float | None:
     """Get media duration in seconds using ffprobe.
 
@@ -304,6 +314,9 @@ def transcribe_media(
     language: str | None = None,
     output_dir: str | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
+    diarize: bool = False,
+    num_speakers: int | None = None,
+    hf_token: str | None = None,
 ) -> dict:
     """Transcribe a media file (video or audio) using whisper.cpp via pywhispercpp.
 
@@ -317,9 +330,14 @@ def transcribe_media(
         output_dir: Directory for output files. Defaults to file's directory.
         progress_callback: Optional callback ``(progress_fraction, message) -> None``
             called during transcription to report progress (0.0–1.0).
+        diarize: If True, run speaker diarization after transcription.
+        num_speakers: Force a specific speaker count (only used when diarize=True).
+        hf_token: HuggingFace access token (required when diarize=True).
 
     Returns:
         Dict with keys: text, segments, language.
+        When diarize=True, also includes "speakers" (int) and each segment
+        has a "speaker" field (e.g. "Speaker 1").
     """
     if not shutil.which("ffmpeg"):
         raise RuntimeError(
@@ -458,7 +476,8 @@ def transcribe_media(
                     ) if _chunk_dur > 0 else 1.0
                     current_speech = cumulative_speech + _chunk_dur * chunk_progress
                     fraction = min(current_speech / total_speech_duration, 0.99)
-                    scaled = 0.12 + fraction * 0.88
+                    transcribe_range = 0.73 if diarize else 0.88
+                    scaled = 0.12 + fraction * transcribe_range
                     if elapsed > 0.5 and fraction > 0.01:
                         eta_seconds = elapsed / fraction * (1.0 - fraction)
                         eta_str = _format_eta(eta_seconds)
@@ -490,6 +509,29 @@ def transcribe_media(
     cleaned_segments = _deduplicate_segments(all_segments, max_repeats=2)
     removed = len(all_segments) - len(cleaned_segments)
 
+    # --- Optional speaker diarization ---
+    speaker_count = 0
+    diarize_error = None
+    if diarize and cleaned_segments:
+        from transcribe.diarize import diarize as run_diarize
+
+        def _diarize_progress(frac: float, msg: str) -> None:
+            _report(0.85 + frac * 0.14, msg)
+
+        _report(0.85, "Starting speaker diarization...")
+        try:
+            cleaned_segments, speaker_count = run_diarize(
+                audio_pcm,
+                cleaned_segments,
+                hf_token=hf_token,
+                num_speakers=num_speakers,
+                progress_callback=_diarize_progress,
+            )
+        except Exception as exc:
+            # Diarization failed — keep the plain transcript intact
+            diarize_error = str(exc)
+            _report(0.99, f"Speaker detection failed: {diarize_error}")
+
     total_time = time.monotonic() - overall_start
     done_msg = f"Done in {_format_eta(total_time)}."
     if removed:
@@ -497,11 +539,16 @@ def transcribe_media(
     done_msg += f" ({len(speech_regions)} speech regions transcribed)"
     _report(1.0, done_msg)
 
-    return {
+    result = {
         "text": " ".join(seg["text"] for seg in cleaned_segments),
         "segments": cleaned_segments,
         "language": detected_language,
     }
+    if diarize:
+        result["speakers"] = speaker_count
+    if diarize_error:
+        result["diarize_error"] = diarize_error
+    return result
 
 
 # Backward-compatible alias
@@ -509,7 +556,80 @@ transcribe_video = transcribe_media
 
 
 def save_txt(result: dict, output_path: str | Path) -> Path:
-    """Save transcription as plain text."""
+    """Save transcription as plain text.
+
+    When segments contain speaker labels, formats each line as
+    ``Speaker N: text``. Otherwise saves plain text.
+    """
     output_path = Path(output_path)
-    output_path.write_text(result["text"], encoding="utf-8")
+
+    segments = result.get("segments", [])
+    has_speakers = segments and "speaker" in segments[0]
+
+    if has_speakers:
+        lines = []
+        for seg in segments:
+            lines.append(f"{seg['speaker']}: {seg['text']}")
+        output_path.write_text("\n".join(lines), encoding="utf-8")
+    else:
+        output_path.write_text(result["text"], encoding="utf-8")
+
     return output_path
+
+
+def retry_diarize(
+    media_path: str,
+    result: dict,
+    hf_token: str,
+    num_speakers: int | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> dict:
+    """Retry speaker diarization on an already-transcribed result.
+
+    Re-extracts audio via ffmpeg (fast) and runs only the diarization step,
+    skipping the full whisper transcription.  Returns a new result dict with
+    speaker labels applied, or with ``diarize_error`` if it fails again.
+    """
+    from transcribe.diarize import diarize as run_diarize
+
+    def _report(frac: float, msg: str) -> None:
+        if progress_callback is not None:
+            progress_callback(frac, msg)
+
+    segments = result.get("segments", [])
+    if not segments:
+        return result
+
+    _report(0.0, "Extracting audio for speaker detection...")
+    audio_pcm = _extract_audio_pcm(media_path)
+
+    _report(0.15, "Running speaker diarization...")
+
+    def _diarize_progress(frac: float, msg: str) -> None:
+        _report(0.15 + frac * 0.84, msg)
+
+    try:
+        labeled_segments, speaker_count = run_diarize(
+            audio_pcm,
+            segments,
+            hf_token=hf_token,
+            num_speakers=num_speakers,
+            progress_callback=_diarize_progress,
+        )
+    except Exception as exc:
+        _report(1.0, f"Speaker detection failed: {exc}")
+        return {
+            **result,
+            "diarize_error": str(exc),
+            "speakers": 0,
+        }
+
+    _report(1.0, f"Done — {speaker_count} speaker{'s' if speaker_count != 1 else ''}.")
+    new_result = {
+        **result,
+        "segments": labeled_segments,
+        "text": " ".join(seg["text"] for seg in labeled_segments),
+        "speakers": speaker_count,
+    }
+    new_result.pop("diarize_error", None)
+    return new_result

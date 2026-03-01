@@ -78,3 +78,64 @@ class TestCliArgParsing:
         # Verify output_dir was passed to transcribe_video
         call_kwargs = mock_tv.call_args
         assert call_kwargs[1]["output_dir"] == str(out_dir) or call_kwargs[0][3] == str(out_dir)
+
+    def test_speakers_flag_with_env_token(self, tmp_path, capsys):
+        """--speakers flag should pass diarize=True using HF_TOKEN env var."""
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        fake_result = {
+            "text": "Hello.",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "Hello.", "speaker": "Speaker 1"}],
+            "language": "en",
+            "speakers": 1,
+        }
+
+        with patch("sys.argv", ["cli", str(video), "--speakers"]):
+            with patch.dict("os.environ", {"HF_TOKEN": "env-tok-123"}):
+                with patch("transcribe.cli.transcribe_media", return_value=fake_result) as mock_tm:
+                    main()
+
+        call_kwargs = mock_tm.call_args[1]
+        assert call_kwargs["diarize"] is True
+        assert call_kwargs["hf_token"] == "env-tok-123"
+
+        captured = capsys.readouterr()
+        assert "Speakers: 1" in captured.out
+
+    def test_num_speakers_flag(self, tmp_path, capsys):
+        """--num-speakers should be forwarded to transcribe_media."""
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        fake_result = {
+            "text": "Hello.",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "Hello."}],
+            "language": "en",
+        }
+
+        with patch("sys.argv", [
+            "cli", str(video), "--speakers", "--num-speakers", "3",
+        ]):
+            with patch.dict("os.environ", {"HF_TOKEN": "env-tok-123"}):
+                with patch("transcribe.cli.transcribe_media", return_value=fake_result) as mock_tm:
+                    main()
+
+        call_kwargs = mock_tm.call_args[1]
+        assert call_kwargs["num_speakers"] == 3
+
+    def test_speakers_without_token_exits(self, tmp_path, capsys):
+        """--speakers without HF_TOKEN env var should exit with error."""
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        with patch("sys.argv", ["cli", str(video), "--speakers"]):
+            with patch.dict("os.environ", {}, clear=True):
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+                assert exc_info.value.code == 1
+
+        captured = capsys.readouterr()
+        assert "huggingface token" in captured.err.lower()
+        # Ensure error message does NOT mention --hf-token CLI flag
+        assert "--hf-token" not in captured.err
