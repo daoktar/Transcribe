@@ -79,7 +79,12 @@ CUSTOM_CSS = """
     color: #64748b;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    margin-bottom: 4px;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+.section-label p {
+    margin: 0 !important;
+    padding: 0 !important;
 }
 .transcribe-btn {
     margin-top: 4px !important;
@@ -105,6 +110,15 @@ CUSTOM_CSS = """
 .results-group {
     border-top: 2px solid #eef2ff !important;
     padding-top: 12px !important;
+}
+footer {
+    display: none !important;
+}
+.custom-footer {
+    text-align: center;
+    padding: 12px 0 8px;
+    font-size: 0.78rem;
+    color: #94a3b8;
 }
 """
 
@@ -150,19 +164,23 @@ def _render_progress(fraction: float, message: str) -> str:
 
 
 def _format_result(result, media_file):
-    """Build transcript text, info string, and saved file path from a result dict."""
+    """Build transcript texts, info string, and saved file path from a result dict.
+
+    Returns (plain_text, speaker_text, txt_path, info).
+    ``speaker_text`` is non-empty only when speaker labels are available.
+    """
     tmp_path = Path(_tmp_dir.name)
     stem = Path(media_file).stem
     txt_path = save_txt(result, tmp_path / f"{stem}.txt")
 
-    # Format transcript with speaker labels when available
+    plain_text = result["text"]
+    speaker_text = ""
+
     if result.get("speakers") and result["segments"]:
         lines = []
         for seg in result["segments"]:
             lines.append(f"{seg['speaker']}: {seg['text']}")
-        transcript_text = "\n".join(lines)
-    else:
-        transcript_text = result["text"]
+        speaker_text = "\n".join(lines)
 
     info = f"Language: {result['language']} | Segments: {len(result['segments'])}"
     if result.get("speakers"):
@@ -173,7 +191,7 @@ def _format_result(result, media_file):
             "\nFix your token above and click \"Retry Speaker Detection\"."
         )
 
-    return transcript_text, str(txt_path), info
+    return plain_text, speaker_text, str(txt_path), info
 
 
 def run_transcription(media_file, model_size, language, diarize_speakers, hf_token):
@@ -221,7 +239,8 @@ def run_transcription(media_file, model_size, language, diarize_speakers, hf_tok
     thread.start()
 
     # Yield progress updates as HTML bar
-    # Outputs: transcript, txt_file, info, progress_bar, cached_result, retry_btn
+    # Outputs: transcript, speaker_transcript, txt_file, info,
+    #          progress_bar, cached_result, retry_btn, speaker_tab
     while True:
         try:
             item = progress_queue.get(timeout=0.25)
@@ -230,8 +249,9 @@ def run_transcription(media_file, model_size, language, diarize_speakers, hf_tok
         if item is None:
             break
         fraction, message = item
-        yield (gr.update(), gr.update(), gr.update(),
-               _render_progress(fraction, message), gr.update(), gr.update())
+        yield (gr.update(), gr.update(), gr.update(), gr.update(),
+               _render_progress(fraction, message), gr.update(),
+               gr.update(), gr.update())
 
     thread.join()
 
@@ -239,14 +259,14 @@ def run_transcription(media_file, model_size, language, diarize_speakers, hf_tok
         raise gr.Error(str(error_holder[0]))
 
     result = result_holder[0]
-    transcript_text, txt_path, info = _format_result(result, media_file)
+    plain_text, speaker_text, txt_path, info = _format_result(result, media_file)
 
-    # Show retry button if diarization failed (transcript is preserved)
     show_retry = bool(result.get("diarize_error"))
+    has_speakers = bool(speaker_text)
 
-    # Final yield — populate results and clear progress bar
-    yield (transcript_text, txt_path, info, "",
-           result, gr.update(visible=show_retry))
+    yield (plain_text, speaker_text, txt_path, info, "",
+           result, gr.update(visible=show_retry),
+           gr.update(visible=has_speakers))
 
 
 def run_retry_diarize(media_file, hf_token, cached_result):
@@ -286,7 +306,8 @@ def run_retry_diarize(media_file, hf_token, cached_result):
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
 
-    # Outputs: transcript, txt_file, info, progress_bar, cached_result, retry_btn
+    # Outputs: transcript, speaker_transcript, txt_file, info,
+    #          progress_bar, cached_result, retry_btn, speaker_tab
     while True:
         try:
             item = progress_queue.get(timeout=0.25)
@@ -295,8 +316,9 @@ def run_retry_diarize(media_file, hf_token, cached_result):
         if item is None:
             break
         fraction, message = item
-        yield (gr.update(), gr.update(), gr.update(),
-               _render_progress(fraction, message), gr.update(), gr.update())
+        yield (gr.update(), gr.update(), gr.update(), gr.update(),
+               _render_progress(fraction, message), gr.update(),
+               gr.update(), gr.update())
 
     thread.join()
 
@@ -304,12 +326,14 @@ def run_retry_diarize(media_file, hf_token, cached_result):
         raise gr.Error(str(error_holder[0]))
 
     result = result_holder[0]
-    transcript_text, txt_path, info = _format_result(result, media_file)
+    plain_text, speaker_text, txt_path, info = _format_result(result, media_file)
 
     show_retry = bool(result.get("diarize_error"))
+    has_speakers = bool(speaker_text)
 
-    yield (transcript_text, txt_path, info, "",
-           result, gr.update(visible=show_retry))
+    yield (plain_text, speaker_text, txt_path, info, "",
+           result, gr.update(visible=show_retry),
+           gr.update(visible=has_speakers))
 
 
 def create_app():
@@ -404,30 +428,49 @@ def create_app():
                     lines=1,
                     max_lines=3,
                 )
-                transcript_output = gr.Textbox(
-                    label="Transcript",
-                    lines=20,
-                    max_lines=40,
-                    interactive=False,
-                    buttons=["copy"],
-                    elem_classes=["transcript-box"],
-                )
+                with gr.Tabs():
+                    with gr.Tab("Transcript"):
+                        transcript_output = gr.Textbox(
+                            label="Transcript",
+                            lines=20,
+                            max_lines=40,
+                            interactive=False,
+                            buttons=["copy"],
+                            elem_classes=["transcript-box"],
+                        )
+                    with gr.Tab("Speakers", visible=False) as speaker_tab:
+                        speaker_output = gr.Textbox(
+                            label="Transcript with Speakers",
+                            lines=20,
+                            max_lines=40,
+                            interactive=False,
+                            buttons=["copy"],
+                            elem_classes=["transcript-box"],
+                        )
                 txt_download = gr.File(label="Download Transcript")
 
-        # --- Event wiring (unchanged) ---
+        # --- Footer ---
+        gr.Markdown(
+            "Media Transcriber — powered by whisper.cpp",
+            elem_classes=["custom-footer"],
+        )
+
+        # --- Event wiring ---
+        _outputs = [transcript_output, speaker_output, txt_download,
+                     info_text, progress_bar, cached_result,
+                     retry_btn, speaker_tab]
+
         transcribe_btn.click(
             fn=run_transcription,
             inputs=[media_input, model_dropdown, language_input,
                     diarize_checkbox, hf_token_input],
-            outputs=[transcript_output, txt_download, info_text,
-                     progress_bar, cached_result, retry_btn],
+            outputs=_outputs,
         )
 
         retry_btn.click(
             fn=run_retry_diarize,
             inputs=[media_input, hf_token_input, cached_result],
-            outputs=[transcript_output, txt_download, info_text,
-                     progress_bar, cached_result, retry_btn],
+            outputs=_outputs,
         )
 
     return app
