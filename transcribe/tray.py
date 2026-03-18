@@ -7,7 +7,7 @@ when dispatching from a background thread).
 
 from __future__ import annotations
 
-import sys
+from pathlib import Path
 from typing import Callable
 
 import objc
@@ -20,16 +20,7 @@ from AppKit import (
 )
 from Foundation import NSData, NSObject
 
-
-# 16×16 template image (SF Symbol–style microphone, base64 PNG).
-# Using a template image makes macOS auto-adapt for dark/light mode.
-_ICON_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10"
-    b"\x08\x06\x00\x00\x00\x1f\xf3\xffa\x00\x00\x00\tpHYs\x00\x00\x0b\x13"
-    b"\x00\x00\x0b\x13\x01\x00\x9a\x9c\x18\x00\x00\x00\x01sRGB\x00\xae\xce"
-    b"\x1c\xe9\x00\x00\x00\x04gAMA\x00\x00\xb1\x8f\x0b\xfca\x05\x00\x00\x00"
-    b"\x00IEND\xaeB`\x82"
-)
+_ASSETS_DIR = Path(__file__).parent / "assets"
 
 
 class TrayDelegate(NSObject):
@@ -96,11 +87,17 @@ class Tray:
 
     @staticmethod
     def _load_icon() -> NSImage | None:
-        data = NSData.dataWithBytes_length_(_ICON_BYTES, len(_ICON_BYTES))
-        img = NSImage.alloc().initWithData_(data)
-        if img:
-            img.setSize_((16, 16))
-        return img
+        # Try @2x first for Retina, fall back to 1x
+        for name in ("tray_icon@2x.png", "tray_icon.png"):
+            path = _ASSETS_DIR / name
+            if path.exists():
+                icon_bytes = path.read_bytes()
+                data = NSData.dataWithBytes_length_(icon_bytes, len(icon_bytes))
+                img = NSImage.alloc().initWithData_(data)
+                if img:
+                    img.setSize_((16, 16))
+                    return img
+        return None
 
     def _build_menu(self) -> NSMenu:
         menu = NSMenu.alloc().init()
