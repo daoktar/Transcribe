@@ -7,7 +7,6 @@ when dispatching from a background thread).
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Callable
 
 import objc
@@ -20,7 +19,7 @@ from AppKit import (
 )
 from Foundation import NSData, NSObject
 
-_ASSETS_DIR = Path(__file__).parent / "assets"
+from transcribe.paths import get_assets_dir
 
 
 class TrayDelegate(NSObject):
@@ -88,8 +87,9 @@ class Tray:
     @staticmethod
     def _load_icon() -> NSImage | None:
         # Try @2x first for Retina, fall back to 1x
+        assets = get_assets_dir()
         for name in ("tray_icon@2x.png", "tray_icon.png"):
-            path = _ASSETS_DIR / name
+            path = assets / name
             if path.exists():
                 icon_bytes = path.read_bytes()
                 data = NSData.dataWithBytes_length_(icon_bytes, len(icon_bytes))

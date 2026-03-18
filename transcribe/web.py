@@ -337,6 +337,8 @@ def run_retry_diarize(media_file, hf_token, cached_result):
 
 
 def create_app():
+    from pywhispercpp.constants import MODELS_DIR as _models_dir
+
     _file_types = sorted(SUPPORTED_EXTENSIONS)
     _format_list = ", ".join(
         ext.lstrip(".").upper() for ext in sorted(SUPPORTED_EXTENSIONS)
@@ -448,6 +450,15 @@ def create_app():
                             elem_classes=["transcript-box"],
                         )
                 txt_download = gr.File(label="Download Transcript")
+
+        # --- Storage info (collapsible) ---
+        with gr.Accordion("Storage & file locations", open=False):
+            gr.Markdown(
+                f"**Whisper models**\n\n"
+                f"`{_models_dir}`\n\n"
+                f"**Transcript files** (temporary, cleared on exit)\n\n"
+                f"`{_tmp_dir.name}`"
+            )
 
         # --- Footer ---
         gr.Markdown(
