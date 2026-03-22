@@ -456,8 +456,8 @@ def create_app():
             gr.Markdown(
                 f"**Whisper models**\n\n"
                 f"`{_models_dir}`\n\n"
-                f"**Transcript files** (temporary, cleared on exit)\n\n"
-                f"`{_tmp_dir.name}`"
+                f"**Transcript files**\n\n"
+                f"Stored in a temporary system directory (cleared on exit)"
             )
 
         # --- Footer ---
