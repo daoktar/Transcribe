@@ -7,7 +7,7 @@ Local video & audio transcription powered by [whisper.cpp](https://github.com/gg
 - **Multi-format support** — MP4, MKV, AVI, MOV, WebM, FLV, WMV, MP3, WAV, OGG, FLAC, AAC, M4A, WMA, Opus
 - **Voice Activity Detection** — WebRTC VAD skips silence and music, reducing hallucinations
 - **Speaker diarization** — identify and label speakers via pyannote.audio (optional, requires HuggingFace token)
-- **Multiple interfaces** — CLI, web UI (Gradio), native macOS app with menu bar tray
+- **Multiple interfaces** — CLI and native macOS app with menu bar tray
 - **5 model sizes** — tiny, base, small, medium, large-v3
 - **Auto language detection** — or set manually with ISO 639-1 codes
 - **Standalone macOS app** — PyInstaller packaging with .dmg distribution
@@ -33,15 +33,6 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-
-### Web UI
-
-```bash
-python -m transcribe.web
-# Opens at http://127.0.0.1:7860 (local-only by default)
-```
-
-Features: drag-and-drop upload, real-time progress bar, tabbed transcript/speaker view, one-click download.
 
 ### CLI
 
@@ -77,7 +68,7 @@ Identifies different speakers using pyannote.audio. Requires a free [HuggingFace
 [00:03] Speaker 2: I'm doing great, thanks for asking!
 ```
 
-**CLI:** set `HF_TOKEN` env var + `--speakers` flag. **Web UI:** check "Detect Speakers" and paste token.
+**CLI:** set `HF_TOKEN` env var + `--speakers` flag. **Native app:** check "Detect Speakers" and paste token.
 
 Token security: never stored (only SHA-256 hash cached), never logged, password-masked in UI, env-var only on CLI.
 

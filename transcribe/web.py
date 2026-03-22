@@ -144,6 +144,7 @@ footer {
 def _render_progress(fraction: float, message: str) -> str:
     """Render an HTML progress bar with status text."""
     pct = max(0, min(100, int(fraction * 100)))
+    message = html_mod.escape(message)
     is_done = pct >= 100
     text_color = "#fff" if pct > 45 else "#475569"
 
@@ -745,11 +746,3 @@ def create_app(native_mode=False):
     return app
 
 
-def main():
-    app = create_app()
-    # Force local-only hosting by default for safer operation.
-    app.launch(server_name="127.0.0.1", share=False, theme=THEME, css=CUSTOM_CSS)
-
-
-if __name__ == "__main__":
-    main()
