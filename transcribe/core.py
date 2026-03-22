@@ -9,6 +9,8 @@ import numpy as np
 import webrtcvad
 from pywhispercpp.model import Model
 
+from transcribe.paths import get_ffmpeg_path, get_ffprobe_path
+
 SAMPLE_RATE = 16000
 
 
@@ -41,7 +43,7 @@ def _get_media_duration(file_path: str) -> float | None:
     try:
         result = subprocess.run(
             [
-                "ffprobe", "-v", "quiet",
+                get_ffprobe_path(), "-v", "quiet",
                 "-show_entries", "format=duration",
                 "-of", "csv=p=0",
                 str(file_path),
@@ -123,7 +125,7 @@ def _extract_audio_pcm(file_path: str) -> np.ndarray:
     """
     result = subprocess.run(
         [
-            "ffmpeg", "-i", str(file_path),
+            get_ffmpeg_path(), "-i", str(file_path),
             "-vn",                    # no video
             "-acodec", "pcm_s16le",   # 16-bit signed little-endian PCM
             "-ar", str(SAMPLE_RATE),  # 16 kHz
@@ -339,7 +341,7 @@ def transcribe_media(
         When diarize=True, also includes "speakers" (int) and each segment
         has a "speaker" field (e.g. "Speaker 1").
     """
-    if not shutil.which("ffmpeg"):
+    if not shutil.which(get_ffmpeg_path()):
         raise RuntimeError(
             "ffmpeg not found on PATH. Install it with: brew install ffmpeg"
         )
