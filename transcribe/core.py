@@ -579,6 +579,24 @@ def save_txt(result: dict, output_path: str | Path) -> Path:
     return output_path
 
 
+def save_txt_alongside(result: dict, original_media_path: str | Path) -> Path:
+    """Save transcript as .txt next to the original media file.
+
+    Derives output path from the media path (e.g. video.mp4 → video.txt).
+    If the target file already exists, appends a numeric suffix (_1, _2, …).
+
+    Raises PermissionError or OSError if the directory is not writable.
+    """
+    media = Path(original_media_path)
+    base = media.parent / media.stem
+    candidate = base.with_suffix(".txt")
+    counter = 1
+    while candidate.exists():
+        candidate = media.parent / f"{media.stem}_{counter}.txt"
+        counter += 1
+    return save_txt(result, candidate)
+
+
 def retry_diarize(
     media_path: str,
     result: dict,

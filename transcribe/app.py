@@ -11,6 +11,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import time
@@ -18,6 +19,7 @@ import urllib.request
 
 import webview
 
+from transcribe.core import SUPPORTED_EXTENSIONS
 from transcribe.web import CUSTOM_CSS, THEME, create_app
 
 # ---------------------------------------------------------------------------
@@ -43,6 +45,31 @@ def _wait_for_server(port: int, timeout: float = 30.0):
         except Exception:
             time.sleep(0.15)
     raise RuntimeError(f"Gradio server did not start within {timeout}s")
+
+
+# ---------------------------------------------------------------------------
+# JS API bridge — exposed to the webview for native file picking
+# ---------------------------------------------------------------------------
+
+# Build the file-type filter string for the native dialog
+_ext_list = ";".join(f"*{ext}" for ext in sorted(SUPPORTED_EXTENSIONS))
+_FILE_TYPES = (f"Media Files ({_ext_list})",)
+
+
+class JsApi:
+    """Python functions callable from JavaScript inside the webview."""
+
+    def __init__(self, window: webview.Window):
+        self._window = window
+
+    def pick_files(self) -> list[str]:
+        """Open a native macOS file dialog and return selected file paths."""
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG,
+            allow_multiple=True,
+            file_types=_FILE_TYPES,
+        )
+        return list(result) if result else []
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +112,34 @@ def _on_webview_started(window: webview.Window):
     """Called by pywebview in a background thread once the GUI is ready."""
     _setup_tray(window)
 
+    # Expose the JS API so Gradio pages can call window.pywebview.api.*
+    api = JsApi(window)
+    window.expose(api)
+
+    # Inject a helper script that connects the native file picker to Gradio.
+    # When the user picks files via the native dialog, we populate the hidden
+    # #original_paths textarea so the Gradio backend knows the real paths,
+    # and programmatically add the files to the Gradio upload component.
+    window.evaluate_js("""
+    (function() {
+        // Make the native browse function available globally
+        window._nativeBrowse = async function() {
+            if (!window.pywebview || !window.pywebview.api) return;
+            const paths = await window.pywebview.api.pick_files();
+            if (!paths || paths.length === 0) return;
+
+            // Store original paths in the hidden textarea
+            const pathsInput = document.querySelector('#original_paths textarea');
+            if (pathsInput) {
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value').set;
+                nativeInputValueSetter.call(pathsInput, JSON.stringify(paths));
+                pathsInput.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        };
+    })();
+    """)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -95,7 +150,7 @@ def main():
     port = _find_free_port()
 
     # Launch the Gradio server without blocking the main thread.
-    gradio_app = create_app()
+    gradio_app = create_app(native_mode=True)
     gradio_app.launch(
         server_name="127.0.0.1",
         server_port=port,

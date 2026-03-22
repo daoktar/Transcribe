@@ -139,3 +139,39 @@ class TestCliArgParsing:
         assert "huggingface token" in captured.err.lower()
         # Ensure error message does NOT mention --hf-token CLI flag
         assert "--hf-token" not in captured.err
+
+    def test_multiple_files(self, tmp_path, capsys):
+        """CLI should accept and process multiple files."""
+        v1 = tmp_path / "video1.mp4"
+        v2 = tmp_path / "video2.mp4"
+        v1.touch()
+        v2.touch()
+
+        fake_result = {
+            "text": "Hello.",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "Hello."}],
+            "language": "en",
+        }
+
+        with patch("sys.argv", ["cli", str(v1), str(v2), "--model", "tiny"]):
+            with patch("transcribe.cli.transcribe_media", return_value=fake_result) as mock_tm:
+                main()
+
+        assert mock_tm.call_count == 2
+        captured = capsys.readouterr()
+        assert "[1/2]" in captured.out
+        assert "[2/2]" in captured.out
+        assert "Batch complete" in captured.out
+
+    def test_multiple_files_one_missing(self, tmp_path, capsys):
+        """CLI should exit 1 if any file is missing (validates all up front)."""
+        v1 = tmp_path / "video1.mp4"
+        v1.touch()
+
+        with patch("sys.argv", ["cli", str(v1), "/nonexistent/video2.mp4"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+
+        captured = capsys.readouterr()
+        assert "file not found" in captured.err.lower()
