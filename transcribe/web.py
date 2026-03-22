@@ -249,9 +249,9 @@ def run_transcription(media_file, model_size, language, diarize_speakers, hf_tok
         if item is None:
             break
         fraction, message = item
-        yield (gr.update(), gr.update(), gr.update(), gr.update(),
-               _render_progress(fraction, message), gr.update(),
-               gr.update(), gr.update())
+        yield (gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+               _render_progress(fraction, message), gr.skip(),
+               gr.skip(), gr.skip())
 
     thread.join()
 
@@ -265,8 +265,8 @@ def run_transcription(media_file, model_size, language, diarize_speakers, hf_tok
     has_speakers = bool(speaker_text)
 
     yield (plain_text, speaker_text, txt_path, info, "",
-           result, gr.update(visible=show_retry),
-           gr.update(visible=has_speakers))
+           result, gr.Button(visible=show_retry),
+           gr.Tab(visible=has_speakers))
 
 
 def run_retry_diarize(media_file, hf_token, cached_result):
@@ -316,9 +316,9 @@ def run_retry_diarize(media_file, hf_token, cached_result):
         if item is None:
             break
         fraction, message = item
-        yield (gr.update(), gr.update(), gr.update(), gr.update(),
-               _render_progress(fraction, message), gr.update(),
-               gr.update(), gr.update())
+        yield (gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+               _render_progress(fraction, message), gr.skip(),
+               gr.skip(), gr.skip())
 
     thread.join()
 
@@ -332,8 +332,8 @@ def run_retry_diarize(media_file, hf_token, cached_result):
     has_speakers = bool(speaker_text)
 
     yield (plain_text, speaker_text, txt_path, info, "",
-           result, gr.update(visible=show_retry),
-           gr.update(visible=has_speakers))
+           result, gr.Button(visible=show_retry),
+           gr.Tab(visible=has_speakers))
 
 
 def create_app():
@@ -397,7 +397,7 @@ def create_app():
                     visible=False,
                 )
                 diarize_checkbox.change(
-                    fn=lambda checked: gr.update(visible=checked),
+                    fn=lambda checked: gr.Textbox(visible=checked),
                     inputs=[diarize_checkbox],
                     outputs=[hf_token_input],
                 )
@@ -437,7 +437,7 @@ def create_app():
                             lines=20,
                             max_lines=40,
                             interactive=False,
-                            buttons=["copy"],
+                            copy_button=True,
                             elem_classes=["transcript-box"],
                         )
                     with gr.Tab("Speakers", visible=False) as speaker_tab:
@@ -446,7 +446,7 @@ def create_app():
                             lines=20,
                             max_lines=40,
                             interactive=False,
-                            buttons=["copy"],
+                            copy_button=True,
                             elem_classes=["transcript-box"],
                         )
                 txt_download = gr.File(label="Download Transcript")
