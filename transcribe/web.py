@@ -680,7 +680,7 @@ def create_app(native_mode=False):
                             lines=20,
                             max_lines=40,
                             interactive=False,
-                            copy_button=True,
+                            buttons=["copy"],
                             elem_classes=["transcript-box"],
                         )
                     with gr.Tab("Speakers", visible=False) as speaker_tab:
@@ -689,7 +689,7 @@ def create_app(native_mode=False):
                             lines=20,
                             max_lines=40,
                             interactive=False,
-                            copy_button=True,
+                            buttons=["copy"],
                             elem_classes=["transcript-box"],
                         )
                 txt_download = gr.File(label="Download Transcript")
