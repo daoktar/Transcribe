@@ -117,24 +117,37 @@ def _on_webview_started(window: webview.Window):
     window.expose(api)
 
     # Inject a helper script that connects the native file picker to Gradio.
-    # When the user picks files via the native dialog, we populate the hidden
-    # #original_paths textarea so the Gradio backend knows the real paths,
-    # and programmatically add the files to the Gradio upload component.
+    # When the user picks files via the native dialog, we:
+    #   1. Store original paths in the hidden #original_paths textarea so the
+    #      backend knows the real on-disk locations (used for "save alongside").
+    #   2. Update the visible #native_file_list element with the selected names.
+    # run_transcription falls back to original_paths when no Gradio upload is
+    # present, so native-mode users can transcribe without the upload widget.
     window.evaluate_js("""
     (function() {
-        // Make the native browse function available globally
         window._nativeBrowse = async function() {
             if (!window.pywebview || !window.pywebview.api) return;
             const paths = await window.pywebview.api.pick_files();
             if (!paths || paths.length === 0) return;
 
-            // Store original paths in the hidden textarea
+            // 1. Store original paths in the hidden textarea
             const pathsInput = document.querySelector('#original_paths textarea');
             if (pathsInput) {
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                const setter = Object.getOwnPropertyDescriptor(
                     window.HTMLTextAreaElement.prototype, 'value').set;
-                nativeInputValueSetter.call(pathsInput, JSON.stringify(paths));
+                setter.call(pathsInput, JSON.stringify(paths));
                 pathsInput.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+
+            // 2. Update the visible file list display
+            const display = document.querySelector('#native_file_list');
+            if (display) {
+                const names = paths.map(p => p.split('/').pop());
+                const label = names.length === 1
+                    ? names[0]
+                    : names.length + ' files selected: ' + names.join(', ');
+                display.innerHTML =
+                    '<span style="color:#16a34a">&#10003; ' + label + '</span>';
             }
         };
     })();
