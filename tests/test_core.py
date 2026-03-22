@@ -17,6 +17,7 @@ from transcribe.core import (
     _merge_speech_regions,
     retry_diarize,
     save_txt,
+    save_txt_alongside,
     transcribe_video,
 )
 
@@ -423,6 +424,63 @@ class TestSaveTxt:
         out = save_txt(sample_result, tmp_path / "out.txt")
         content = out.read_text(encoding="utf-8")
         assert content == "Hello world. This is a test."
+
+
+# ---------------------------------------------------------------------------
+# save_txt_alongside
+# ---------------------------------------------------------------------------
+
+
+class TestSaveTxtAlongside:
+    """Tests for save_txt_alongside — saves .txt next to the media file."""
+
+    def test_basic_save(self, tmp_path, sample_result):
+        media = tmp_path / "video.mp4"
+        media.touch()
+        out = save_txt_alongside(sample_result, media)
+        assert out == tmp_path / "video.txt"
+        assert out.exists()
+        assert out.read_text(encoding="utf-8") == "Hello world. This is a test."
+
+    def test_collision_increments_suffix(self, tmp_path, sample_result):
+        media = tmp_path / "video.mp4"
+        media.touch()
+        (tmp_path / "video.txt").write_text("existing")
+        out = save_txt_alongside(sample_result, media)
+        assert out == tmp_path / "video_1.txt"
+        assert out.exists()
+
+    def test_multiple_collisions(self, tmp_path, sample_result):
+        media = tmp_path / "video.mp4"
+        media.touch()
+        (tmp_path / "video.txt").write_text("existing")
+        (tmp_path / "video_1.txt").write_text("existing")
+        (tmp_path / "video_2.txt").write_text("existing")
+        out = save_txt_alongside(sample_result, media)
+        assert out == tmp_path / "video_3.txt"
+
+    def test_audio_extension(self, tmp_path, sample_result):
+        media = tmp_path / "recording.mp3"
+        media.touch()
+        out = save_txt_alongside(sample_result, media)
+        assert out == tmp_path / "recording.txt"
+
+    def test_permission_error(self, tmp_path, sample_result):
+        read_only = tmp_path / "readonly"
+        read_only.mkdir()
+        read_only.chmod(0o444)
+        media = read_only / "video.mp4"
+        try:
+            with pytest.raises((PermissionError, OSError)):
+                save_txt_alongside(sample_result, media)
+        finally:
+            read_only.chmod(0o755)
+
+    def test_returns_path_object(self, tmp_path, sample_result):
+        media = tmp_path / "video.mp4"
+        media.touch()
+        out = save_txt_alongside(sample_result, str(media))
+        assert isinstance(out, Path)
 
 
 # ---------------------------------------------------------------------------
