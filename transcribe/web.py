@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import html as html_mod
 import json
 import queue
@@ -217,7 +218,8 @@ def _format_result(result, media_file):
     """
     tmp_path = Path(_tmp_dir.name)
     stem = Path(media_file).stem
-    txt_path = save_txt(result, tmp_path / f"{stem}.txt")
+    path_hash = hashlib.md5(str(media_file).encode()).hexdigest()[:8]
+    txt_path = save_txt(result, tmp_path / f"{stem}_{path_hash}.txt")
 
     plain_text = result["text"]
     speaker_text = ""
@@ -248,9 +250,20 @@ def run_transcription(
 
     # Normalise: single file comes as a str, multiple as a list
     if media_files is None:
-        raise gr.Error("Please upload at least one media file.")
+        media_files = []
     if isinstance(media_files, str):
         media_files = [media_files]
+
+    # In native mode the user may browse via the native picker without using the
+    # Gradio uploader — fall back to original_paths_json as the file source.
+    if not media_files and original_paths_json:
+        try:
+            parsed = json.loads(original_paths_json)
+            if isinstance(parsed, list) and parsed:
+                media_files = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     if not media_files:
         raise gr.Error("Please upload at least one media file.")
 
@@ -364,6 +377,7 @@ def run_transcription(
         else:
             statuses[idx] = "done"
             result = result_holder[0]
+            result["_media_file"] = media_file  # cache path for retry/select
             all_results[idx] = result
 
             # Save to temp dir
@@ -397,7 +411,7 @@ def run_transcription(
         plain_text, speaker_text, _, info = _format_result(
             result, media_files[first_result_idx]
         )
-        show_retry = bool(result.get("diarize_error"))
+        show_retry = any(r.get("diarize_error") for r in all_results.values())
         has_speakers = bool(speaker_text)
     else:
         plain_text = ""
@@ -456,9 +470,13 @@ def _on_file_select(filename, all_results, media_files):
     except (ValueError, IndexError):
         return gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
-    if isinstance(all_results, dict) and idx in all_results and idx < len(media_files):
+    if isinstance(all_results, dict) and idx in all_results:
         result = all_results[idx]
-        plain_text, speaker_text, _, info = _format_result(result, media_files[idx])
+        # Prefer the path stored in the result; fall back to media_files list
+        media_file_path = result.get("_media_file") or (
+            media_files[idx] if media_files and idx < len(media_files) else "unknown"
+        )
+        plain_text, speaker_text, _, info = _format_result(result, media_file_path)
         has_speakers = bool(speaker_text)
         return plain_text, speaker_text, info, gr.Tab(visible=has_speakers)
 
@@ -473,21 +491,8 @@ def _on_cancel_click(cancel_state):
 
 
 def run_retry_diarize(media_files, hf_token, cached_results):
-    """Retry only the speaker diarization step using the cached transcription."""
-    # Use the first file for retry (single-file behaviour preserved)
-    if isinstance(media_files, list):
-        media_file = media_files[0] if media_files else None
-    else:
-        media_file = media_files
-
-    # Get the first cached result
-    if isinstance(cached_results, dict) and cached_results:
-        first_key = min(cached_results.keys(), key=int) if cached_results else None
-        cached_result = cached_results[first_key] if first_key is not None else None
-    else:
-        cached_result = cached_results
-
-    if cached_result is None or not cached_result.get("segments"):
+    """Retry speaker diarization for every cached result that previously failed."""
+    if not isinstance(cached_results, dict) or not cached_results:
         raise gr.Error("No transcription to retry. Please transcribe first.")
 
     if not hf_token:
@@ -496,61 +501,96 @@ def run_retry_diarize(media_files, hf_token, cached_results):
             "Enter your token or get one at huggingface.co/settings/tokens"
         )
 
-    if media_file is None:
-        raise gr.Error("Original media file is required for speaker detection retry.")
+    # Resolve media_files to a list for index-based lookup
+    if isinstance(media_files, str):
+        media_files = [media_files] if media_files else []
+    elif media_files is None:
+        media_files = []
 
-    progress_queue: queue.Queue = queue.Queue()
-    result_holder: list[dict] = []
-    error_holder: list[Exception] = []
-
-    def on_progress(fraction: float, message: str):
-        progress_queue.put((fraction, message))
-
-    def _run():
-        try:
-            result = retry_diarize(
-                media_file,
-                cached_result,
-                hf_token=hf_token,
-                progress_callback=on_progress,
-            )
-            result_holder.append(result)
-        except Exception as exc:
-            error_holder.append(exc)
-        progress_queue.put(None)
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+    # Find every entry that previously failed diarization
+    to_retry = {k: v for k, v in cached_results.items() if v.get("diarize_error")}
+    if not to_retry:
+        raise gr.Error("No failed speaker detection found. Nothing to retry.")
 
     _skip = gr.skip()
     # Outputs: transcript, speaker_transcript, txt_file, info,
     #          progress_bar, cached_results, retry_btn, speaker_tab,
     #          batch_queue, file_selector, cancel_btn, cancel_state
-    while True:
-        try:
-            item = progress_queue.get(timeout=0.25)
-        except queue.Empty:
+    updated_results = dict(cached_results)  # preserve entries that succeeded
+
+    for key, cached_result in sorted(to_retry.items()):
+        # Resolve the media file path: prefer path stored in result, then list
+        media_file = cached_result.get("_media_file") or (
+            media_files[key] if key < len(media_files) else None
+        )
+        if not media_file:
+            updated_results[key] = {
+                **cached_result,
+                "diarize_error": "Original media file path unavailable for retry.",
+            }
             continue
-        if item is None:
-            break
-        fraction, message = item
-        yield (_skip, _skip, _skip, _skip,
-               _render_progress(fraction, message), _skip,
-               _skip, _skip, _skip, _skip, _skip, _skip)
 
-    thread.join()
+        progress_queue: queue.Queue = queue.Queue()
+        result_holder: list[dict] = []
+        error_holder: list[Exception] = []
 
-    if error_holder:
-        raise gr.Error(str(error_holder[0]))
+        def on_progress(fraction: float, message: str):
+            progress_queue.put((fraction, message))
 
-    result = result_holder[0]
-    plain_text, speaker_text, txt_path, info = _format_result(result, media_file)
+        def _run(_mf=media_file, _cr=cached_result):
+            try:
+                result = retry_diarize(
+                    _mf,
+                    _cr,
+                    hf_token=hf_token,
+                    progress_callback=on_progress,
+                )
+                result_holder.append(result)
+            except Exception as exc:
+                error_holder.append(exc)
+            progress_queue.put(None)
 
-    show_retry = bool(result.get("diarize_error"))
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        while True:
+            try:
+                item = progress_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            fraction, message = item
+            yield (_skip, _skip, _skip, _skip,
+                   _render_progress(fraction, message), _skip,
+                   _skip, _skip, _skip, _skip, _skip, _skip)
+
+        thread.join()
+
+        if error_holder:
+            updated_results[key] = {
+                **cached_result,
+                "diarize_error": str(error_holder[0]),
+            }
+        else:
+            result = result_holder[0]
+            result["_media_file"] = media_file
+            updated_results[key] = result
+
+    # Display the first successfully updated result (or first overall)
+    display_key = next(
+        (k for k in sorted(updated_results) if not updated_results[k].get("diarize_error")),
+        min(updated_results.keys()),
+    )
+    display_result = updated_results[display_key]
+    display_path = display_result.get("_media_file", "unknown")
+    plain_text, speaker_text, txt_path, info = _format_result(display_result, display_path)
+
+    show_retry = any(r.get("diarize_error") for r in updated_results.values())
     has_speakers = bool(speaker_text)
 
     yield (plain_text, speaker_text, txt_path, info, "",
-           {0: result}, gr.Button(visible=show_retry),
+           updated_results, gr.Button(visible=show_retry),
            gr.Tab(visible=has_speakers), _skip, _skip, _skip, _skip)
 
 
@@ -587,6 +627,22 @@ def create_app(native_mode=False):
                 f"Supported formats: {_format_list}",
                 elem_classes=["format-hint"],
             )
+
+            # Native mode: provide a browse button that opens the system picker
+            # and records original paths so "save alongside" works correctly.
+            if native_mode:
+                with gr.Row():
+                    native_browse_btn = gr.Button(
+                        "Browse Files...", variant="secondary", size="sm"
+                    )
+                native_file_display = gr.HTML(
+                    value="<em style='color:#94a3b8'>No files selected</em>",
+                    elem_id="native_file_list",
+                )
+                native_browse_btn.click(
+                    fn=None,
+                    js="() => { window._nativeBrowse && window._nativeBrowse(); }",
+                )
 
             # --- Settings ---
             with gr.Group():
