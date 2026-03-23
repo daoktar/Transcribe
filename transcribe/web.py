@@ -37,6 +37,7 @@ THEME = gr.themes.Soft(
     font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
     font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "monospace"],
 ).set(
+    # Light mode
     body_background_fill="#f8f9fb",
     block_background_fill="white",
     block_border_width="0px",
@@ -47,6 +48,12 @@ THEME = gr.themes.Soft(
     button_primary_background_fill="#4f7df5",
     button_primary_text_color="white",
     button_large_radius="10px",
+    # Dark mode overrides
+    body_background_fill_dark="#0f1219",
+    block_background_fill_dark="#1a1f2e",
+    block_shadow_dark="0 1px 3px rgba(0,0,0,0.3)",
+    body_text_color_dark="#e2e8f0",
+    input_background_fill_dark="#1e2433",
 )
 
 CUSTOM_CSS = """
@@ -139,6 +146,19 @@ footer {
 .batch-queue-item.done { background: #f0fdf4; color: #16a34a; }
 .batch-queue-item.error { background: #fef2f2; color: #dc2626; }
 .batch-queue-item.cancelled { background: #f9fafb; color: #9ca3af; }
+
+/* --- Dark mode overrides (Gradio adds .dark class) --- */
+.dark .app-header h1 { color: #e2e8f0; }
+.dark .app-header p { color: #94a3b8; }
+.dark .format-hint { color: #64748b; }
+.dark .section-label { color: #94a3b8; }
+.dark .results-group { border-top-color: #2d3548 !important; }
+.dark .custom-footer { color: #64748b; }
+.dark .batch-queue-item.pending { background: #1e2433; color: #94a3b8; }
+.dark .batch-queue-item.processing { background: #1e2750; color: #748ffc; }
+.dark .batch-queue-item.done { background: #132a1e; color: #4ade80; }
+.dark .batch-queue-item.error { background: #2a1315; color: #f87171; }
+.dark .batch-queue-item.cancelled { background: #1a1f2e; color: #64748b; }
 """
 
 
@@ -146,7 +166,6 @@ def _render_progress(fraction: float, message: str) -> str:
     """Render an HTML progress bar with status text."""
     pct = max(0, min(100, int(fraction * 100)))
     is_done = pct >= 100
-    text_color = "#fff" if pct > 45 else "#475569"
 
     if is_done:
         fill = "linear-gradient(90deg, #22c55e, #16a34a)"
@@ -169,14 +188,16 @@ def _render_progress(fraction: float, message: str) -> str:
     return (
         f"<style>@keyframes shimmer {{0%{{background-position:200% 0}}"
         f"100%{{background-position:-200% 0}}}}</style>"
-        f"<div style='background:#e8ecf1; border-radius:10px; overflow:hidden; "
-        f"height:32px; position:relative; box-shadow:inset 0 1px 2px rgba(0,0,0,0.06)'>"
+        f"<div style='background:rgba(0,0,0,0.15); border:1px solid rgba(128,128,128,0.3); "
+        f"border-radius:10px; overflow:hidden; "
+        f"height:32px; position:relative;'>"
         f"<div style='width:{pct}%; background:{fill}; height:100%; "
         f"border-radius:10px; "
         f"transition:width 0.4s cubic-bezier(0.4,0,0.2,1); {shimmer}'></div>"
         f"<span style='position:absolute; top:0; left:0; right:0; height:100%; "
         f"display:flex; align-items:center; justify-content:center; "
-        f"font-size:13px; color:{text_color}; font-weight:600'>"
+        f"font-size:13px; color:#fff; font-weight:600; "
+        f"text-shadow:0 1px 3px rgba(0,0,0,0.5)'>"
         f"{message}{icon}</span>"
         f"</div>"
     )
@@ -312,6 +333,7 @@ def run_transcription(
     #          progress_bar, cached_results, retry_btn, speaker_tab,
     #          batch_queue_html, file_selector, cancel_btn, cancel_state
     _skip = gr.skip()
+    is_batch = total > 1  # only show batch queue for multi-file jobs
 
     for idx, media_file in enumerate(media_files):
         if cancel_event.is_set():
@@ -319,7 +341,8 @@ def run_transcription(
                 statuses[j] = "cancelled"
             queue_html = _render_batch_queue(filenames, statuses, errors)
             yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-                   queue_html, _skip, _skip, cancel_state)
+                   gr.HTML(value=queue_html, visible=is_batch),
+                   _skip, _skip, cancel_state)
             break
 
         statuses[idx] = "processing"
@@ -328,7 +351,8 @@ def run_transcription(
 
         yield (_skip, _skip, _skip, _skip,
                _render_progress(0, batch_msg), _skip, _skip, _skip,
-               queue_html, _skip, gr.Button(visible=True), cancel_state)
+               gr.HTML(value=queue_html, visible=is_batch),
+               _skip, gr.Button(visible=True), cancel_state)
 
         # Run transcription in a thread
         progress_queue: queue.Queue = queue.Queue()
@@ -394,7 +418,8 @@ def run_transcription(
 
         queue_html = _render_batch_queue(filenames, statuses, errors)
         yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-               queue_html, _skip, _skip, _skip)
+               gr.HTML(value=queue_html, visible=is_batch),
+               _skip, _skip, _skip)
 
     # --- Batch complete ---
     done_count = sum(1 for s in statuses if s == "done")
@@ -442,12 +467,14 @@ def run_transcription(
     queue_html = _render_batch_queue(filenames, statuses, errors)
 
     yield (
-        plain_text, speaker_text, download_path, info,
+        plain_text, speaker_text,
+        gr.DownloadButton(value=download_path, visible=download_path is not None),
+        info,
         _render_progress(1.0, f"Done — {' | '.join(summary_parts)}"),
         all_results,
         gr.Button(visible=show_retry),
         gr.Tab(visible=has_speakers),
-        queue_html,
+        gr.HTML(value=queue_html, visible=is_batch),
         gr.Dropdown(choices=selector_choices,
                     value=selector_choices[0] if selector_choices else None,
                     visible=len(selector_choices) > 1),
@@ -589,7 +616,9 @@ def run_retry_diarize(media_files, hf_token, cached_results):
     show_retry = any(r.get("diarize_error") for r in updated_results.values())
     has_speakers = bool(speaker_text)
 
-    yield (plain_text, speaker_text, txt_path, info, "",
+    yield (plain_text, speaker_text,
+           gr.DownloadButton(value=txt_path, visible=True),
+           info, "",
            updated_results, gr.Button(visible=show_retry),
            gr.Tab(visible=has_speakers), _skip, _skip, _skip, _skip)
 
@@ -710,8 +739,8 @@ def create_app(native_mode=False):
                     visible=False,
                 )
 
-            # --- Batch queue display ---
-            batch_queue_html = gr.HTML(value="", elem_classes=["progress-container"])
+            # --- Batch queue display (hidden until multi-file batch) ---
+            batch_queue_html = gr.HTML(value="", visible=False, elem_classes=["progress-container"])
 
             # --- Progress ---
             progress_bar = gr.HTML(value="", elem_classes=["progress-container"])
@@ -748,7 +777,9 @@ def create_app(native_mode=False):
                             buttons=["copy"],
                             elem_classes=["transcript-box"],
                         )
-                txt_download = gr.File(label="Download Transcript")
+                txt_download = gr.DownloadButton(
+                    label="Download Transcript", visible=False,
+                )
 
         # --- Storage info (collapsible) ---
         with gr.Accordion("Storage & file locations", open=False):
