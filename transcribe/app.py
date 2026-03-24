@@ -183,7 +183,7 @@ def _on_webview_started(window: webview.Window):
 
     # Expose the JS API so Gradio pages can call window.pywebview.api.*
     api = JsApi(window)
-    window.expose(api)
+    window.expose(api.pick_files, api.save_transcript)
 
     # Inject a helper script that connects the native file picker to Gradio.
     # When the user picks files via the native dialog, we populate the hidden
@@ -235,9 +235,9 @@ def main():
     window = webview.create_window(
         title="Media Transcriber",
         url=f"http://127.0.0.1:{port}",
-        width=900,
-        height=750,
-        min_size=(600, 500),
+        width=1100,
+        height=900,
+        min_size=(800, 600),
         background_color="#0b1326",
     )
 

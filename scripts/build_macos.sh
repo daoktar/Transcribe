@@ -16,7 +16,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="1.0.0"
+VERSION="1.1.0"
 APP_NAME="Media Transcriber"
 DMG_NAME="MediaTranscriber-${VERSION}-arm64"
 
