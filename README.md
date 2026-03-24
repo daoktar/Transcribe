@@ -7,7 +7,7 @@ Local video & audio transcription powered by [whisper.cpp](https://github.com/gg
 - **Multi-format support** — MP4, MKV, AVI, MOV, WebM, FLV, WMV, MP3, WAV, OGG, FLAC, AAC, M4A, WMA, Opus
 - **Voice Activity Detection** — WebRTC VAD skips silence and music, reducing hallucinations
 - **Speaker diarization** — identify and label speakers via pyannote.audio (optional, requires HuggingFace token)
-- **Multiple interfaces** — CLI and native macOS app with menu bar tray
+- **Multiple interfaces** — CLI and native macOS app (dark UI with Upload/Process/Review tabs) with menu bar tray
 - **5 model sizes** — tiny, base, small, medium, large-v3
 - **Auto language detection** — or set manually with ISO 639-1 codes
 - **Standalone macOS app** — PyInstaller packaging with .dmg distribution
@@ -57,7 +57,7 @@ python -m transcribe.cli recording.mp4 --speakers --num-speakers 3
 python -m transcribe.app
 ```
 
-Runs as a native window with menu bar tray icon. Minimize-to-tray, Cmd+Q to quit.
+Opens a native window with a dark navy UI organized into three tabs — Upload, Process, and Review. Includes menu bar tray icon, minimize-to-tray, and Cmd+Q to quit.
 
 ## Speaker Diarization
 
