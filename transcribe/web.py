@@ -115,16 +115,14 @@ footer { display: none !important; }
     border: none !important;
     box-shadow: none !important;
 }
-.dark-tabs > .tab-wrapper {
-    margin-top: -44px !important;
-}
 .dark-tabs > .tab-wrapper .tab-container[role="tablist"] {
     background: transparent !important;
     border: none !important;
     border-bottom: none !important;
     justify-content: flex-end !important;
-    gap: 32px !important;
+    gap: 24px !important;
     padding: 0 !important;
+    flex-wrap: wrap !important;
 }
 .dark-tabs > .tab-wrapper .tab-container[role="tablist"] button {
     background: transparent !important;
