@@ -11,8 +11,8 @@ pip install -r requirements.txt
 # CLI transcription (video or audio)
 python -m transcribe.cli <media_file> [--model large-v3] [--language en] [--output-dir ./out]
 
-# Launch Gradio web UI
-python -m transcribe.web
+# Launch native macOS app
+python -m transcribe.app
 
 # Run tests
 pytest tests/ -v
@@ -20,7 +20,7 @@ pytest tests/ -v
 
 ## Architecture
 
-The project is a Python package (`transcribe/`) with three modules:
+The project is a Python package (`transcribe/`) with these modules:
 
 - **`core.py`** — Transcription engine. Supports video (mp4, mkv, avi, mov, webm, flv, wmv) and audio (mp3, wav, ogg, flac, aac, m4a, wma, opus) files. The main pipeline in `transcribe_media()`:
   1. Loads a whisper.cpp model via pywhispercpp (auto-detects Metal on Apple Silicon)
@@ -38,13 +38,17 @@ The project is a Python package (`transcribe/`) with three modules:
   - Anti-hallucination params: `no_context=True`, `no_speech_thold=0.3`, `entropy_thold=2.4`, `max_tokens=100`
 
 - **`cli.py`** — CLI entry point via `argparse`. Calls `core.transcribe_media()` and saves TXT output.
-- **`web.py`** — Gradio web UI. Uses `gr.Blocks` layout with media file upload (video + audio), model/language selection, custom HTML progress bar (threading + queue + generator pattern), and downloadable TXT file.
+- **`web.py`** — Internal Gradio UI (used by the native app, not a standalone server). Provides `create_app()`, theme, and CSS consumed by `app.py`.
+- **`app.py`** — Native macOS app. Launches the Gradio server in a background thread and displays it inside a native WKWebView window via pywebview, with menu-bar tray integration via PyObjC.
+- **`tray.py`** — macOS menu bar (system tray) integration via PyObjC.
 
-All transcription logic lives in `core.py`. Both CLI and web UI are thin wrappers around it.
+All transcription logic lives in `core.py`. CLI and native app are thin wrappers around it.
 
 ## Dependencies
 
 - `pywhispercpp` — Python bindings for whisper.cpp (requires system ffmpeg)
 - `webrtcvad-wheels` — WebRTC Voice Activity Detection (lightweight C extension, no PyTorch)
-- `gradio` — Web UI framework
+- `gradio` — UI framework (used internally by the native app)
+- `pywebview` — Native WKWebView window for the macOS app
+- `pyobjc-framework-Cocoa` — macOS menu bar integration
 - `numpy` — Installed as a pywhispercpp dependency
