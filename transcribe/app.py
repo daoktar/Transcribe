@@ -238,7 +238,7 @@ def main():
         width=900,
         height=750,
         min_size=(600, 500),
-        background_color="#f8f9fb",
+        background_color="#0b1326",
     )
 
     # Intercept window close-button → hide to tray instead of quitting.
