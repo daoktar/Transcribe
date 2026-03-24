@@ -161,7 +161,7 @@ footer { display: none !important; }
     background: #131b2e !important;
     border: 2px dashed rgba(65,71,85,0.3) !important;
     border-radius: 24px !important;
-    min-height: 380px !important;
+    min-height: 300px !important;
     box-shadow: none !important;
 }
 .upload-zone .wrap { color: #c1c6d7 !important; }

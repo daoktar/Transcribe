@@ -235,9 +235,9 @@ def main():
     window = webview.create_window(
         title="Media Transcriber",
         url=f"http://127.0.0.1:{port}",
-        width=900,
-        height=750,
-        min_size=(600, 500),
+        width=1100,
+        height=900,
+        min_size=(800, 600),
         background_color="#0b1326",
     )
 
