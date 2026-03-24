@@ -8,10 +8,13 @@ Usage::
 
     python -m transcribe.app
 """
-
 from __future__ import annotations
 
+import os
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+
 import json
+import shutil
 import socket
 import sys
 import time
@@ -71,6 +74,24 @@ class JsApi:
         )
         return list(result) if result else []
 
+    def save_transcript(self, src_path: str) -> str:
+        """Open a native Save dialog and copy the transcript file there."""
+        from pathlib import Path
+        src = Path(src_path)
+        if not src.exists():
+            return ""
+        save_types = ("Text Files (*.txt;*.zip)",)
+        result = self._window.create_file_dialog(
+            webview.SAVE_DIALOG,
+            save_filename=src.name,
+            file_types=save_types,
+        )
+        if result:
+            dest = result if isinstance(result, str) else result[0]
+            shutil.copy2(str(src), dest)
+            return dest
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # Tray integration (dispatched to main thread after Cocoa event loop starts)
@@ -78,6 +99,17 @@ class JsApi:
 
 _tray = None  # keep a reference so it isn't garbage-collected
 _closing_handler = None  # stored so we can detach before real quit
+_quitting = False  # set True when the app should actually terminate
+
+
+def _force_quit(window: webview.Window):
+    """Detach the hide-on-close handler and destroy the window."""
+    global _closing_handler, _quitting
+    _quitting = True
+    if _closing_handler is not None:
+        window.events.closing -= _closing_handler
+        _closing_handler = None
+    window.destroy()
 
 
 def _setup_tray(window: webview.Window):
@@ -89,12 +121,7 @@ def _setup_tray(window: webview.Window):
         window.show()
 
     def _quit():
-        global _closing_handler
-        # Detach the hide-on-close handler so destroy() actually terminates.
-        if _closing_handler is not None:
-            window.events.closing -= _closing_handler
-            _closing_handler = None
-        window.destroy()
+        _force_quit(window)
 
     def _create():
         global _tray
@@ -111,6 +138,48 @@ def _setup_tray(window: webview.Window):
 def _on_webview_started(window: webview.Window):
     """Called by pywebview in a background thread once the GUI is ready."""
     _setup_tray(window)
+
+    # Hook Cmd+Q so it force-quits instead of being blocked by the
+    # hide-on-close handler.  We wrap the existing NSApplication delegate's
+    # applicationShouldTerminate: to set _quitting before the closing event.
+    from PyObjCTools.AppHelper import callAfter
+    from AppKit import NSApplication, NSTerminateNow
+    from Foundation import NSObject
+    import objc
+
+    class TerminateInterceptor(NSObject):
+        """Wraps the existing app delegate to intercept Cmd+Q."""
+
+        def initWithOriginal_(self, original):
+            self = objc.super(TerminateInterceptor, self).init()
+            if self is None:
+                return None
+            self._original = original
+            return self
+
+        def applicationShouldTerminate_(self, sender):
+            _force_quit(window)
+            return NSTerminateNow
+
+        def forwardingTargetForSelector_(self, sel):
+            return self._original
+
+        def respondsToSelector_(self, sel):
+            if sel == b"applicationShouldTerminate:":
+                return True
+            if self._original is not None:
+                return self._original.respondsToSelector_(sel)
+            return False
+
+    def _install():
+        app = NSApplication.sharedApplication()
+        original_delegate = app.delegate()
+        interceptor = TerminateInterceptor.alloc().initWithOriginal_(original_delegate)
+        app.setDelegate_(interceptor)
+        # Keep a reference to prevent GC
+        window._terminate_interceptor = interceptor
+
+    callAfter(_install)
 
     # Expose the JS API so Gradio pages can call window.pywebview.api.*
     api = JsApi(window)
@@ -137,6 +206,7 @@ def _on_webview_started(window: webview.Window):
                 pathsInput.dispatchEvent(new Event('input', { bubbles: true }));
             }
         };
+
     })();
     """)
 
@@ -171,10 +241,13 @@ def main():
         background_color="#f8f9fb",
     )
 
-    # Intercept window close → hide to tray instead of quitting.
+    # Intercept window close-button → hide to tray instead of quitting.
+    # Cmd+Q sets _quitting=True first, so the handler lets it through.
     def _hide_instead_of_close():
+        if _quitting:
+            return True  # allow the close
         window.hide()
-        return False  # cancel the close
+        return False  # cancel the close — just hide to tray
 
     global _closing_handler
     _closing_handler = _hide_instead_of_close
@@ -187,11 +260,13 @@ def main():
         gui="cocoa",
     )
 
-    # Cleanup: shut down the Gradio server.
+    # Cleanup: shut down the Gradio server and force-exit.
+    # Gradio spawns non-daemon threads that prevent a clean exit.
     try:
         gradio_app.close()
     except Exception:
         pass
+    os._exit(0)
 
 
 if __name__ == "__main__":

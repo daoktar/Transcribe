@@ -33,8 +33,8 @@ THEME = gr.themes.Soft(
         c400="#748ffc", c500="#4f7df5", c600="#4263eb", c700="#3b5bdb",
         c800="#364fc7", c900="#2b44a8", c950="#1e3a8a",
     ),
-    font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
-    font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "monospace"],
+    font=["-apple-system", "BlinkMacSystemFont", "system-ui", "sans-serif"],
+    font_mono=["SF Mono", "Menlo", "monospace"],
 ).set(
     body_background_fill="#f8f9fb",
     block_background_fill="white",
@@ -249,23 +249,44 @@ def run_transcription(
 
     # Normalise: single file comes as a str, multiple as a list
     if media_files is None:
-        raise gr.Error("Please upload at least one media file.")
+        media_files = []
     if isinstance(media_files, str):
         media_files = [media_files]
-    if not media_files:
-        raise gr.Error("Please upload at least one media file.")
 
-    # Parse original paths supplied by the native file picker (if any)
-    orig_paths: list[str | None] = [None] * len(media_files)
+    # Parse original paths supplied by the native file picker (if any).
+    # In native mode these are the real on-disk paths — use them as the
+    # file source when the Gradio upload is empty, and always as the
+    # save-alongside target.
+    native_paths: list[str] = []
     if original_paths_json:
         try:
             parsed = json.loads(original_paths_json)
             if isinstance(parsed, list):
-                for i, p in enumerate(parsed):
-                    if i < len(orig_paths):
-                        orig_paths[i] = p
+                native_paths = [str(p) for p in parsed if p]
         except (json.JSONDecodeError, TypeError):
             pass
+
+    # If Gradio upload is empty but native paths exist, use native paths
+    # directly (they're real local files, no copying needed).
+    if not media_files and native_paths:
+        media_files = native_paths
+
+    if not media_files:
+        raise gr.Error("Please upload at least one media file.")
+
+    # Build orig_paths map: prefer native paths, fall back to media_files
+    # themselves (handles the case where user uploads via Gradio in native mode).
+    orig_paths: list[str | None] = [None] * len(media_files)
+    for i in range(len(media_files)):
+        if i < len(native_paths):
+            orig_paths[i] = native_paths[i]
+        else:
+            # Gradio upload — media_files[i] is a temp copy, but if
+            # the path looks like a real file (not in a temp/gradio dir),
+            # use it as-is for save-alongside.
+            mf = str(media_files[i])
+            if "/tmp/" not in mf and "/gradio/" not in mf:
+                orig_paths[i] = mf
 
     # Validate extensions up-front
     for mf in media_files:
@@ -282,7 +303,7 @@ def run_transcription(
             "Enter your token or get one at huggingface.co/settings/tokens"
         )
 
-    lang = language if language else None
+    lang = language.strip().lower() if language else None
     total = len(media_files)
     filenames = [Path(mf).name for mf in media_files]
     statuses = ["pending"] * total
@@ -307,14 +328,14 @@ def run_transcription(
                 statuses[j] = "cancelled"
             queue_html = _render_batch_queue(filenames, statuses, errors)
             yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-                   queue_html, _skip, _skip, cancel_state)
+                   _skip, queue_html, _skip, _skip, cancel_state)
             break
 
         statuses[idx] = "processing"
         queue_html = _render_batch_queue(filenames, statuses, errors)
         batch_msg = f"File {idx + 1} of {total}: {filenames[idx]}"
 
-        yield (_skip, _skip, _skip, _skip,
+        yield (_skip, _skip, _skip, _skip, _skip,
                _render_progress(0, batch_msg), _skip, _skip, _skip,
                queue_html, _skip, gr.Button(visible=True), cancel_state)
 
@@ -353,7 +374,7 @@ def run_transcription(
                 break
             fraction, message = item
             combined_msg = f"[{idx + 1}/{total}] {message}"
-            yield (_skip, _skip, _skip, _skip,
+            yield (_skip, _skip, _skip, _skip, _skip,
                    _render_progress(fraction, combined_msg), _skip, _skip, _skip,
                    _skip, _skip, _skip, _skip)
 
@@ -381,7 +402,7 @@ def run_transcription(
 
         queue_html = _render_batch_queue(filenames, statuses, errors)
         yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-               queue_html, _skip, _skip, _skip)
+               _skip, queue_html, _skip, _skip, _skip)
 
     # --- Batch complete ---
     done_count = sum(1 for s in statuses if s == "done")
@@ -429,7 +450,9 @@ def run_transcription(
     queue_html = _render_batch_queue(filenames, statuses, errors)
 
     yield (
-        plain_text, speaker_text, download_path, info,
+        plain_text, speaker_text, download_path or "",
+        gr.Button(visible=bool(download_path)),
+        info,
         _render_progress(1.0, f"Done — {' | '.join(summary_parts)}"),
         all_results,
         gr.Button(visible=show_retry),
@@ -535,7 +558,7 @@ def run_retry_diarize(media_files, hf_token, cached_results):
         if item is None:
             break
         fraction, message = item
-        yield (_skip, _skip, _skip, _skip,
+        yield (_skip, _skip, _skip, _skip, _skip,
                _render_progress(fraction, message), _skip,
                _skip, _skip, _skip, _skip, _skip, _skip)
 
@@ -550,7 +573,9 @@ def run_retry_diarize(media_files, hf_token, cached_results):
     show_retry = bool(result.get("diarize_error"))
     has_speakers = bool(speaker_text)
 
-    yield (plain_text, speaker_text, txt_path, info, "",
+    yield (plain_text, speaker_text, str(txt_path),
+           gr.Button(visible=True),
+           info, "",
            {0: result}, gr.Button(visible=show_retry),
            gr.Tab(visible=has_speakers), _skip, _skip, _skip, _skip)
 
@@ -589,6 +614,17 @@ def create_app(native_mode=False):
                 elem_classes=["format-hint"],
             )
 
+            # Native mode: provide a browse button that opens the system picker
+            # and records original paths so "save alongside" works correctly.
+            if native_mode:
+                native_browse_btn = gr.Button(
+                    "Browse Files...", variant="secondary", size="sm"
+                )
+                native_browse_btn.click(
+                    fn=None,
+                    js="() => { window._nativeBrowse && window._nativeBrowse(); }",
+                )
+
             # --- Settings ---
             with gr.Group():
                 gr.Markdown("Settings", elem_classes=["section-label"])
@@ -606,23 +642,20 @@ def create_app(native_mode=False):
                         info="ISO 639-1 code (en, fr, de, ja, ...)",
                         scale=1,
                     )
-                diarize_checkbox = gr.Checkbox(
-                    label="Detect Speakers",
-                    value=False,
-                    info="Identify and label different speakers (requires HuggingFace token)",
-                )
-                hf_token_input = gr.Textbox(
-                    label="HuggingFace Token",
-                    placeholder="hf_xxxxxxxxxxxxxxxxxxxx",
-                    info="Get a token at huggingface.co/settings/tokens",
-                    type="password",
-                    visible=False,
-                )
-                diarize_checkbox.change(
-                    fn=lambda checked: gr.Textbox(visible=checked),
-                    inputs=[diarize_checkbox],
-                    outputs=[hf_token_input],
-                )
+                with gr.Row():
+                    diarize_checkbox = gr.Checkbox(
+                        label="Detect Speakers",
+                        value=False,
+                        info="Identify and label different speakers (requires HuggingFace token)",
+                        scale=2,
+                    )
+                    hf_token_input = gr.Textbox(
+                        label="HuggingFace Token",
+                        placeholder="hf_xxxxxxxxxxxxxxxxxxxx",
+                        info="Get a token at huggingface.co/settings/tokens",
+                        type="password",
+                        scale=1,
+                    )
 
                 save_alongside_checkbox = gr.Checkbox(
                     label="Save transcripts alongside source files",
@@ -693,7 +726,15 @@ def create_app(native_mode=False):
                             buttons=["copy"],
                             elem_classes=["transcript-box"],
                         )
-                txt_download = gr.File(label="Download Transcript")
+                txt_download = gr.Textbox(
+                    visible=False,
+                    elem_id="txt_download_path",
+                )
+                download_btn = gr.Button(
+                    "📥 Download Transcript",
+                    visible=False,
+                    elem_id="download_btn",
+                )
 
         # --- Storage info (collapsible) ---
         with gr.Accordion("Storage & file locations", open=False):
@@ -712,6 +753,7 @@ def create_app(native_mode=False):
 
         # --- Event wiring ---
         _outputs = [transcript_output, speaker_output, txt_download,
+                     download_btn,
                      info_text, progress_bar, cached_results,
                      retry_btn, speaker_tab,
                      batch_queue_html, file_selector, cancel_btn,
@@ -729,6 +771,25 @@ def create_app(native_mode=False):
             fn=run_retry_diarize,
             inputs=[media_input, hf_token_input, cached_results],
             outputs=_outputs,
+        )
+
+        download_btn.click(
+            fn=None,
+            inputs=[txt_download],
+            outputs=[],
+            js="""(path) => {
+                if (window.pywebview && window.pywebview.api && path) {
+                    window.pywebview.api.save_transcript(path);
+                } else if (path) {
+                    // Fallback for browser: fetch file from Gradio and trigger download
+                    const a = document.createElement('a');
+                    a.href = '/file=' + encodeURIComponent(path);
+                    a.download = path.split('/').pop();
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                }
+            }""",
         )
 
         cancel_btn.click(
