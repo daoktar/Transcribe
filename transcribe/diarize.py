@@ -24,12 +24,6 @@ def _load_pipeline(hf_token: str):
     hash of the token is kept in memory for cache invalidation — the raw
     token is never stored beyond the ``Pipeline.from_pretrained`` call.
     """
-    if not hf_token:
-        raise ValueError(
-            "hf_token is required for speaker diarization. "
-            "Get a token at huggingface.co/settings/tokens"
-        )
-
     from pyannote.audio import Pipeline
 
     import torch

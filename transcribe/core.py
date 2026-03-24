@@ -610,16 +610,6 @@ def retry_diarize(
     skipping the full whisper transcription.  Returns a new result dict with
     speaker labels applied, or with ``diarize_error`` if it fails again.
     """
-    if not hf_token:
-        return {
-            **result,
-            "diarize_error": (
-                "hf_token is required for speaker diarization. "
-                "Get a token at huggingface.co/settings/tokens"
-            ),
-            "speakers": 0,
-        }
-
     from transcribe.diarize import diarize as run_diarize
 
     def _report(frac: float, msg: str) -> None:

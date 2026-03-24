@@ -7,23 +7,15 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 # ---------------------------------------------------------------------------
 # Disable broken contrib hook for webrtcvad (incompatible with webrtcvad-wheels)
-# The hook is renamed temporarily for this build and restored on process exit
-# so that unrelated builds in the same environment are not affected.
 # ---------------------------------------------------------------------------
-import atexit
 import PyInstaller.config
 _hooks_dir = os.path.join(
     os.path.dirname(__import__("_pyinstaller_hooks_contrib").__file__),
     "stdhooks",
 )
 _bad_hook = os.path.join(_hooks_dir, "hook-webrtcvad.py")
-_disabled_hook = _bad_hook + ".disabled"
 if os.path.exists(_bad_hook):
-    os.rename(_bad_hook, _disabled_hook)
-    atexit.register(
-        lambda src=_disabled_hook, dst=_bad_hook:
-            os.path.exists(src) and os.rename(src, dst)
-    )
+    os.rename(_bad_hook, _bad_hook + ".disabled")
 
 # ---------------------------------------------------------------------------
 # Collect complex packages with data files
