@@ -223,7 +223,8 @@ input, select, textarea {
 /* Layout */
 .upload-layout {
   display: grid;
-  grid-template-columns: 7fr 5fr;
+  grid-template-columns: 1fr 1fr;
+  align-items: stretch;
   gap: 24px;
   padding: 24px 32px;
 }
@@ -234,11 +235,15 @@ input, select, textarea {
   border: 2px dashed var(--border-strong);  /* 0.4 — increased for visibility */
   border-radius: var(--radius-panel);
   min-height: 300px;
+  height: 100%;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   transition: border-color 0.25s, background-color 0.25s;
+  padding: 24px;
+  gap: 16px;
 }
 
 .drop-zone:hover {
@@ -251,6 +256,8 @@ input, select, textarea {
   align-items: center;
   text-align: center;
   gap: 12px;
+  margin-top: auto;
+  margin-bottom: auto;
 }
 
 .drop-zone-content .drop-icon {
@@ -282,7 +289,7 @@ input, select, textarea {
   flex-wrap: wrap;
   justify-content: center;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: auto;
 }
 
 .format-tags span,
@@ -301,7 +308,14 @@ input, select, textarea {
 .settings-panel {
   background: var(--bg-card);
   border-radius: var(--radius-panel);
-  padding: 25px;
+  padding: 28px 28px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.settings-panel .field {
+  margin: 0;
 }
 
 .section-title {
@@ -309,7 +323,11 @@ input, select, textarea {
   font-size: 20px;
   font-weight: 700;
   color: var(--text-primary);
-  margin-bottom: 20px;
+  margin-bottom: 0;
+}
+
+.settings-header {
+  margin-bottom: 0;
 }
 
 /* Field Labels */
@@ -363,7 +381,8 @@ select.field-select {
 .field-info {
   font-size: 12px;
   color: var(--text-subdued);
-  margin-top: 4px;
+  margin-top: 6px;
+  margin-bottom: 0;
 }
 
 /* Field Group */
@@ -1175,6 +1194,16 @@ a:focus-visible {
 .summary-inline .summary-stat strong {
   color: var(--text-primary);
   font-weight: 600;
+}
+
+.summary-error {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.1);
+  border-radius: 6px;
 }
 
 /* ----------------------------------------------------------

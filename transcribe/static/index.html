@@ -33,10 +33,10 @@
                         <p class="drop-text">Drop files here</p>
                         <p class="drop-subtext">or click to browse</p>
                     </div>
+                    <div class="format-tags" id="format-tags">
+                        <!-- Filled by JS from /api/config -->
+                    </div>
                     <input type="file" id="file-input" multiple hidden>
-                </div>
-                <div class="format-tags" id="format-tags">
-                    <!-- Filled by JS from /api/config -->
                 </div>
             </div>
 
@@ -60,8 +60,8 @@
                     </div>
 
                     <div class="field">
-                        <label for="language-input">LANGUAGE (ISO CODE)</label>
-                        <input type="text" id="language-input" placeholder="e.g. 'en', 'fr' (empty for auto)">
+                        <label for="language-input">LANGUAGE (DEFAULT IS 'ru')</label>
+                        <input type="text" id="language-input" value="ru" placeholder="e.g. 'en', 'fr' (empty for auto)">
                     </div>
 
                     <div class="field checkbox-field">
