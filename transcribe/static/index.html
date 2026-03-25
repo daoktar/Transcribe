@@ -133,18 +133,16 @@
             <div class="review-header-left">
                 <h2 class="review-title">Review Results</h2>
                 <p class="review-subtitle">Verification and export of your batch processing queue.</p>
-                <select id="file-selector" class="file-selector" hidden>
-                </select>
-            </div>
-            <div class="review-header-right" id="summary-box" hidden>
-                <!-- Summary: language, segments, speakers -->
             </div>
         </div>
 
         <!-- Transcript Canvas -->
         <div class="transcript-canvas">
-            <!-- File results list -->
-            <div id="file-results-list"></div>
+            <!-- File switcher pills (multi-file) -->
+            <div id="file-switcher" class="file-switcher" hidden></div>
+
+            <!-- Inline summary bar -->
+            <div id="summary-bar" class="summary-inline" hidden></div>
 
             <!-- Toolbar -->
             <div class="review-toolbar" id="review-toolbar" hidden>
