@@ -84,6 +84,10 @@ async function loadConfig() {
             if (hfInput) {
                 hfInput.placeholder = 'Token loaded from environment';
             }
+            const diarizeCheckbox = document.getElementById('diarize-checkbox');
+            if (diarizeCheckbox) {
+                diarizeCheckbox.checked = true;
+            }
         }
     } catch (err) {
         console.error('Failed to load config:', err);

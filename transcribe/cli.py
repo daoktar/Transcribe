@@ -48,11 +48,11 @@ def main():
 
     # Token is read from environment only — never from CLI args (visible in
     # process listings and shell history).
-    hf_token = os.environ.get("HF_TOKEN")
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
     if args.speakers and not hf_token:
         print(
             "Error: speaker diarization requires a HuggingFace token. "
-            "Set the HF_TOKEN environment variable.",
+            "Set the HF_TOKEN or HUGGINGFACE_TOKEN environment variable.",
             file=sys.stderr,
         )
         sys.exit(1)

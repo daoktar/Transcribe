@@ -6,7 +6,9 @@ import asyncio
 import atexit
 import io
 import json
+import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -16,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -24,7 +26,8 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from transcribe.core import (
     SUPPORTED_EXTENSIONS,
@@ -35,17 +38,35 @@ from transcribe.core import (
 )
 from transcribe.paths import get_base_dir
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
 
+# Security limits
+MAX_UPLOAD_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB per file
+MAX_NUM_SPEAKERS = 20
+MAX_LANGUAGE_LEN = 5
+
 # Single reusable temp directory — cleaned up on process exit
 _tmp_dir = tempfile.TemporaryDirectory(prefix="transcribe_")
 atexit.register(_tmp_dir.cleanup)
 
 STATIC_DIR = get_base_dir() / "static"
+
+
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to every response."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
 # ---------------------------------------------------------------------------
 # Job state
@@ -71,6 +92,7 @@ class Job:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     progress_queue: asyncio.Queue | None = field(default=None, repr=False)
     settings: dict = field(default_factory=dict)
+    _hf_token: str | None = field(default=None, repr=False)  # never in settings/logs
 
 
 _jobs: dict[str, Job] = {}
@@ -89,16 +111,67 @@ class TranscribeRequest(BaseModel):
     save_alongside: bool = False
     original_paths: list[str | None] | None = None
 
+    @field_validator("language")
+    @classmethod
+    def _validate_language(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        v = v.strip()
+        if not (1 <= len(v) <= MAX_LANGUAGE_LEN and v.isalpha()):
+            raise ValueError(f"Invalid language code: {v!r}")
+        return v.lower()
+
+    @field_validator("num_speakers")
+    @classmethod
+    def _validate_num_speakers(cls, v: int | None) -> int | None:
+        if v is not None and (v < 1 or v > MAX_NUM_SPEAKERS):
+            raise ValueError(f"num_speakers must be 1–{MAX_NUM_SPEAKERS}")
+        return v
+
 
 class RetryDiarizeRequest(BaseModel):
     hf_token: str | None = None
     num_speakers: int | None = None
     file_index: int = 0
 
+    @field_validator("num_speakers")
+    @classmethod
+    def _validate_num_speakers(cls, v: int | None) -> int | None:
+        if v is not None and (v < 1 or v > MAX_NUM_SPEAKERS):
+            raise ValueError(f"num_speakers must be 1–{MAX_NUM_SPEAKERS}")
+        return v
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_env_hf_token() -> str | None:
+    """Read HuggingFace token from environment (supports both common names)."""
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Strip path components and dangerous characters from an upload filename."""
+    # Take only the basename (prevent path traversal via ../../)
+    filename = Path(filename).name
+    # Remove any remaining path separators or null bytes
+    filename = re.sub(r'[\x00/\\]', '', filename)
+    return filename or "upload"
+
+
+def _validate_save_alongside_path(user_path: str) -> Path:
+    """Validate that a user-supplied path for save-alongside is safe.
+
+    Only allows paths under the user's home directory to prevent
+    arbitrary file writes.
+    """
+    resolved = Path(user_path).resolve()
+    home = Path.home().resolve()
+    if not resolved.is_relative_to(home):
+        raise ValueError(f"Path not within home directory: {resolved}")
+    return resolved
 
 
 def _get_job(job_id: str) -> Job:
@@ -174,7 +247,7 @@ def _run_transcription(job: Job) -> None:
                 progress_callback=_progress_cb,
                 diarize=job.settings.get("diarize", False),
                 num_speakers=job.settings.get("num_speakers"),
-                hf_token=job.settings.get("hf_token"),
+                hf_token=job._hf_token,
             )
             job.results[i] = result
             job.statuses[i] = "done"
@@ -184,7 +257,15 @@ def _run_transcription(job: Job) -> None:
 
             # Save transcript
             if job.settings.get("save_alongside") and job.original_paths[i]:
-                txt_path = save_txt_alongside(result, job.original_paths[i])
+                try:
+                    _validate_save_alongside_path(job.original_paths[i])
+                    txt_path = save_txt_alongside(result, job.original_paths[i])
+                except (ValueError, OSError):
+                    logger.warning("save_alongside path rejected, using temp dir")
+                    txt_path = save_txt(
+                        result,
+                        Path(_tmp_dir.name) / f"{fpath.stem}.txt",
+                    )
             else:
                 txt_path = save_txt(
                     result,
@@ -244,7 +325,15 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
 
         # Re-save transcript
         if job.settings.get("save_alongside") and job.original_paths[file_index]:
-            txt_path = save_txt_alongside(result, job.original_paths[file_index])
+            try:
+                _validate_save_alongside_path(job.original_paths[file_index])
+                txt_path = save_txt_alongside(result, job.original_paths[file_index])
+            except (ValueError, OSError):
+                logger.warning("save_alongside path rejected, using temp dir")
+                txt_path = save_txt(
+                    result,
+                    Path(_tmp_dir.name) / f"{job.files[file_index].stem}.txt",
+                )
         else:
             txt_path = save_txt(
                 result,
@@ -283,6 +372,7 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(title="Transcribe", docs_url="/docs")
+    app.add_middleware(_SecurityHeadersMiddleware)
 
     # Mount static files if the directory exists
     if STATIC_DIR.is_dir():
@@ -306,7 +396,7 @@ def create_app() -> FastAPI:
         return JSONResponse({
             "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
             "model_choices": MODEL_CHOICES,
-            "hf_token_set": bool(os.environ.get("HF_TOKEN")),
+            "hf_token_set": bool(_get_env_hf_token()),
         })
 
     # ------------------------------------------------------------------
@@ -349,7 +439,7 @@ def create_app() -> FastAPI:
         else:
             # Browser mode: uploaded files
             for upload in files:  # type: ignore[union-attr]
-                filename = upload.filename or "unknown"
+                filename = _sanitize_filename(upload.filename or "unknown")
                 suffix = Path(filename).suffix.lower()
                 if suffix not in SUPPORTED_EXTENSIONS:
                     raise HTTPException(
@@ -363,8 +453,18 @@ def create_app() -> FastAPI:
                     dest = job_dir / f"{Path(filename).stem}_{counter}{suffix}"
                     counter += 1
 
-                content = await upload.read()
-                dest.write_bytes(content)
+                # Stream upload with size limit
+                total_size = 0
+                chunks: list[bytes] = []
+                while chunk := await upload.read(1024 * 1024):  # 1 MB chunks
+                    total_size += len(chunk)
+                    if total_size > MAX_UPLOAD_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large (max {MAX_UPLOAD_SIZE // (1024**3)} GB)",
+                        )
+                    chunks.append(chunk)
+                dest.write_bytes(b"".join(chunks))
 
                 job.files.append(dest)
                 job.filenames.append(filename)
@@ -388,21 +488,26 @@ def create_app() -> FastAPI:
         if job.status == "processing":
             raise HTTPException(status_code=409, detail="Job already processing")
 
-        # Store settings
+        # Store settings (hf_token kept separate — never in serialisable dict)
         job.settings = {
             "model": body.model if body.model in MODEL_CHOICES else "large-v3",
             "language": body.language or None,
             "diarize": body.diarize,
-            "hf_token": body.hf_token or os.environ.get("HF_TOKEN"),
             "num_speakers": body.num_speakers,
             "save_alongside": body.save_alongside,
         }
+        job._hf_token = body.hf_token or _get_env_hf_token()
 
-        # Update original paths if provided
+        # Update original paths if provided (validate each path)
         if body.original_paths:
             for i, op in enumerate(body.original_paths):
-                if i < len(job.original_paths):
-                    job.original_paths[i] = op
+                if i < len(job.original_paths) and op:
+                    try:
+                        _validate_save_alongside_path(op)
+                        job.original_paths[i] = op
+                    except ValueError:
+                        logger.warning("Rejected original_path: %s", op)
+                        job.original_paths[i] = None
 
         # Reset state for re-runs
         job.status = "uploaded"
@@ -484,7 +589,10 @@ def create_app() -> FastAPI:
     async def download_transcripts(job_id: str):
         job = _get_job(job_id)
 
-        valid_paths = [p for p in job.txt_paths if Path(p).is_file()]
+        valid_paths = [
+            p for p in job.txt_paths
+            if Path(p).is_file() and Path(p).suffix == ".txt"
+        ]
         if not valid_paths:
             raise HTTPException(status_code=404, detail="No transcripts available")
 
@@ -540,9 +648,10 @@ def create_app() -> FastAPI:
         job.progress_queue = asyncio.Queue()
         job._loop = loop  # type: ignore[attr-defined]
 
+        hf_token = body.hf_token or job._hf_token or _get_env_hf_token()
         thread = threading.Thread(
             target=_run_retry_diarize,
-            args=(job, file_index, body.hf_token or os.environ.get("HF_TOKEN"), body.num_speakers),
+            args=(job, file_index, hf_token, body.num_speakers),
             daemon=True,
         )
         thread.start()
