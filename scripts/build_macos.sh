@@ -73,17 +73,46 @@ echo "ffprobe: $FFPROBE_BIN"
 echo "=== Building .app with PyInstaller ==="
 if ! command -v pyinstaller &>/dev/null; then
     echo "Installing PyInstaller..."
-    pip install pyinstaller
+    pip3 install pyinstaller
 fi
 
 pyinstaller MediaTranscriber.spec --noconfirm --clean
 
 echo "=== Build complete ==="
 ls -lh "dist/$APP_NAME.app/Contents/MacOS/MediaTranscriber"
+
+# -----------------------------------------------------------------------
+# Step 4: Post-build cleanup — remove unnecessary files from bundle
+# -----------------------------------------------------------------------
+echo "=== Post-build cleanup ==="
+APP_CONTENTS="dist/$APP_NAME.app/Contents"
+BEFORE_SIZE=$(du -sm "dist/$APP_NAME.app" | cut -f1)
+
+# Remove test directories
+find "$APP_CONTENTS" -type d \( -name "tests" -o -name "test" -o -name "__pycache__" \) -exec rm -rf {} + 2>/dev/null || true
+
+# Remove package metadata
+find "$APP_CONTENTS" -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+
+# Remove type stubs and documentation
+find "$APP_CONTENTS" \( -name "*.pyi" -o -name "*.pyx" \) -delete 2>/dev/null || true
+
+# Remove leftover torch test data and benchmarks
+find "$APP_CONTENTS" -path "*/torch/testing/*" -exec rm -rf {} + 2>/dev/null || true
+find "$APP_CONTENTS" -path "*/torch/utils/benchmark/*" -exec rm -rf {} + 2>/dev/null || true
+find "$APP_CONTENTS" -path "*/caffe2/*" -exec rm -rf {} + 2>/dev/null || true
+
+# Remove any scipy/sklearn/pandas that survived exclude (transitive imports)
+for pkg in scipy sklearn pandas matplotlib PIL grpc onnxruntime hf_xet; do
+    find "$APP_CONTENTS" -type d -name "$pkg" -exec rm -rf {} + 2>/dev/null || true
+done
+
+AFTER_SIZE=$(du -sm "dist/$APP_NAME.app" | cut -f1)
+echo "Cleanup saved $((BEFORE_SIZE - AFTER_SIZE))MB (${BEFORE_SIZE}MB -> ${AFTER_SIZE}MB)"
 echo "App bundle: dist/$APP_NAME.app"
 
 # -----------------------------------------------------------------------
-# Step 4: Create .dmg (optional)
+# Step 5: Create .dmg (optional)
 # -----------------------------------------------------------------------
 if [ "${SKIP_DMG:-}" = "1" ]; then
     echo "=== Skipping .dmg creation (SKIP_DMG=1) ==="

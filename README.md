@@ -108,14 +108,17 @@ Token security: never stored persistently (only SHA-256 hash cached for model re
 ## Building the macOS App
 
 ```bash
-# Build .app bundle
-bash scripts/build_macos.sh
+# Install build tools
+pip install pyinstaller
+brew install create-dmg   # optional, for .dmg creation
 
-# Build .dmg installer
-bash scripts/build_macos.sh --dmg
+# Build .app bundle + .dmg
+bash scripts/build_macos.sh
 ```
 
-Bundles ffmpeg, whisper models, and all Python dependencies into a standalone .app.
+The build excludes unused pyannote transitive dependencies (scipy, sklearn, pandas, matplotlib, onnxruntime) and torch subpackages (CUDA, distributed, JIT, ONNX) to minimize bundle size. A post-build cleanup step removes test data, metadata, and type stubs.
+
+To override the bundled ffmpeg: `FFMPEG_BIN=/path/to/ffmpeg FFPROBE_BIN=/path/to/ffprobe bash scripts/build_macos.sh`
 
 ## Privacy
 

@@ -24,7 +24,7 @@ torch_datas, torch_binaries, torch_hiddenimports = collect_all("torch")
 pyannote_datas, _, pyannote_hiddenimports = collect_all("pyannote")
 
 # ---------------------------------------------------------------------------
-# Locate bundled ffmpeg/ffprobe (Homebrew or build cache)
+# Locate bundled ffmpeg/ffprobe (Homebrew or env override)
 # ---------------------------------------------------------------------------
 _ffmpeg = os.environ.get("FFMPEG_BIN", shutil.which("ffmpeg") or "ffmpeg")
 _ffprobe = os.environ.get("FFPROBE_BIN", shutil.which("ffprobe") or "ffprobe")
@@ -73,11 +73,77 @@ a = Analysis(
         *pyannote_hiddenimports,
     ],
     excludes=[
+        # ---------------------------------------------------------------
+        # Torch: unused backends & subpackages (~50-80MB savings)
+        # ---------------------------------------------------------------
         "torch.cuda",
         "torch.distributed",
         "torch.testing",
+        "torch.utils.tensorboard",
+        "torch.utils.benchmark",
+        "torch.onnx",
+        "torch.jit",
+        "caffe2",
+        # ---------------------------------------------------------------
+        # Pyannote transitive deps not needed at runtime (~163MB savings)
+        # Only pyannote.audio is used; pyannote.metrics/database pull in
+        # scipy, sklearn, pandas, matplotlib — none used by our code.
+        # ---------------------------------------------------------------
+        "pyannote.metrics",
+        "pyannote.database",
+        "scipy",
+        "sklearn",
+        "scikit-learn",
+        "pandas",
+        "matplotlib",
+        "PIL",
+        "Pillow",
+        "grpc",
+        "grpcio",
+        "onnxruntime",
+        "hf_xet",
+        # ---------------------------------------------------------------
+        # Unused third-party
+        # ---------------------------------------------------------------
         "gradio",
         "gradio_client",
+        "sympy",
+        "IPython",
+        "notebook",
+        "jupyterlab",
+        # ---------------------------------------------------------------
+        # Testing / dev tools (should not be in production)
+        # ---------------------------------------------------------------
+        "pytest",
+        "_pytest",
+        "unittest",
+        "doctest",
+        "setuptools",
+        "pip",
+        "distutils",
+        "ensurepip",
+        # ---------------------------------------------------------------
+        # Unused stdlib
+        # ---------------------------------------------------------------
+        "tkinter",
+        "_tkinter",
+        "turtle",
+        "idlelib",
+        "xmlrpc",
+        "ftplib",
+        "imaplib",
+        "poplib",
+        "smtplib",
+        "nntplib",
+        "pydoc",
+        "pydoc_data",
+        # ---------------------------------------------------------------
+        # Unused numpy subpackages
+        # ---------------------------------------------------------------
+        "numpy.testing",
+        "numpy.tests",
+        "numpy.f2py",
+        "numpy.distutils",
     ],
     noarchive=False,
 )
@@ -85,7 +151,7 @@ a = Analysis(
 # ---------------------------------------------------------------------------
 # Build steps
 # ---------------------------------------------------------------------------
-pyz = PYZ(a.pure)
+pyz = PYZ(a.pure, optimize=2)
 
 exe = EXE(
     pyz,
@@ -95,7 +161,7 @@ exe = EXE(
     name="MediaTranscriber",
     debug=False,
     strip=False,       # don't strip — breaks PyObjC signatures
-    upx=False,         # don't compress — breaks torch Metal libs
+    upx=False,         # PyInstaller disables UPX on macOS anyway
     console=False,     # no terminal window
     target_arch="arm64",
 )
