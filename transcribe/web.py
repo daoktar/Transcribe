@@ -81,6 +81,16 @@ THEME = gr.themes.Base(
 CUSTOM_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
+/* ===== Hidden download helper ===== */
+.download-file-output {
+    position: absolute !important;
+    width: 0 !important;
+    height: 0 !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+
 /* ===== Global ===== */
 .gradio-container {
     max-width: 1280px !important;
@@ -437,6 +447,51 @@ footer { display: none !important; }
     background: transparent !important;
     border: none !important;
 }
+
+/* ===== Review Toolbar ===== */
+.review-toolbar {
+    background: #131b2e !important;
+    border-bottom: 1px solid rgba(65,71,85,0.05) !important;
+    padding: 12px 24px !important;
+    gap: 12px !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+.copy-text-btn button {
+    background: rgba(49,57,77,0.5) !important;
+    border: none !important;
+    border-radius: 8px !important;
+    color: #c1c6d7 !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 12px !important;
+    padding: 6px 12px !important;
+}
+.copy-text-btn button:hover {
+    background: rgba(49,57,77,0.8) !important;
+}
+
+/* ===== File Selector (Review tab) ===== */
+.file-selector {
+    background: #131b2e !important;
+    border-radius: 12px !important;
+    padding: 6px !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+.file-selector .wrap {
+    background: #131b2e !important;
+    border: none !important;
+    border-radius: 8px !important;
+}
+.file-selector .wrap input {
+    color: #c1c6d7 !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 500 !important;
+}
+.file-selector .dropdown-arrow {
+    color: #c1c6d7 !important;
+}
 """
 
 
@@ -615,6 +670,74 @@ def _render_summary_html(result):
     )
 
 
+def _render_file_results_html(filenames, all_results, txt_path_map):
+    """Render per-file result rows for the Review tab transcript canvas."""
+    if not filenames or not all_results:
+        return ""
+
+    badge_map = {
+        "ok": (
+            "<span style='background:rgba(60,221,199,0.1);"
+            "border:1px solid rgba(60,221,199,0.2);color:#3cddc7;"
+            "font-family:Inter,sans-serif;font-size:10px;padding:3px 9px;"
+            "border-radius:9999px;white-space:nowrap'>Done</span>"
+        ),
+        "warn": (
+            "<span style='background:rgba(251,191,36,0.1);"
+            "border:1px solid rgba(251,191,36,0.2);color:#fbbf24;"
+            "font-family:Inter,sans-serif;font-size:10px;padding:3px 9px;"
+            "border-radius:9999px;white-space:nowrap'>Warning</span>"
+        ),
+        "fail": (
+            "<span style='background:rgba(255,180,171,0.1);"
+            "border:1px solid rgba(255,180,171,0.2);color:#ffb4ab;"
+            "font-family:Inter,sans-serif;font-size:10px;padding:3px 9px;"
+            "border-radius:9999px;white-space:nowrap'>Failed</span>"
+        ),
+    }
+
+    file_icon = (
+        "<svg width='12' height='14' viewBox='0 0 12 14' fill='none' "
+        "style='flex-shrink:0'>"
+        "<path d='M1 2a1 1 0 011-1h5l4 4v7a1 1 0 01-1 1H2a1 1 0 01-1-1V2z' "
+        "stroke='#0088ff' stroke-width='1.2' fill='none'/>"
+        "<path d='M7 1v4h4' stroke='#0088ff' stroke-width='1.2' fill='none'/>"
+        "</svg>"
+    )
+
+    rows = []
+    for i, name in enumerate(filenames):
+        name_esc = html_mod.escape(name)
+        has_result = isinstance(all_results, dict) and i in all_results
+        result = all_results.get(i, {}) if isinstance(all_results, dict) else {}
+        has_diarize_error = bool(result.get("diarize_error"))
+
+        if has_result and not has_diarize_error:
+            badge = badge_map["ok"]
+        elif has_result and has_diarize_error:
+            badge = badge_map["warn"]
+        else:
+            badge = badge_map["fail"]
+
+        row = (
+            f"<div style='background:#131b2e;"
+            f"border-bottom:1px solid rgba(65,71,85,0.05);"
+            f"min-height:56px;display:flex;align-items:center;"
+            f"gap:19px;padding:0 24px'>"
+            f"<div style='display:flex;align-items:center;gap:8px;"
+            f"min-width:100px;flex:1'>"
+            f"{file_icon}"
+            f"<span style='font-family:Inter,sans-serif;font-weight:500;"
+            f"font-size:16px;color:#08f'>{name_esc}</span>"
+            f"</div>"
+            f"<div style='flex-shrink:0'>{badge}</div>"
+            f"</div>"
+        )
+        rows.append(row)
+
+    return "<div style='overflow:hidden'>" + "".join(rows) + "</div>"
+
+
 def _format_result(result, media_file):
     """Build transcript texts, info string, and saved file path from a result dict.
 
@@ -724,7 +847,8 @@ def run_transcription(
                 statuses[j] = "cancelled"
             queue_html = _render_batch_queue(filenames, statuses, errors)
             yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-                   _skip, queue_html, _skip, _skip, cancel_state, _skip, _skip, _skip)
+                   _skip, queue_html, _skip, _skip, cancel_state, _skip, _skip, _skip,
+                   _skip)
             break
 
         statuses[idx] = "processing"
@@ -736,7 +860,7 @@ def run_transcription(
         yield (_skip, _skip, _skip, _skip, _skip,
                _render_progress(0, batch_msg), _skip, _skip, _skip,
                queue_html, _skip, gr.Button(visible=True), cancel_state,
-               _skip, _skip, tab_update)
+               _skip, _skip, tab_update, _skip)
 
         progress_queue: queue.Queue = queue.Queue()
         result_holder: list[dict] = []
@@ -774,7 +898,7 @@ def run_transcription(
             combined_msg = f"[{idx + 1}/{total}] {message}"
             yield (_skip, _skip, _skip, _skip, _skip,
                    _render_progress(fraction, combined_msg), _skip, _skip, _skip,
-                   _skip, _skip, _skip, _skip, _skip, _skip, _skip)
+                   _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip)
 
         thread.join()
 
@@ -798,7 +922,7 @@ def run_transcription(
 
         queue_html = _render_batch_queue(filenames, statuses, errors)
         yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-               _skip, queue_html, _skip, _skip, _skip, _skip, _skip, _skip)
+               _skip, queue_html, _skip, _skip, _skip, _skip, _skip, _skip, _skip)
 
     # --- Batch complete ---
     done_count = sum(1 for s in statuses if s == "done")
@@ -862,13 +986,15 @@ def run_transcription(
         summary_html,
         gr.Column(visible=bool(summary_html)),
         gr.Tabs(selected="review"),
+        gr.Button(visible=bool(first_result_idx is not None)),
     )
 
 
 def _on_file_select(filename, all_results, media_files):
     """Switch displayed transcript when user picks a file from the dropdown."""
+    _sk = gr.skip()
     if not filename or not all_results or not media_files:
-        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        return _sk, _sk, _sk, _sk, _sk, _sk, _sk
 
     if isinstance(media_files, str):
         media_files = [media_files]
@@ -876,17 +1002,30 @@ def _on_file_select(filename, all_results, media_files):
     try:
         idx = int(filename.split(".", 1)[0]) - 1
     except (ValueError, IndexError):
-        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        return _sk, _sk, _sk, _sk, _sk, _sk, _sk
 
     if isinstance(all_results, dict) and idx in all_results and idx < len(media_files):
         result = all_results[idx]
         plain_text, speaker_text, _, info = _format_result(result, media_files[idx])
         has_speakers = bool(speaker_text)
         summary_html_val = _render_summary_html(result)
-        return (plain_text, speaker_text, info, gr.Tab(visible=has_speakers),
-                summary_html_val, gr.Column(visible=bool(summary_html_val)))
 
-    return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        # Build file results list for all files
+        filenames = [Path(mf).name for mf in media_files]
+        txt_path_map = {}
+        for i, res in (all_results or {}).items():
+            if isinstance(i, int) and i < len(media_files):
+                tp = str(Path(_tmp_dir.name) / f"{Path(media_files[i]).stem}.txt")
+                txt_path_map[i] = tp
+        file_results_val = _render_file_results_html(
+            filenames, all_results, txt_path_map
+        )
+
+        return (plain_text, speaker_text, info, gr.Tab(visible=has_speakers),
+                summary_html_val, gr.Column(visible=bool(summary_html_val)),
+                file_results_val)
+
+    return _sk, _sk, _sk, _sk, _sk, _sk, _sk
 
 
 def _on_cancel_click(cancel_state):
@@ -955,7 +1094,8 @@ def run_retry_diarize(media_files, hf_token, cached_results):
         fraction, message = item
         yield (_skip, _skip, _skip, _skip, _skip,
                _render_progress(fraction, message), _skip,
-               _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip)
+               _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
+               _skip)
 
     thread.join()
 
@@ -974,7 +1114,8 @@ def run_retry_diarize(media_files, hf_token, cached_results):
            info, "",
            {0: result}, gr.Button(visible=show_retry),
            gr.Tab(visible=has_speakers), _skip, _skip, _skip, _skip,
-           summary_html, gr.Column(visible=bool(summary_html)), _skip)
+           summary_html, gr.Column(visible=bool(summary_html)), _skip,
+           _skip)
 
 
 def create_app(native_mode=False):
@@ -992,7 +1133,45 @@ def create_app(native_mode=False):
     if _more_count:
         _format_tags += f" <span>+{_more_count} More</span>"
 
-    with gr.Blocks(title="Media Transcriber") as app:
+    _page_js = """
+    document.addEventListener('click', (e) => {
+        const btn = e.target.closest('button.copy-text-btn');
+        if (!btn) return;
+        const ta = document.querySelector('.transcript-box textarea');
+        if (!ta || !ta.value) return;
+        const text = ta.value;
+        function showFeedback(ok) {
+            const orig = btn.textContent;
+            btn.textContent = ok ? 'Copied!' : 'Copy failed';
+            setTimeout(() => { btn.textContent = orig; }, 1500);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text)
+                .then(() => showFeedback(true))
+                .catch(() => {
+                    const tmp = document.createElement('textarea');
+                    tmp.value = text;
+                    tmp.style.cssText = 'position:fixed;opacity:0';
+                    document.body.appendChild(tmp);
+                    tmp.select();
+                    showFeedback(document.execCommand('copy'));
+                    tmp.remove();
+                });
+        } else {
+            const tmp = document.createElement('textarea');
+            tmp.value = text;
+            tmp.style.cssText = 'position:fixed;opacity:0';
+            document.body.appendChild(tmp);
+            tmp.select();
+            showFeedback(document.execCommand('copy'));
+            tmp.remove();
+        }
+    });
+    """
+
+    _page_head = "<script>" + _page_js + "</script>"
+
+    with gr.Blocks(title="Media Transcriber", head=_page_head) as app:
 
         # --- App Header ---
         gr.Markdown("# Media Transcriber", elem_classes=["app-header"])
@@ -1138,31 +1317,45 @@ def create_app(native_mode=False):
                             "Verification and export of your batch processing queue.",
                             elem_classes=["review-subtitle"],
                         )
+                        file_selector = gr.Dropdown(
+                            label="",
+                            choices=[],
+                            visible=False,
+                            elem_classes=["file-selector"],
+                            show_label=False,
+                        )
                     with gr.Column(scale=1, visible=False) as summary_col:
                         summary_html = gr.HTML(
                             value="",
                             elem_classes=["summary-box"],
                         )
 
-                # File selector
-                file_selector = gr.Dropdown(
-                    label="View results for",
-                    choices=[],
-                    visible=False,
-                )
-
-                # Info text
-                info_text = gr.Textbox(
-                    label="Info",
-                    interactive=False,
-                    lines=1,
-                    max_lines=3,
-                    elem_classes=["info-display"],
-                    visible=False,
-                )
-
-                # Transcript content
+                # File results canvas
                 with gr.Group(elem_classes=["transcript-canvas"]):
+                    file_results_html = gr.HTML(
+                        value="",
+                        elem_classes=["no-bg"],
+                    )
+
+                    # -- Toolbar: Copy / Download / Retry --
+                    with gr.Row(elem_classes=["review-toolbar"]):
+                        copy_btn = gr.Button(
+                            "Copy Text",
+                            visible=False,
+                            elem_classes=["copy-text-btn"],
+                        )
+                        download_btn = gr.Button(
+                            "Download ALL (.zip)",
+                            visible=False,
+                            elem_classes=["download-btn"],
+                        )
+                        retry_btn = gr.Button(
+                            "Retry Speaker Detection",
+                            variant="secondary",
+                            visible=False,
+                            elem_classes=["retry-btn"],
+                        )
+
                     with gr.Tabs(elem_classes=["file-tabs"]):
                         with gr.Tab("Transcript"):
                             transcript_output = gr.Textbox(
@@ -1170,7 +1363,6 @@ def create_app(native_mode=False):
                                 lines=20,
                                 max_lines=40,
                                 interactive=False,
-                                buttons=["copy"],
                                 elem_classes=["transcript-box"],
                                 show_label=False,
                             )
@@ -1180,29 +1372,27 @@ def create_app(native_mode=False):
                                 lines=20,
                                 max_lines=40,
                                 interactive=False,
-                                buttons=["copy"],
                                 elem_classes=["transcript-box"],
                                 show_label=False,
                             )
 
+                # Hidden state
                 txt_download = gr.Textbox(
                     visible=False,
                     elem_id="txt_download_path",
                 )
-
-                # Action footer
-                with gr.Row():
-                    download_btn = gr.Button(
-                        "Download ALL (.zip)",
-                        visible=False,
-                        elem_classes=["download-btn"],
-                    )
-                    retry_btn = gr.Button(
-                        "Retry Speaker Detection",
-                        variant="secondary",
-                        visible=False,
-                        elem_classes=["retry-btn"],
-                    )
+                download_file_output = gr.File(
+                    visible=True,
+                    elem_classes=["download-file-output"],
+                )
+                info_text = gr.Textbox(
+                    label="Info",
+                    interactive=False,
+                    lines=1,
+                    max_lines=3,
+                    elem_classes=["info-display"],
+                    visible=False,
+                )
 
         # --- Event wiring ---
         _outputs = [transcript_output, speaker_output, txt_download,
@@ -1210,7 +1400,8 @@ def create_app(native_mode=False):
                      info_text, progress_bar, cached_results,
                      retry_btn, speaker_tab,
                      batch_queue_html, file_selector, cancel_btn,
-                     cancel_state, summary_html, summary_col, main_tabs]
+                     cancel_state, summary_html, summary_col, main_tabs,
+                     copy_btn]
 
         transcribe_btn.click(
             fn=run_transcription,
@@ -1226,22 +1417,23 @@ def create_app(native_mode=False):
             outputs=_outputs,
         )
 
+        # Copy button is handled by page-level JS event delegation (_page_js)
+
+        def _on_download_click(path):
+            """Return the transcript file for download."""
+            if path and Path(path).exists():
+                return gr.File(value=path, visible=True)
+            return gr.File(value=None, visible=True)
+
         download_btn.click(
-            fn=None,
+            fn=_on_download_click,
             inputs=[txt_download],
+            outputs=[download_file_output],
+        ).then(
+            fn=None,
+            inputs=[],
             outputs=[],
-            js="""(path) => {
-                if (window.pywebview && window.pywebview.api && path) {
-                    window.pywebview.api.save_transcript(path);
-                } else if (path) {
-                    const a = document.createElement('a');
-                    a.href = '/file=' + encodeURIComponent(path);
-                    a.download = path.split('/').pop();
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                }
-            }""",
+            js="() => { const link = document.querySelector('.download-file-output a[download]'); if (link) link.click(); }",
         )
 
         cancel_btn.click(
@@ -1254,7 +1446,7 @@ def create_app(native_mode=False):
             fn=_on_file_select,
             inputs=[file_selector, cached_results, media_input],
             outputs=[transcript_output, speaker_output, info_text, speaker_tab,
-                     summary_html, summary_col],
+                     summary_html, summary_col, file_results_html],
         )
 
     return app
@@ -1262,4 +1454,5 @@ def create_app(native_mode=False):
 
 if __name__ == "__main__":
     app = create_app()
-    app.launch(server_name="127.0.0.1", server_port=7860, theme=THEME, css=CUSTOM_CSS)
+    app.launch(server_name="127.0.0.1", server_port=7860, theme=THEME, css=CUSTOM_CSS,
+               allowed_paths=[_tmp_dir.name])
