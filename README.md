@@ -82,9 +82,20 @@ Identifies different speakers using pyannote.audio. Requires a free [HuggingFace
 [00:03] Speaker 2: I'm doing great, thanks for asking!
 ```
 
-**CLI:** set `HF_TOKEN` env var + `--speakers` flag. **Native app:** check "Detect Speakers" and paste token.
+### Providing Your Token
 
-Token security: never stored (only SHA-256 hash cached), never logged, password-masked in UI, env-var only on CLI.
+The app looks for a HuggingFace token in this order (first match wins):
+
+1. **Web UI field** — paste into the "HuggingFace Token" input (least preferred; token transits through the browser)
+2. **Environment variable** — `export HF_TOKEN=hf_...` before launching
+3. **`.env` file** — create a `.env` file in the project root (see `.env.example`):
+   ```
+   HF_TOKEN=hf_YourTokenHere
+   ```
+
+**CLI:** set `HF_TOKEN` env var + `--speakers` flag.
+
+Token security: never stored persistently (only SHA-256 hash cached for model reuse), never logged, password-masked in UI.
 
 ## How It Works
 
