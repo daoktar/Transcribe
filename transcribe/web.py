@@ -32,6 +32,7 @@ from transcribe.core import (
     save_txt_alongside,
     transcribe_media,
 )
+from transcribe.paths import get_base_dir
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,7 +44,7 @@ MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
 _tmp_dir = tempfile.TemporaryDirectory(prefix="transcribe_")
 atexit.register(_tmp_dir.cleanup)
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = get_base_dir() / "static"
 
 # ---------------------------------------------------------------------------
 # Job state

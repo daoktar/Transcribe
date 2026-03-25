@@ -21,8 +21,6 @@ if os.path.exists(_bad_hook):
 # Collect complex packages with data files
 # ---------------------------------------------------------------------------
 torch_datas, torch_binaries, torch_hiddenimports = collect_all("torch")
-gradio_datas, gradio_binaries, gradio_hiddenimports = collect_all("gradio")
-gradio_client_datas, _, gradio_client_hiddenimports = collect_all("gradio_client")
 pyannote_datas, _, pyannote_hiddenimports = collect_all("pyannote")
 
 # ---------------------------------------------------------------------------
@@ -39,19 +37,14 @@ a = Analysis(
     pathex=[],
     datas=[
         ("transcribe/assets", "transcribe/assets"),
-        *collect_data_files("safehttpx"),
-        *collect_data_files("groovy"),
-        *collect_data_files("gradio_client"),
+        ("transcribe/static", "transcribe/static"),
         *torch_datas,
-        *gradio_datas,
-        *gradio_client_datas,
         *pyannote_datas,
     ],
     binaries=[
         (_ffmpeg, "."),
         (_ffprobe, "."),
         *torch_binaries,
-        *gradio_binaries,
     ],
     hiddenimports=[
         "transcribe",
@@ -64,6 +57,12 @@ a = Analysis(
         "webrtcvad",
         "pywhispercpp",
         "pywhispercpp.model",
+        "fastapi",
+        "uvicorn",
+        "starlette",
+        "starlette.staticfiles",
+        "starlette.responses",
+        "multipart",
         "PyObjCTools",
         "PyObjCTools.AppHelper",
         "AppKit",
@@ -71,14 +70,14 @@ a = Analysis(
         "objc",
         "webview",
         *torch_hiddenimports,
-        *gradio_hiddenimports,
-        *gradio_client_hiddenimports,
         *pyannote_hiddenimports,
     ],
     excludes=[
         "torch.cuda",
         "torch.distributed",
         "torch.testing",
+        "gradio",
+        "gradio_client",
     ],
     noarchive=False,
 )
@@ -119,8 +118,8 @@ app = BUNDLE(
         "CFBundleName": "Media Transcriber",
         "CFBundleDisplayName": "Media Transcriber",
         "CFBundleIdentifier": "com.mediatranscriber.app",
-        "CFBundleVersion": "1.0.0",
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleVersion": "1.1.0",
+        "CFBundleShortVersionString": "1.1.0",
         "CFBundlePackageType": "APPL",
         "CFBundleSignature": "MTSC",
         "CFBundleExecutable": "MediaTranscriber",
