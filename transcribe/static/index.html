@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Media Transcriber</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="app-header">
+        <h1>Media Transcriber</h1>
+    </header>
+
+    <!-- Tab Navigation -->
+    <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="upload">UPLOAD</button>
+        <button class="tab-btn" data-tab="process">PROCESS</button>
+        <button class="tab-btn" data-tab="review">REVIEW</button>
+    </nav>
+
+    <!-- TAB 1: UPLOAD -->
+    <section id="tab-upload" class="tab-panel active">
+        <div class="upload-layout">
+            <!-- Left: Drop Zone -->
+            <div class="upload-left">
+                <div class="drop-zone" id="drop-zone">
+                    <div class="drop-zone-content">
+                        <svg class="drop-icon" width="64" height="64" viewBox="0 0 64 64" fill="none">
+                            <rect x="8" y="8" width="48" height="48" rx="8" stroke="#3e90ff" stroke-width="2" stroke-dasharray="4 4"/>
+                            <path d="M32 22v20M22 32l10-10 10 10" stroke="#3e90ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        <p class="drop-text">Drop files here</p>
+                        <p class="drop-subtext">or click to browse</p>
+                    </div>
+                    <input type="file" id="file-input" multiple hidden>
+                </div>
+                <div class="format-tags" id="format-tags">
+                    <!-- Filled by JS from /api/config -->
+                </div>
+            </div>
+
+            <!-- Right: Settings Panel -->
+            <div class="upload-right">
+                <div class="settings-panel">
+                    <div class="settings-header">
+                        <span class="settings-icon">☰</span>
+                        <span class="section-title">Transcription Engine</span>
+                    </div>
+
+                    <div class="field">
+                        <label for="model-select">MODEL ENGINE</label>
+                        <select id="model-select">
+                            <option value="tiny">tiny</option>
+                            <option value="base">base</option>
+                            <option value="small">small</option>
+                            <option value="medium">medium</option>
+                            <option value="large-v3" selected>large-v3</option>
+                        </select>
+                    </div>
+
+                    <div class="field">
+                        <label for="language-input">LANGUAGE (ISO CODE)</label>
+                        <input type="text" id="language-input" placeholder="e.g. 'en', 'fr' (empty for auto)">
+                    </div>
+
+                    <div class="field checkbox-field">
+                        <label>
+                            <input type="checkbox" id="diarize-checkbox">
+                            <span>Detect Speakers</span>
+                        </label>
+                        <p class="field-info">Identify unique voices in media</p>
+                    </div>
+
+                    <div class="field">
+                        <label for="hf-token">HUGGINGFACE TOKEN</label>
+                        <input type="password" id="hf-token" placeholder="hf_****************">
+                        <p class="field-info">Required for speaker detection diarization</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Transcribe Button -->
+        <div class="transcribe-btn-wrap">
+            <button id="transcribe-btn" class="btn-primary btn-large" disabled>Transcribe</button>
+            <p class="gpu-hint">Engine will utilize GPU acceleration if available.</p>
+        </div>
+    </section>
+
+    <!-- TAB 2: PROCESS -->
+    <section id="tab-process" class="tab-panel">
+        <div class="process-layout">
+            <!-- Left: Progress -->
+            <div class="process-left">
+                <div class="process-card">
+                    <div class="progress-section" id="progress-section">
+                        <div class="progress-label">Current Activity</div>
+                        <div class="progress-message" id="progress-message">Waiting to start...</div>
+                        <div class="progress-bar-wrap">
+                            <div class="progress-bar-track">
+                                <div class="progress-bar-fill" id="progress-bar-fill" style="width: 0%"></div>
+                            </div>
+                            <div class="progress-pct-row">
+                                <span>0%</span>
+                                <span class="progress-pct-current" id="progress-pct">0%</span>
+                                <span>100%</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right: Job Queue -->
+            <div class="process-right">
+                <div class="job-queue">
+                    <div class="job-queue-header">Job Queue</div>
+                    <div id="job-queue-list">
+                        <p class="queue-empty">No files queued yet.</p>
+                    </div>
+                    <button id="cancel-btn" class="btn-cancel" hidden>Cancel Remaining</button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- TAB 3: REVIEW -->
+    <section id="tab-review" class="tab-panel">
+        <!-- Header row -->
+        <div class="review-header-row">
+            <div class="review-header-left">
+                <h2 class="review-title">Review Results</h2>
+                <p class="review-subtitle">Verification and export of your batch processing queue.</p>
+                <select id="file-selector" class="file-selector" hidden>
+                </select>
+            </div>
+            <div class="review-header-right" id="summary-box" hidden>
+                <!-- Summary: language, segments, speakers -->
+            </div>
+        </div>
+
+        <!-- Transcript Canvas -->
+        <div class="transcript-canvas">
+            <!-- File results list -->
+            <div id="file-results-list"></div>
+
+            <!-- Toolbar -->
+            <div class="review-toolbar" id="review-toolbar" hidden>
+                <button id="copy-btn" class="btn-tool">Copy Text</button>
+                <button id="download-btn" class="btn-primary btn-small">Download ALL (.zip)</button>
+                <button id="retry-btn" class="btn-retry" hidden>Retry Speaker Detection</button>
+            </div>
+
+            <!-- Transcript/Speakers sub-tabs -->
+            <div class="transcript-tabs" id="transcript-tabs" hidden>
+                <button class="transcript-tab active" data-subtab="transcript">Transcript</button>
+                <button class="transcript-tab" data-subtab="speakers">Speakers</button>
+            </div>
+
+            <div class="transcript-content" id="transcript-content">
+                <pre class="transcript-text" id="transcript-text"></pre>
+                <pre class="transcript-text" id="speaker-text" hidden></pre>
+            </div>
+        </div>
+    </section>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

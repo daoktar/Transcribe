@@ -1,13 +1,29 @@
+"""FastAPI backend for Transcribe — REST API + SSE progress streaming + static files."""
+
+from __future__ import annotations
+
+import asyncio
 import atexit
-import html as html_mod
+import io
 import json
-import queue
+import shutil
 import tempfile
 import threading
+import uuid
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-import gradio as gr
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from transcribe.core import (
     SUPPORTED_EXTENSIONS,
@@ -17,1442 +33,565 @@ from transcribe.core import (
     transcribe_media,
 )
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
 
 # Single reusable temp directory — cleaned up on process exit
 _tmp_dir = tempfile.TemporaryDirectory(prefix="transcribe_")
 atexit.register(_tmp_dir.cleanup)
 
+STATIC_DIR = Path(__file__).parent / "static"
+
 # ---------------------------------------------------------------------------
-# Theme & styling — Dark navy design from Figma
+# Job state
 # ---------------------------------------------------------------------------
 
-THEME = gr.themes.Base(
-    primary_hue=gr.themes.Color(
-        c50="#dae2fd", c100="#aac7ff", c200="#7fadff", c300="#5a94ff",
-        c400="#3e90ff", c500="#3e90ff", c600="#3578d9", c700="#2c63b3",
-        c800="#234e8d", c900="#1a3a67", c950="#003064",
-    ),
-    secondary_hue=gr.themes.Color(
-        c50="#dae2fd", c100="#c1c6d7", c200="#414755", c300="#31394d",
-        c400="#222a3d", c500="#1a2236", c600="#131b2e", c700="#0b1326",
-        c800="#060e20", c900="#030a18", c950="#010510",
-    ),
-    neutral_hue=gr.themes.Color(
-        c50="#dae2fd", c100="#c1c6d7", c200="#8a91a4", c300="#6b7280",
-        c400="#414755", c500="#31394d", c600="#222a3d", c700="#131b2e",
-        c800="#0b1326", c900="#060e20", c950="#030a18",
-    ),
-    font=["Inter", "-apple-system", "BlinkMacSystemFont", "system-ui", "sans-serif"],
-    font_mono=["JetBrains Mono", "SF Mono", "Menlo", "monospace"],
-).set(
-    body_background_fill="#0b1326",
-    body_text_color="#dae2fd",
-    body_text_color_subdued="#c1c6d7",
-    block_background_fill="#131b2e",
-    block_border_width="1px",
-    block_border_color="rgba(65,71,85,0.1)",
-    block_shadow="none",
-    block_radius="12px",
-    block_label_text_color="#c1c6d7",
-    block_title_text_color="#dae2fd",
-    input_background_fill="#222a3d",
-    input_border_color="rgba(65,71,85,0.2)",
-    input_border_width="1px",
-    input_radius="8px",
-    input_placeholder_color="rgba(65,71,85,0.5)",
-    button_primary_background_fill="linear-gradient(165deg, #aac7ff 0%, #3e90ff 100%)",
-    button_primary_text_color="#003064",
-    button_primary_border_color="transparent",
-    button_secondary_background_fill="transparent",
-    button_secondary_text_color="#c1c6d7",
-    button_secondary_border_color="rgba(65,71,85,0.2)",
-    button_cancel_background_fill="transparent",
-    button_cancel_text_color="#ffb4ab",
-    button_cancel_border_color="rgba(255,180,171,0.3)",
-    button_large_radius="12px",
-    checkbox_background_color="#222a3d",
-    checkbox_border_color="rgba(65,71,85,0.2)",
-    checkbox_label_text_color="#dae2fd",
-    shadow_spread="0px",
-    border_color_primary="rgba(65,71,85,0.1)",
-)
 
-CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+@dataclass
+class Job:
+    """In-memory state for one transcription job."""
 
-/* ===== Hidden download helper ===== */
-.download-file-output {
-    position: absolute !important;
-    width: 0 !important;
-    height: 0 !important;
-    overflow: hidden !important;
-    opacity: 0 !important;
-    pointer-events: none !important;
-}
-
-/* ===== Global ===== */
-.gradio-container {
-    max-width: 1280px !important;
-    background: #0b1326 !important;
-    overflow-x: hidden !important;
-}
-body, html { overflow-x: hidden !important; }
-footer { display: none !important; }
-.prose { color: #c1c6d7 !important; }
-.prose h1, .prose h2, .prose h3 { color: #dae2fd !important; }
-
-/* ===== App Header ===== */
-.app-header {
-    background: #0b1326 !important;
-    border: none !important;
-    box-shadow: none !important;
-    padding: 14px 0 8px !important;
-    margin-bottom: 0 !important;
-}
-.app-header h1 {
-    font-family: 'Manrope', sans-serif !important;
-    font-size: 18px !important;
-    font-weight: 600 !important;
-    color: #aac7ff !important;
-    letter-spacing: 0.45px;
-    margin: 0 !important;
-}
-
-/* ===== Tab Navigation (UPLOAD / PROCESS / REVIEW) ===== */
-.dark-tabs {
-    background: transparent !important;
-    border: none !important;
-    box-shadow: none !important;
-}
-.dark-tabs > .tab-wrapper .tab-container[role="tablist"] {
-    background: transparent !important;
-    border: none !important;
-    border-bottom: none !important;
-    justify-content: flex-end !important;
-    gap: 24px !important;
-    padding: 0 !important;
-    flex-wrap: wrap !important;
-}
-.dark-tabs > .tab-wrapper .tab-container[role="tablist"] button {
-    background: transparent !important;
-    border: none !important;
-    border-bottom: 2px solid transparent !important;
-    color: #dae2fd !important;
-    opacity: 0.6;
-    font-family: 'Inter', sans-serif !important;
-    font-size: 14px !important;
-    font-weight: 400 !important;
-    letter-spacing: 1.4px !important;
-    text-transform: uppercase !important;
-    padding: 4px 0 6px !important;
-    margin: 0 !important;
-    transition: opacity 0.2s, border-color 0.2s !important;
-}
-.dark-tabs > .tab-wrapper .tab-container[role="tablist"] button.selected {
-    opacity: 1 !important;
-    color: #aac7ff !important;
-    border-bottom-color: #aac7ff !important;
-    font-weight: 600 !important;
-}
-.dark-tabs > .tab-wrapper .tab-container[role="tablist"] button:hover {
-    opacity: 0.85 !important;
-}
-.dark-tabs > .tabitem {
-    background: transparent !important;
-    border: none !important;
-    padding: 0 !important;
-}
-
-/* ===== Upload Drop Zone ===== */
-.upload-zone {
-    background: #131b2e !important;
-    border: 2px dashed rgba(65,71,85,0.3) !important;
-    border-radius: 24px !important;
-    min-height: 300px !important;
-    box-shadow: none !important;
-}
-.upload-zone .wrap { color: #c1c6d7 !important; }
-.upload-zone .or { color: #414755 !important; }
-
-/* ===== Settings Panel ===== */
-.settings-panel {
-    background: #131b2e !important;
-    border: 1px solid rgba(65,71,85,0.05) !important;
-    border-radius: 24px !important;
-    padding: 25px !important;
-    box-shadow: none !important;
-}
-.settings-panel .section-title {
-    font-family: 'Manrope', sans-serif !important;
-    font-weight: 700;
-    font-size: 20px;
-    color: #dae2fd;
-}
-.settings-panel label span {
-    font-family: 'Inter', sans-serif !important;
-    font-size: 12px !important;
-    font-weight: 600 !important;
-    color: #c1c6d7 !important;
-    text-transform: uppercase !important;
-    letter-spacing: 1.2px !important;
-}
-
-/* ===== Format Tags ===== */
-.format-tags {
-    text-align: center;
-    font-size: 0;
-    padding: 8px 0;
-    opacity: 0.4;
-}
-.format-tags span {
-    display: inline-block;
-    background: #222a3d;
-    color: #dae2fd;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 10px;
-    letter-spacing: -0.5px;
-    padding: 4px 8px;
-    border-radius: 8px;
-    margin: 0 4px 4px 0;
-}
-
-/* ===== Supported Formats Box ===== */
-.formats-box {
-    background: #060e20 !important;
-    border: 1px solid rgba(65,71,85,0.1) !important;
-    border-radius: 12px !important;
-    box-shadow: none !important;
-}
-.formats-box .format-heading {
-    font-family: 'Manrope', sans-serif;
-    font-weight: 700;
-    font-size: 12px;
-    color: #c1c6d7;
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
-}
-.formats-box .format-list {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 14px;
-    line-height: 1.6;
-    color: #c1c6d7;
-}
-
-/* ===== Transcribe Button ===== */
-.transcribe-btn {
-    margin-top: 8px !important;
-}
-.transcribe-btn button {
-    background: linear-gradient(170deg, #aac7ff 0%, #3e90ff 100%) !important;
-    color: #003064 !important;
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 600 !important;
-    font-size: 18px !important;
-    border: none !important;
-    border-radius: 12px !important;
-    padding: 20px 48px !important;
-    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25) !important;
-    transition: box-shadow 0.2s, transform 0.15s, opacity 0.2s !important;
-    max-width: 448px;
-    margin: 0 auto;
-}
-.transcribe-btn button:hover {
-    box-shadow: 0 25px 50px -8px rgba(62,144,255,0.3) !important;
-    transform: translateY(-1px) !important;
-}
-.gpu-hint {
-    text-align: center;
-    font-family: 'Inter', sans-serif;
-    font-size: 12px;
-    color: #c1c6d7;
-    opacity: 0.6;
-    margin-top: 8px;
-}
-
-/* ===== Processing Card ===== */
-.process-card {
-    background: #131b2e !important;
-    border-radius: 12px !important;
-    border: none !important;
-    box-shadow: none !important;
-    overflow: hidden;
-    position: relative;
-}
-.process-card::after {
-    content: '';
-    position: absolute;
-    top: -128px;
-    right: -128px;
-    width: 256px;
-    height: 256px;
-    background: #3e90ff;
-    filter: blur(50px);
-    opacity: 0.05;
-    pointer-events: none;
-}
-
-/* ===== Log Section ===== */
-.log-section {
-    background: #060e20 !important;
-    border: 1px solid rgba(65,71,85,0.1) !important;
-    border-radius: 8px !important;
-    box-shadow: none !important;
-}
-
-/* ===== Job Queue ===== */
-.job-queue {
-    background: #131b2e !important;
-    border-radius: 12px !important;
-    border: none !important;
-    box-shadow: none !important;
-}
-.job-queue-header {
-    font-family: 'Manrope', sans-serif;
-    font-weight: 600;
-    font-size: 18px;
-    color: #dae2fd;
-    padding-bottom: 4px;
-    border-bottom: 1px solid rgba(65,71,85,0.1);
-    margin-bottom: 16px;
-}
-
-/* ===== Cancel Button ===== */
-.cancel-btn button {
-    border: 1px solid rgba(255,180,171,0.3) !important;
-    color: #ffb4ab !important;
-    background: transparent !important;
-    font-family: 'Manrope', sans-serif !important;
-    font-weight: 600 !important;
-    font-size: 14px !important;
-    border-radius: 8px !important;
-}
-
-/* ===== Review Tab ===== */
-.review-title {
-    overflow: hidden !important;
-}
-.review-title h2 {
-    font-family: 'Manrope', sans-serif !important;
-    font-weight: 800 !important;
-    font-size: 30px !important;
-    color: #dae2fd !important;
-    letter-spacing: -0.75px !important;
-}
-.review-subtitle p {
-    font-family: 'Inter', sans-serif !important;
-    color: #c1c6d7 !important;
-    font-size: 16px !important;
-}
-.summary-box {
-    background: #222a3d !important;
-    border: 1px solid rgba(65,71,85,0.1) !important;
-    border-radius: 12px !important;
-    box-shadow: none !important;
-    overflow: hidden !important;
-}
-
-/* ===== Transcript Canvas ===== */
-.transcript-canvas {
-    background: #060e20 !important;
-    border: 1px solid rgba(65,71,85,0.1) !important;
-    border-radius: 16px !important;
-    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25) !important;
-    overflow: hidden;
-}
-.transcript-toolbar {
-    background: #131b2e !important;
-    border-bottom: 1px solid rgba(65,71,85,0.05) !important;
-    border: none !important;
-    box-shadow: none !important;
-}
-.transcript-box textarea {
-    font-family: 'JetBrains Mono', monospace !important;
-    line-height: 1.6 !important;
-    font-size: 14px !important;
-    color: rgba(218,226,253,0.9) !important;
-    background: #060e20 !important;
-    max-height: 500px !important;
-    overflow-y: auto !important;
-}
-
-/* ===== Download Button ===== */
-.download-btn button {
-    background: linear-gradient(7deg, #aac7ff 0%, #3e90ff 100%) !important;
-    color: #003064 !important;
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 600 !important;
-    border: none !important;
-    border-radius: 8px !important;
-}
-.retry-btn button {
-    background: rgba(251,191,36,0.1) !important;
-    color: #fbbf24 !important;
-    border: none !important;
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 600 !important;
-    font-size: 12px !important;
-    border-radius: 8px !important;
-}
-
-/* ===== Transparent containers ===== */
-.no-bg {
-    background: transparent !important;
-    border: none !important;
-    box-shadow: none !important;
-    padding: 0 !important;
-}
-
-/* ===== File selector tabs (Review page) ===== */
-.file-tabs {
-    background: #131b2e !important;
-    border-radius: 12px !important;
-    padding: 6px !important;
-    box-shadow: none !important;
-    border: none !important;
-}
-.file-tabs > .tab-wrapper .tab-container[role="tablist"] {
-    background: transparent !important;
-    border: none !important;
-    border-bottom: none !important;
-    gap: 8px !important;
-    padding: 0 !important;
-}
-.file-tabs > .tab-wrapper .tab-container[role="tablist"] button {
-    background: transparent !important;
-    border: none !important;
-    color: #c1c6d7 !important;
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 500 !important;
-    font-size: 16px !important;
-    padding: 8px 16px !important;
-    border-radius: 8px !important;
-    margin: 0 !important;
-}
-.file-tabs > .tab-wrapper .tab-container[role="tablist"] button.selected {
-    background: #3e90ff !important;
-    color: #002957 !important;
-    box-shadow: 0 0 15px rgba(62,144,255,0.2) !important;
-}
-.file-tabs > .tabitem {
-    background: transparent !important;
-    border: none !important;
-    padding: 0 !important;
-}
-
-/* ===== Info text styling ===== */
-.info-display textarea {
-    font-family: 'Inter', sans-serif !important;
-    color: #c1c6d7 !important;
-    background: transparent !important;
-    border: none !important;
-}
-
-/* ===== Review Toolbar ===== */
-.review-toolbar {
-    background: #131b2e !important;
-    border-bottom: 1px solid rgba(65,71,85,0.05) !important;
-    padding: 12px 24px !important;
-    gap: 12px !important;
-    border: none !important;
-    box-shadow: none !important;
-}
-.copy-text-btn button {
-    background: rgba(49,57,77,0.5) !important;
-    border: none !important;
-    border-radius: 8px !important;
-    color: #c1c6d7 !important;
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 500 !important;
-    font-size: 12px !important;
-    padding: 6px 12px !important;
-}
-.copy-text-btn button:hover {
-    background: rgba(49,57,77,0.8) !important;
-}
-
-/* ===== File Selector (Review tab) ===== */
-.file-selector {
-    background: #131b2e !important;
-    border-radius: 12px !important;
-    padding: 6px !important;
-    border: none !important;
-    box-shadow: none !important;
-}
-.file-selector .wrap {
-    background: #131b2e !important;
-    border: none !important;
-    border-radius: 8px !important;
-}
-.file-selector .wrap input {
-    color: #c1c6d7 !important;
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 500 !important;
-}
-.file-selector .dropdown-arrow {
-    color: #c1c6d7 !important;
-}
-"""
+    id: str
+    files: list[Path] = field(default_factory=list)
+    filenames: list[str] = field(default_factory=list)
+    original_paths: list[str | None] = field(default_factory=list)
+    status: str = "uploaded"  # uploaded | processing | done | cancelled
+    statuses: list[str] = field(default_factory=list)  # per-file
+    errors: dict[int, str] = field(default_factory=dict)
+    results: dict[int, dict] = field(default_factory=dict)
+    txt_paths: list[str] = field(default_factory=list)
+    progress_fraction: float = 0.0
+    progress_message: str = ""
+    current_file_index: int = 0
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    progress_queue: asyncio.Queue | None = field(default=None, repr=False)
+    settings: dict = field(default_factory=dict)
 
 
-def _render_progress(fraction: float, message: str) -> str:
-    """Render a progress bar matching the Figma dark design."""
-    pct = max(0, min(100, int(fraction * 100)))
-    message = html_mod.escape(message)
-    is_done = pct >= 100
+_jobs: dict[str, Job] = {}
 
-    if is_done:
-        fill = "linear-gradient(90deg, #3cddc7, #00a392)"
-        glow = "0 0 15px rgba(60,221,199,0.4)"
-    else:
-        fill = "linear-gradient(90deg, #aac7ff, #3e90ff)"
-        glow = "0 0 15px rgba(62,144,255,0.4)"
-
-    shimmer = (
-        ""
-        if is_done
-        else (
-            "background-image: linear-gradient(90deg, transparent 0%, "
-            "rgba(255,255,255,0.15) 50%, transparent 100%);"
-            "background-size: 200% 100%;"
-            "animation: shimmer 1.8s infinite;"
-        )
-    )
-
-    return (
-        f"<style>@keyframes shimmer {{0%{{background-position:200% 0}}"
-        f"100%{{background-position:-200% 0}}}}</style>"
-        f"<div style='text-align:center; padding:16px 0 8px'>"
-        f"<div style='font-family:Inter,sans-serif; font-size:12px; "
-        f"color:#c1c6d7; text-transform:uppercase; letter-spacing:1.2px; "
-        f"margin-bottom:8px'>Current Activity</div>"
-        f"<div style='font-family:Manrope,sans-serif; font-size:24px; "
-        f"font-weight:600; color:#dae2fd; margin-bottom:24px'>{message}</div>"
-        f"</div>"
-        f"<div style='max-width:512px; margin:0 auto'>"
-        f"<div style='background:#31394d; border-radius:9999px; overflow:hidden; "
-        f"height:16px; position:relative'>"
-        f"<div style='width:{pct}%; background:{fill}; height:100%; "
-        f"border-radius:9999px; box-shadow:{glow}; "
-        f"transition:width 0.4s cubic-bezier(0.4,0,0.2,1); {shimmer}'></div>"
-        f"</div>"
-        f"<div style='display:flex; justify-content:space-between; "
-        f"margin-top:12px; font-family:monospace; font-size:14px; color:#c1c6d7'>"
-        f"<span>0%</span>"
-        f"<span style='font-weight:700; color:#aac7ff'>{pct}%</span>"
-        f"<span>100%</span>"
-        f"</div>"
-        f"</div>"
-    )
+# ---------------------------------------------------------------------------
+# Pydantic request bodies
+# ---------------------------------------------------------------------------
 
 
-def _render_batch_queue(filenames, statuses, errors=None):
-    """Render the batch file queue matching the Figma card design."""
-    if not filenames:
-        return ""
-    errors = errors or {}
-
-    badge_styles = {
-        "processing": "background:#3e90ff; color:#002957;",
-        "pending": "background:#31394d; color:#c1c6d7;",
-        "done": "background:#00a392; color:#00302a;",
-        "error": "background:#93000a; color:#ffdad6;",
-        "cancelled": "background:#414755; color:#dae2fd;",
-    }
-    card_borders = {
-        "processing": "border:none;",
-        "pending": "border:1px solid rgba(65,71,85,0.1);",
-        "done": "border:1px solid rgba(60,221,199,0.1);",
-        "error": "border:1px solid rgba(255,180,171,0.1);",
-        "cancelled": "border:none; opacity:0.4;",
-    }
-
-    items = []
-    for i, name in enumerate(filenames):
-        status = statuses[i]
-        badge = badge_styles.get(status, badge_styles["pending"])
-        border = card_borders.get(status, card_borders["pending"])
-        label = html_mod.escape(name)
-        note = ""
-        if status in ("error", "done") and i in errors:
-            note = f"<div style='font-size:11px; color:#c1c6d7; opacity:0.7; margin-top:4px'>{html_mod.escape(str(errors[i]))}</div>"
-
-        progress_html = ""
-        if status == "processing":
-            card_bg = "#222a3d"
-            progress_html = (
-                "<div style='background:#171f33; height:4px; border-radius:9999px; "
-                "overflow:hidden; margin-top:8px'>"
-                "<div style='background:#aac7ff; width:45%; height:100%'></div>"
-                "</div>"
-            )
-        elif status == "pending":
-            card_bg = "#171f33"
-        else:
-            card_bg = "#171f33"
-
-        items.append(
-            f"<div style='background:{card_bg}; {border} border-radius:8px; "
-            f"padding:16px; margin-bottom:8px'>"
-            f"<div style='display:flex; align-items:center; justify-content:space-between'>"
-            f"<span style='{badge} font-family:Inter,sans-serif; font-size:12px; "
-            f"padding:2px 8px; border-radius:9999px'>{status.title()}</span>"
-            f"</div>"
-            f"<div style='font-family:Inter,sans-serif; font-weight:500; "
-            f"font-size:14px; color:#dae2fd; margin-top:8px'>{label}</div>"
-            f"{note}{progress_html}"
-            f"</div>"
-        )
-
-    return "<div>" + "".join(items) + "</div>"
+class TranscribeRequest(BaseModel):
+    model: str = "large-v3"
+    language: str | None = None
+    diarize: bool = False
+    hf_token: str | None = None
+    num_speakers: int | None = None
+    save_alongside: bool = False
+    original_paths: list[str | None] | None = None
 
 
-def _render_log_html(log_entries=None):
-    """Render the log section matching the Figma dark design."""
-    if not log_entries:
-        return (
-            "<div style='font-family:JetBrains Mono,monospace; font-size:12px; "
-            "color:#c1c6d7; opacity:0.5; padding:8px 0'>Waiting for transcription to start...</div>"
-        )
-    lines = []
-    for ts, msg in log_entries:
-        lines.append(
-            f"<div style='display:flex; gap:16px; margin-bottom:8px'>"
-            f"<span style='color:#3cddc7; opacity:0.5; font-family:monospace; "
-            f"font-size:12px; white-space:nowrap'>{html_mod.escape(ts)}</span>"
-            f"<span style='color:#c1c6d7; font-family:monospace; "
-            f"font-size:12px'>{html_mod.escape(msg)}</span>"
-            f"</div>"
-        )
-    return "<div>" + "".join(lines) + "</div>"
+class RetryDiarizeRequest(BaseModel):
+    hf_token: str
+    num_speakers: int | None = None
+    file_index: int = 0
 
 
-def _render_summary_html(result):
-    """Render the processing summary box for the Review tab."""
-    if not result:
-        return ""
-    lang = html_mod.escape(str(result.get("language", "—")).upper())
-    segments = len(result.get("segments", []))
-    speakers = result.get("speakers", "—")
-    has_error = bool(result.get("diarize_error"))
-    status_badge = (
-        "<span style='background:rgba(60,221,199,0.1); border:1px solid rgba(60,221,199,0.2); "
-        "color:#3cddc7; font-size:10px; padding:3px 9px; border-radius:9999px'>Success</span>"
-        if not has_error else
-        "<span style='background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.2); "
-        "color:#fbbf24; font-size:10px; padding:3px 9px; border-radius:9999px'>Warning</span>"
-    )
-    return (
-        f"<div style='padding:25px'>"
-        f"<div style='display:flex; justify-content:space-between; align-items:center; "
-        f"padding-bottom:16px'>"
-        f"<span style='font-family:Inter,sans-serif; font-weight:600; font-size:12px; "
-        f"color:#aac7ff; text-transform:uppercase; letter-spacing:1.2px'>Processing Summary</span>"
-        f"{status_badge}"
-        f"</div>"
-        f"<div style='display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px'>"
-        f"<div>"
-        f"<div style='font-family:Inter,sans-serif; font-weight:600; font-size:10px; "
-        f"color:#c1c6d7; text-transform:uppercase; letter-spacing:-0.5px'>Language</div>"
-        f"<div style='font-family:Manrope,sans-serif; font-weight:700; font-size:18px; "
-        f"color:#dae2fd'>{lang}</div></div>"
-        f"<div>"
-        f"<div style='font-family:Inter,sans-serif; font-weight:600; font-size:10px; "
-        f"color:#c1c6d7; text-transform:uppercase; letter-spacing:-0.5px'>Segments</div>"
-        f"<div style='font-family:Manrope,sans-serif; font-weight:700; font-size:18px; "
-        f"color:#dae2fd'>{segments}</div></div>"
-        f"<div>"
-        f"<div style='font-family:Inter,sans-serif; font-weight:600; font-size:10px; "
-        f"color:#c1c6d7; text-transform:uppercase; letter-spacing:-0.5px'>Speakers</div>"
-        f"<div style='font-family:Manrope,sans-serif; font-weight:700; font-size:18px; "
-        f"color:#dae2fd'>{speakers}</div></div>"
-        f"</div></div>"
-    )
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _render_file_results_html(filenames, all_results, txt_path_map):
-    """Render per-file result rows for the Review tab transcript canvas."""
-    if not filenames or not all_results:
-        return ""
-
-    badge_map = {
-        "ok": (
-            "<span style='background:rgba(60,221,199,0.1);"
-            "border:1px solid rgba(60,221,199,0.2);color:#3cddc7;"
-            "font-family:Inter,sans-serif;font-size:10px;padding:3px 9px;"
-            "border-radius:9999px;white-space:nowrap'>Done</span>"
-        ),
-        "warn": (
-            "<span style='background:rgba(251,191,36,0.1);"
-            "border:1px solid rgba(251,191,36,0.2);color:#fbbf24;"
-            "font-family:Inter,sans-serif;font-size:10px;padding:3px 9px;"
-            "border-radius:9999px;white-space:nowrap'>Warning</span>"
-        ),
-        "fail": (
-            "<span style='background:rgba(255,180,171,0.1);"
-            "border:1px solid rgba(255,180,171,0.2);color:#ffb4ab;"
-            "font-family:Inter,sans-serif;font-size:10px;padding:3px 9px;"
-            "border-radius:9999px;white-space:nowrap'>Failed</span>"
-        ),
-    }
-
-    file_icon = (
-        "<svg width='12' height='14' viewBox='0 0 12 14' fill='none' "
-        "style='flex-shrink:0'>"
-        "<path d='M1 2a1 1 0 011-1h5l4 4v7a1 1 0 01-1 1H2a1 1 0 01-1-1V2z' "
-        "stroke='#0088ff' stroke-width='1.2' fill='none'/>"
-        "<path d='M7 1v4h4' stroke='#0088ff' stroke-width='1.2' fill='none'/>"
-        "</svg>"
-    )
-
-    rows = []
-    for i, name in enumerate(filenames):
-        name_esc = html_mod.escape(name)
-        has_result = isinstance(all_results, dict) and i in all_results
-        result = all_results.get(i, {}) if isinstance(all_results, dict) else {}
-        has_diarize_error = bool(result.get("diarize_error"))
-
-        if has_result and not has_diarize_error:
-            badge = badge_map["ok"]
-        elif has_result and has_diarize_error:
-            badge = badge_map["warn"]
-        else:
-            badge = badge_map["fail"]
-
-        row = (
-            f"<div style='background:#131b2e;"
-            f"border-bottom:1px solid rgba(65,71,85,0.05);"
-            f"min-height:56px;display:flex;align-items:center;"
-            f"gap:19px;padding:0 24px'>"
-            f"<div style='display:flex;align-items:center;gap:8px;"
-            f"min-width:100px;flex:1'>"
-            f"{file_icon}"
-            f"<span style='font-family:Inter,sans-serif;font-weight:500;"
-            f"font-size:16px;color:#08f'>{name_esc}</span>"
-            f"</div>"
-            f"<div style='flex-shrink:0'>{badge}</div>"
-            f"</div>"
-        )
-        rows.append(row)
-
-    return "<div style='overflow:hidden'>" + "".join(rows) + "</div>"
+def _get_job(job_id: str) -> Job:
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
-def _format_result(result, media_file):
-    """Build transcript texts, info string, and saved file path from a result dict.
-
-    Returns (plain_text, speaker_text, txt_path, info).
-    ``speaker_text`` is non-empty only when speaker labels are available.
-    """
-    tmp_path = Path(_tmp_dir.name)
-    stem = Path(media_file).stem
-    txt_path = save_txt(result, tmp_path / f"{stem}.txt")
-
-    plain_text = result["text"]
-    speaker_text = ""
-
-    if result.get("speakers") and result["segments"]:
-        lines = []
-        for seg in result["segments"]:
-            lines.append(f"{seg['speaker']}: {seg['text']}")
-        speaker_text = "\n".join(lines)
-
-    info = f"Language: {result['language']} | Segments: {len(result['segments'])}"
-    if result.get("speakers"):
-        info += f" | Speakers: {result['speakers']}"
-    if result.get("diarize_error"):
-        info += (
-            f"\n Speaker detection failed: {result['diarize_error']}"
-            "\nFix your token above and click \"Retry Speaker Detection\"."
-        )
-
-    return plain_text, speaker_text, str(txt_path), info
+def _enqueue(job: Job, event: dict[str, Any]) -> None:
+    """Push an SSE event dict onto the job's asyncio queue from any thread."""
+    q = job.progress_queue
+    if q is None:
+        return
+    loop = job._loop  # type: ignore[attr-defined]
+    loop.call_soon_threadsafe(q.put_nowait, event)
 
 
-def run_transcription(
-    media_files, model_size, language, diarize_speakers, hf_token,
-    save_alongside, original_paths_json, cancel_state,
-):
-    """Transcribe one or more files sequentially with batch progress."""
+def _run_transcription(job: Job) -> None:
+    """Run transcription for all files in the job (called in a background thread)."""
+    job.status = "processing"
+    done_count = 0
+    error_count = 0
+    first_result_index: int | None = None
 
-    # Normalise: single file comes as a str, multiple as a list
-    if media_files is None:
-        media_files = []
-    if isinstance(media_files, str):
-        media_files = [media_files]
+    total_files = len(job.files)
 
-    # Parse original paths supplied by the native file picker (if any).
-    native_paths: list[str] = []
-    if original_paths_json:
+    for i, fpath in enumerate(job.files):
+        if job.cancel_event.is_set():
+            job.status = "cancelled"
+            for j in range(i, total_files):
+                job.statuses[j] = "cancelled"
+            _enqueue(job, {
+                "type": "complete",
+                "done_count": done_count,
+                "error_count": error_count,
+                "first_result_index": first_result_index,
+                "cancelled": True,
+            })
+            return
+
+        job.current_file_index = i
+        job.statuses[i] = "processing"
+
+        # Build per-file progress callback
+        def _progress_cb(
+            fraction: float,
+            message: str,
+            *,
+            _file_index: int = i,
+            _total: int = total_files,
+        ) -> None:
+            # Scale fraction across all files
+            overall = (_file_index + fraction) / _total
+            job.progress_fraction = overall
+            job.progress_message = message
+            _enqueue(job, {
+                "type": "progress",
+                "fraction": round(overall, 4),
+                "message": message,
+                "file_index": _file_index,
+                "statuses": list(job.statuses),
+                "errors": {str(k): v for k, v in job.errors.items()},
+            })
+
+        _progress_cb(0.0, f"Starting {job.filenames[i]}...")
+
         try:
-            parsed = json.loads(original_paths_json)
-            if isinstance(parsed, list):
-                native_paths = [str(p) for p in parsed if p]
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    if not media_files and native_paths:
-        media_files = native_paths
-
-    if not media_files:
-        raise gr.Error("Please upload at least one media file.")
-
-    orig_paths: list[str | None] = [None] * len(media_files)
-    for i in range(len(media_files)):
-        if i < len(native_paths):
-            orig_paths[i] = native_paths[i]
-        else:
-            mf = str(media_files[i])
-            if "/tmp/" not in mf and "/gradio/" not in mf:
-                orig_paths[i] = mf
-
-    # Validate extensions up-front
-    for mf in media_files:
-        ext = Path(mf).suffix.lower()
-        if ext not in SUPPORTED_EXTENSIONS:
-            raise gr.Error(
-                f"Unsupported file format '{ext}' ({Path(mf).name}). "
-                f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            result = transcribe_media(
+                media_path=str(fpath),
+                model_size=job.settings.get("model", "large-v3"),
+                language=job.settings.get("language"),
+                progress_callback=_progress_cb,
+                diarize=job.settings.get("diarize", False),
+                num_speakers=job.settings.get("num_speakers"),
+                hf_token=job.settings.get("hf_token"),
             )
+            job.results[i] = result
+            job.statuses[i] = "done"
+            done_count += 1
+            if first_result_index is None:
+                first_result_index = i
 
-    if diarize_speakers and not hf_token:
-        raise gr.Error(
-            "Speaker detection requires a HuggingFace token. "
-            "Enter your token or get one at huggingface.co/settings/tokens"
-        )
-
-    lang = language.strip().lower() if language else None
-    total = len(media_files)
-    filenames = [Path(mf).name for mf in media_files]
-    statuses = ["pending"] * total
-    errors: dict[int, str] = {}
-    all_results: dict[int, dict] = {}
-    all_txt_paths: list[str] = []
-
-    cancel_event = threading.Event()
-    if isinstance(cancel_state, dict):
-        cancel_state.clear()
-    cancel_state = {"event": cancel_event}
-
-    _skip = gr.skip()
-
-    # Outputs: transcript, speaker_transcript, txt_file, download_btn,
-    #          info, progress_bar, cached_results, retry_btn, speaker_tab,
-    #          batch_queue_html, file_selector, cancel_btn, cancel_state,
-    #          summary_html, main_tabs
-
-    for idx, media_file in enumerate(media_files):
-        if cancel_event.is_set():
-            for j in range(idx, total):
-                statuses[j] = "cancelled"
-            queue_html = _render_batch_queue(filenames, statuses, errors)
-            yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-                   _skip, queue_html, _skip, _skip, cancel_state, _skip, _skip, _skip,
-                   _skip)
-            break
-
-        statuses[idx] = "processing"
-        queue_html = _render_batch_queue(filenames, statuses, errors)
-        batch_msg = f"File {idx + 1} of {total}: {filenames[idx]}"
-
-        # Switch to Process tab on first file
-        tab_update = gr.Tabs(selected="process") if idx == 0 else _skip
-        yield (_skip, _skip, _skip, _skip, _skip,
-               _render_progress(0, batch_msg), _skip, _skip, _skip,
-               queue_html, _skip, gr.Button(visible=True), cancel_state,
-               _skip, _skip, tab_update, _skip)
-
-        progress_queue: queue.Queue = queue.Queue()
-        result_holder: list[dict] = []
-        error_holder: list[Exception] = []
-
-        def on_progress(fraction: float, message: str):
-            progress_queue.put((fraction, message))
-
-        def _run(_mf=media_file):
-            try:
-                result = transcribe_media(
-                    _mf,
-                    model_size=model_size,
-                    language=lang,
-                    progress_callback=on_progress,
-                    diarize=diarize_speakers,
-                    hf_token=hf_token if diarize_speakers else None,
+            # Save transcript
+            if job.settings.get("save_alongside") and job.original_paths[i]:
+                txt_path = save_txt_alongside(result, job.original_paths[i])
+            else:
+                txt_path = save_txt(
+                    result,
+                    Path(_tmp_dir.name) / f"{fpath.stem}.txt",
                 )
-                result_holder.append(result)
-            except Exception as exc:
-                error_holder.append(exc)
-            progress_queue.put(None)
+            job.txt_paths.append(str(txt_path))
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+        except Exception as exc:
+            job.statuses[i] = "error"
+            job.errors[i] = str(exc)
+            error_count += 1
 
-        while True:
-            try:
-                item = progress_queue.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            if item is None:
-                break
-            fraction, message = item
-            combined_msg = f"[{idx + 1}/{total}] {message}"
-            yield (_skip, _skip, _skip, _skip, _skip,
-                   _render_progress(fraction, combined_msg), _skip, _skip, _skip,
-                   _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip)
-
-        thread.join()
-
-        if error_holder:
-            statuses[idx] = "error"
-            errors[idx] = str(error_holder[0])
-        else:
-            statuses[idx] = "done"
-            result = result_holder[0]
-            all_results[idx] = result
-
-            _, _, txt_path, _ = _format_result(result, media_file)
-            all_txt_paths.append(txt_path)
-
-            if save_alongside and orig_paths[idx]:
-                try:
-                    saved = save_txt_alongside(result, orig_paths[idx])
-                    errors[idx] = f"Saved to {Path(saved).name}"
-                except (PermissionError, OSError):
-                    errors[idx] = "Could not save alongside source (permission denied)"
-
-        queue_html = _render_batch_queue(filenames, statuses, errors)
-        yield (_skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-               _skip, queue_html, _skip, _skip, _skip, _skip, _skip, _skip, _skip)
-
-    # --- Batch complete ---
-    done_count = sum(1 for s in statuses if s == "done")
-    err_count = sum(1 for s in statuses if s == "error")
-    summary_parts = [f"{done_count} of {total} completed"]
-    if err_count:
-        summary_parts.append(f"{err_count} failed")
-
-    first_result_idx = next((i for i in range(total) if i in all_results), None)
-
-    if first_result_idx is not None:
-        result = all_results[first_result_idx]
-        plain_text, speaker_text, _, info = _format_result(
-            result, media_files[first_result_idx]
-        )
-        show_retry = bool(result.get("diarize_error"))
-        has_speakers = bool(speaker_text)
-        summary_html = _render_summary_html(result)
-    else:
-        plain_text = ""
-        speaker_text = ""
-        info = "All files failed."
-        show_retry = False
-        has_speakers = False
-        summary_html = ""
-
-    if len(all_txt_paths) == 1:
-        download_path = all_txt_paths[0]
-    elif len(all_txt_paths) > 1:
-        zip_path = Path(_tmp_dir.name) / "transcripts.zip"
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            for tp in all_txt_paths:
-                zf.write(tp, Path(tp).name)
-        download_path = str(zip_path)
-    else:
-        download_path = None
-
-    info = f"{' | '.join(summary_parts)}\n{info}" if first_result_idx is not None else info
-
-    selector_choices = [
-        f"{i + 1}. {filenames[i]}" for i in sorted(all_results.keys())
-    ]
-
-    queue_html = _render_batch_queue(filenames, statuses, errors)
-
-    # Switch to Review tab on completion
-    yield (
-        plain_text, speaker_text, download_path or "",
-        gr.Button(visible=bool(download_path)),
-        info,
-        _render_progress(1.0, f"Done -- {' | '.join(summary_parts)}"),
-        all_results,
-        gr.Button(visible=show_retry),
-        gr.Tab(visible=has_speakers),
-        queue_html,
-        gr.Dropdown(choices=selector_choices,
-                    value=selector_choices[0] if selector_choices else None,
-                    visible=len(selector_choices) > 1),
-        gr.Button(visible=False),
-        cancel_state,
-        summary_html,
-        gr.Column(visible=bool(summary_html)),
-        gr.Tabs(selected="review"),
-        gr.Button(visible=bool(first_result_idx is not None)),
-    )
+    job.status = "done"
+    job.progress_fraction = 1.0
+    job.progress_message = "Complete"
+    _enqueue(job, {
+        "type": "complete",
+        "done_count": done_count,
+        "error_count": error_count,
+        "first_result_index": first_result_index if first_result_index is not None else 0,
+    })
 
 
-def _on_file_select(filename, all_results, media_files):
-    """Switch displayed transcript when user picks a file from the dropdown."""
-    _sk = gr.skip()
-    if not filename or not all_results or not media_files:
-        return _sk, _sk, _sk, _sk, _sk, _sk, _sk
+def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: int | None) -> None:
+    """Retry diarization for a single file (called in a background thread)."""
+    job.status = "processing"
+    job.statuses[file_index] = "processing"
 
-    if isinstance(media_files, str):
-        media_files = [media_files]
+    def _progress_cb(fraction: float, message: str) -> None:
+        job.progress_fraction = fraction
+        job.progress_message = message
+        _enqueue(job, {
+            "type": "progress",
+            "fraction": round(fraction, 4),
+            "message": message,
+            "file_index": file_index,
+            "statuses": list(job.statuses),
+            "errors": {str(k): v for k, v in job.errors.items()},
+        })
+
+    _progress_cb(0.0, f"Retrying speaker detection for {job.filenames[file_index]}...")
 
     try:
-        idx = int(filename.split(".", 1)[0]) - 1
-    except (ValueError, IndexError):
-        return _sk, _sk, _sk, _sk, _sk, _sk, _sk
+        cached = job.results.get(file_index)
+        if cached is None:
+            raise ValueError(f"No transcription result for file index {file_index}")
 
-    if isinstance(all_results, dict) and idx in all_results and idx < len(media_files):
-        result = all_results[idx]
-        plain_text, speaker_text, _, info = _format_result(result, media_files[idx])
-        has_speakers = bool(speaker_text)
-        summary_html_val = _render_summary_html(result)
-
-        # Build file results list for all files
-        filenames = [Path(mf).name for mf in media_files]
-        txt_path_map = {}
-        for i, res in (all_results or {}).items():
-            if isinstance(i, int) and i < len(media_files):
-                tp = str(Path(_tmp_dir.name) / f"{Path(media_files[i]).stem}.txt")
-                txt_path_map[i] = tp
-        file_results_val = _render_file_results_html(
-            filenames, all_results, txt_path_map
+        result = retry_diarize(
+            media_path=str(job.files[file_index]),
+            result=cached,
+            hf_token=hf_token,
+            num_speakers=num_speakers,
+            progress_callback=_progress_cb,
         )
+        job.results[file_index] = result
+        job.statuses[file_index] = "done"
 
-        return (plain_text, speaker_text, info, gr.Tab(visible=has_speakers),
-                summary_html_val, gr.Column(visible=bool(summary_html_val)),
-                file_results_val)
-
-    return _sk, _sk, _sk, _sk, _sk, _sk, _sk
-
-
-def _on_cancel_click(cancel_state):
-    """Set the cancellation flag for batch processing."""
-    if isinstance(cancel_state, dict) and "event" in cancel_state:
-        cancel_state["event"].set()
-    return gr.Button(interactive=False, value="Cancelling...")
-
-
-def run_retry_diarize(media_files, hf_token, cached_results):
-    """Retry only the speaker diarization step using the cached transcription."""
-    if isinstance(media_files, list):
-        media_file = media_files[0] if media_files else None
-    else:
-        media_file = media_files
-
-    if isinstance(cached_results, dict) and cached_results:
-        first_key = min(cached_results.keys(), key=int) if cached_results else None
-        cached_result = cached_results[first_key] if first_key is not None else None
-    else:
-        cached_result = cached_results
-
-    if cached_result is None or not cached_result.get("segments"):
-        raise gr.Error("No transcription to retry. Please transcribe first.")
-
-    if not hf_token:
-        raise gr.Error(
-            "Speaker detection requires a HuggingFace token. "
-            "Enter your token or get one at huggingface.co/settings/tokens"
-        )
-
-    if media_file is None:
-        raise gr.Error("Original media file is required for speaker detection retry.")
-
-    progress_queue: queue.Queue = queue.Queue()
-    result_holder: list[dict] = []
-    error_holder: list[Exception] = []
-
-    def on_progress(fraction: float, message: str):
-        progress_queue.put((fraction, message))
-
-    def _run():
-        try:
-            result = retry_diarize(
-                media_file,
-                cached_result,
-                hf_token=hf_token,
-                progress_callback=on_progress,
+        # Re-save transcript
+        if job.settings.get("save_alongside") and job.original_paths[file_index]:
+            txt_path = save_txt_alongside(result, job.original_paths[file_index])
+        else:
+            txt_path = save_txt(
+                result,
+                Path(_tmp_dir.name) / f"{job.files[file_index].stem}.txt",
             )
-            result_holder.append(result)
-        except Exception as exc:
-            error_holder.append(exc)
-        progress_queue.put(None)
+        # Update the corresponding txt_path
+        if file_index < len(job.txt_paths):
+            job.txt_paths[file_index] = str(txt_path)
+        else:
+            job.txt_paths.append(str(txt_path))
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+        _enqueue(job, {
+            "type": "complete",
+            "done_count": 1,
+            "error_count": 0,
+            "first_result_index": file_index,
+        })
 
-    _skip = gr.skip()
-    while True:
-        try:
-            item = progress_queue.get(timeout=0.25)
-        except queue.Empty:
-            continue
-        if item is None:
-            break
-        fraction, message = item
-        yield (_skip, _skip, _skip, _skip, _skip,
-               _render_progress(fraction, message), _skip,
-               _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip, _skip,
-               _skip)
+    except Exception as exc:
+        job.statuses[file_index] = "error"
+        job.errors[file_index] = str(exc)
+        _enqueue(job, {
+            "type": "error",
+            "file_index": file_index,
+            "error": str(exc),
+        })
 
-    thread.join()
-
-    if error_holder:
-        raise gr.Error(str(error_holder[0]))
-
-    result = result_holder[0]
-    plain_text, speaker_text, txt_path, info = _format_result(result, media_file)
-
-    show_retry = bool(result.get("diarize_error"))
-    has_speakers = bool(speaker_text)
-    summary_html = _render_summary_html(result)
-
-    yield (plain_text, speaker_text, str(txt_path),
-           gr.Button(visible=True),
-           info, "",
-           {0: result}, gr.Button(visible=show_retry),
-           gr.Tab(visible=has_speakers), _skip, _skip, _skip, _skip,
-           summary_html, gr.Column(visible=bool(summary_html)), _skip,
-           _skip)
+    job.status = "done"
 
 
-def create_app(native_mode=False):
-    from pywhispercpp.constants import MODELS_DIR as _models_dir
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
 
-    _file_types = sorted(SUPPORTED_EXTENSIONS)
-    _format_list = ", ".join(
-        ext.lstrip(".").upper() for ext in sorted(SUPPORTED_EXTENSIONS)
-    )
-    _format_tags = " ".join(
-        f"<span>{ext.lstrip('.').upper()}</span>"
-        for ext in sorted(SUPPORTED_EXTENSIONS)[:5]
-    )
-    _more_count = max(0, len(SUPPORTED_EXTENSIONS) - 5)
-    if _more_count:
-        _format_tags += f" <span>+{_more_count} More</span>"
 
-    _page_js = """
-    document.addEventListener('click', (e) => {
-        const btn = e.target.closest('button.copy-text-btn');
-        if (!btn) return;
-        const ta = document.querySelector('.transcript-box textarea');
-        if (!ta || !ta.value) return;
-        const text = ta.value;
-        function showFeedback(ok) {
-            const orig = btn.textContent;
-            btn.textContent = ok ? 'Copied!' : 'Copy failed';
-            setTimeout(() => { btn.textContent = orig; }, 1500);
-        }
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text)
-                .then(() => showFeedback(true))
-                .catch(() => {
-                    const tmp = document.createElement('textarea');
-                    tmp.value = text;
-                    tmp.style.cssText = 'position:fixed;opacity:0';
-                    document.body.appendChild(tmp);
-                    tmp.select();
-                    showFeedback(document.execCommand('copy'));
-                    tmp.remove();
-                });
-        } else {
-            const tmp = document.createElement('textarea');
-            tmp.value = text;
-            tmp.style.cssText = 'position:fixed;opacity:0';
-            document.body.appendChild(tmp);
-            tmp.select();
-            showFeedback(document.execCommand('copy'));
-            tmp.remove();
-        }
-    });
-    """
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    app = FastAPI(title="Transcribe", docs_url="/docs")
 
-    _page_head = "<script>" + _page_js + "</script>"
+    # Mount static files if the directory exists
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    with gr.Blocks(title="Media Transcriber", head=_page_head) as app:
+    # ------------------------------------------------------------------
+    # GET / — serve the frontend
+    # ------------------------------------------------------------------
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> HTMLResponse:
+        index_path = STATIC_DIR / "index.html"
+        if not index_path.is_file():
+            return HTMLResponse("<h1>Transcribe</h1><p>No frontend found.</p>")
+        return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
-        # --- App Header ---
-        gr.Markdown("# Media Transcriber", elem_classes=["app-header"])
+    # ------------------------------------------------------------------
+    # GET /api/config
+    # ------------------------------------------------------------------
+    @app.get("/api/config")
+    async def get_config() -> JSONResponse:
+        return JSONResponse({
+            "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
+            "model_choices": MODEL_CHOICES,
+        })
 
-        # Hidden state
-        cached_results = gr.State(value=None)
-        cancel_state = gr.State(value=None)
-        original_paths = gr.Textbox(visible=False, elem_id="original_paths")
+    # ------------------------------------------------------------------
+    # POST /api/upload
+    # ------------------------------------------------------------------
+    @app.post("/api/upload")
+    async def upload_files(
+        files: list[UploadFile] | None = None,
+        paths: list[str] | None = None,
+    ) -> JSONResponse:
+        """Upload media files or reference local paths (native mode)."""
+        has_files = files and len(files) > 0
+        has_paths = paths and len(paths) > 0
 
-        # ===== Main 3-Tab Navigation =====
-        with gr.Tabs(elem_classes=["dark-tabs"], elem_id="main-tabs") as main_tabs:
+        if not has_files and not has_paths:
+            raise HTTPException(status_code=400, detail="No files provided")
 
-            # ==================== TAB 1: UPLOAD ====================
-            with gr.Tab("Upload", id="upload"):
-                with gr.Row(equal_height=False):
+        job_id = str(uuid.uuid4())
+        job_dir = Path(_tmp_dir.name) / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
 
-                    # --- Left: File Drop Zone ---
-                    with gr.Column(scale=7):
-                        media_input = gr.File(
-                            label="Drop files here",
-                            file_types=_file_types,
-                            file_count="multiple",
-                            elem_classes=["upload-zone"],
-                        )
+        job = Job(id=job_id)
 
-                        if native_mode:
-                            native_browse_btn = gr.Button(
-                                "Browse Files...", variant="secondary", size="sm"
-                            )
-                            native_browse_btn.click(
-                                fn=None,
-                                js="() => { window._nativeBrowse && window._nativeBrowse(); }",
-                            )
-
-                        gr.HTML(
-                            f"<div class='format-tags'>{_format_tags}</div>",
-                            elem_classes=["no-bg"],
-                        )
-
-                    # --- Right: Settings Panel ---
-                    with gr.Column(scale=5, elem_classes=["settings-panel"]):
-                        gr.HTML(
-                            "<div style='display:flex; gap:12px; align-items:center; "
-                            "margin-bottom:24px'>"
-                            "<span style='font-size:18px; color:#c1c6d7'>&#9776;</span>"
-                            "<span class='section-title'>Transcription Engine</span></div>",
-                            elem_classes=["no-bg"],
-                        )
-
-                        model_dropdown = gr.Dropdown(
-                            choices=MODEL_CHOICES,
-                            value="large-v3",
-                            label="Model Engine",
-                        )
-                        language_input = gr.Textbox(
-                            label="Language (ISO Code)",
-                            placeholder="e.g. 'en', 'fr' (empty for auto)",
-                        )
-                        diarize_checkbox = gr.Checkbox(
-                            label="Detect Speakers",
-                            value=False,
-                            info="Identify unique voices in media",
-                        )
-                        hf_token_input = gr.Textbox(
-                            label="HuggingFace Token",
-                            placeholder="hf_****************",
-                            type="password",
-                            info="Required for speaker detection diarization",
-                        )
-
-                        save_alongside_checkbox = gr.Checkbox(
-                            label="Save transcripts alongside source files",
-                            value=native_mode,
-                            visible=native_mode,
-                            info="Write .txt next to each original media file",
-                        )
-
-                # --- Transcribe Button ---
-                transcribe_btn = gr.Button(
-                    "Transcribe",
-                    variant="primary",
-                    size="lg",
-                    elem_classes=["transcribe-btn"],
-                )
-                gr.HTML(
-                    "<div class='gpu-hint'>Engine will utilize GPU acceleration if available.</div>",
-                    elem_classes=["no-bg"],
-                )
-
-            # ==================== TAB 2: PROCESS ====================
-            with gr.Tab("Process", id="process"):
-                with gr.Row(equal_height=False):
-
-                    # --- Left: Processing Status ---
-                    with gr.Column(scale=8):
-                        with gr.Group(elem_classes=["process-card"]):
-                            progress_bar = gr.HTML(
-                                value=_render_progress(0, "Waiting to start..."),
-                                elem_classes=["no-bg"],
-                            )
-
-                        with gr.Group(elem_classes=["log-section"]):
-                            gr.HTML(
-                                "<div style='padding:25px 25px 8px'>"
-                                "<span style='font-family:Inter,sans-serif; font-size:12px; "
-                                "color:#c1c6d7; text-transform:uppercase; letter-spacing:0.6px'>"
-                                "Logs</span></div>",
-                                elem_classes=["no-bg"],
-                            )
-                            log_html = gr.HTML(
-                                value=_render_log_html(),
-                                elem_classes=["no-bg"],
-                            )
-
-                    # --- Right: Job Queue ---
-                    with gr.Column(scale=4):
-                        with gr.Group(elem_classes=["job-queue"]):
-                            gr.HTML(
-                                "<div style='padding:24px 24px 0'>"
-                                "<div class='job-queue-header'>Job Queue</div>"
-                                "</div>",
-                                elem_classes=["no-bg"],
-                            )
-                            batch_queue_html = gr.HTML(
-                                value="<div style='padding:0 16px; color:#c1c6d7; "
-                                "font-size:12px; opacity:0.5'>No files queued yet.</div>",
-                                elem_classes=["no-bg"],
-                            )
-                            cancel_btn = gr.Button(
-                                "Cancel Remaining",
-                                variant="stop",
-                                visible=False,
-                                elem_classes=["cancel-btn"],
-                            )
-
-            # ==================== TAB 3: REVIEW ====================
-            with gr.Tab("Review", id="review"):
-
-                with gr.Row(equal_height=False):
-                    with gr.Column(scale=2):
-                        gr.Markdown("## Review Results", elem_classes=["review-title"])
-                        gr.Markdown(
-                            "Verification and export of your batch processing queue.",
-                            elem_classes=["review-subtitle"],
-                        )
-                        file_selector = gr.Dropdown(
-                            label="",
-                            choices=[],
-                            visible=False,
-                            elem_classes=["file-selector"],
-                            show_label=False,
-                        )
-                    with gr.Column(scale=1, visible=False) as summary_col:
-                        summary_html = gr.HTML(
-                            value="",
-                            elem_classes=["summary-box"],
-                        )
-
-                # File results canvas
-                with gr.Group(elem_classes=["transcript-canvas"]):
-                    file_results_html = gr.HTML(
-                        value="",
-                        elem_classes=["no-bg"],
+        if has_paths:
+            # Native mode: files are local paths from pywebview file picker
+            for p in paths:  # type: ignore[union-attr]
+                fp = Path(p)
+                if not fp.is_file():
+                    raise HTTPException(status_code=400, detail=f"File not found: {p}")
+                suffix = fp.suffix.lower()
+                if suffix not in SUPPORTED_EXTENSIONS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported file type: {suffix}",
+                    )
+                job.files.append(fp)
+                job.filenames.append(fp.name)
+                job.original_paths.append(str(fp))
+                job.statuses.append("pending")
+        else:
+            # Browser mode: uploaded files
+            for upload in files:  # type: ignore[union-attr]
+                filename = upload.filename or "unknown"
+                suffix = Path(filename).suffix.lower()
+                if suffix not in SUPPORTED_EXTENSIONS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported file type: {suffix}",
                     )
 
-                    # -- Toolbar: Copy / Download / Retry --
-                    with gr.Row(elem_classes=["review-toolbar"]):
-                        copy_btn = gr.Button(
-                            "Copy Text",
-                            visible=False,
-                            elem_classes=["copy-text-btn"],
-                        )
-                        download_btn = gr.Button(
-                            "Download ALL (.zip)",
-                            visible=False,
-                            elem_classes=["download-btn"],
-                        )
-                        retry_btn = gr.Button(
-                            "Retry Speaker Detection",
-                            variant="secondary",
-                            visible=False,
-                            elem_classes=["retry-btn"],
-                        )
+                dest = job_dir / filename
+                counter = 1
+                while dest.exists():
+                    dest = job_dir / f"{Path(filename).stem}_{counter}{suffix}"
+                    counter += 1
 
-                    with gr.Tabs(elem_classes=["file-tabs"]):
-                        with gr.Tab("Transcript"):
-                            transcript_output = gr.Textbox(
-                                label="",
-                                lines=20,
-                                max_lines=40,
-                                interactive=False,
-                                elem_classes=["transcript-box"],
-                                show_label=False,
-                            )
-                        with gr.Tab("Speakers", visible=False) as speaker_tab:
-                            speaker_output = gr.Textbox(
-                                label="",
-                                lines=20,
-                                max_lines=40,
-                                interactive=False,
-                                elem_classes=["transcript-box"],
-                                show_label=False,
-                            )
+                content = await upload.read()
+                dest.write_bytes(content)
 
-                # Hidden state
-                txt_download = gr.Textbox(
-                    visible=False,
-                    elem_id="txt_download_path",
-                )
-                download_file_output = gr.File(
-                    visible=True,
-                    elem_classes=["download-file-output"],
-                )
-                info_text = gr.Textbox(
-                    label="Info",
-                    interactive=False,
-                    lines=1,
-                    max_lines=3,
-                    elem_classes=["info-display"],
-                    visible=False,
-                )
+                job.files.append(dest)
+                job.filenames.append(filename)
+                job.original_paths.append(None)
+                job.statuses.append("pending")
 
-        # --- Event wiring ---
-        _outputs = [transcript_output, speaker_output, txt_download,
-                     download_btn,
-                     info_text, progress_bar, cached_results,
-                     retry_btn, speaker_tab,
-                     batch_queue_html, file_selector, cancel_btn,
-                     cancel_state, summary_html, summary_col, main_tabs,
-                     copy_btn]
+        _jobs[job_id] = job
+        return JSONResponse({
+            "job_id": job_id,
+            "filenames": job.filenames,
+            "file_count": len(job.files),
+        })
 
-        transcribe_btn.click(
-            fn=run_transcription,
-            inputs=[media_input, model_dropdown, language_input,
-                    diarize_checkbox, hf_token_input,
-                    save_alongside_checkbox, original_paths, cancel_state],
-            outputs=_outputs,
+    # ------------------------------------------------------------------
+    # POST /api/transcribe/{job_id}
+    # ------------------------------------------------------------------
+    @app.post("/api/transcribe/{job_id}")
+    async def start_transcription(job_id: str, body: TranscribeRequest) -> JSONResponse:
+        job = _get_job(job_id)
+
+        if job.status == "processing":
+            raise HTTPException(status_code=409, detail="Job already processing")
+
+        # Store settings
+        job.settings = {
+            "model": body.model if body.model in MODEL_CHOICES else "large-v3",
+            "language": body.language or None,
+            "diarize": body.diarize,
+            "hf_token": body.hf_token or None,
+            "num_speakers": body.num_speakers,
+            "save_alongside": body.save_alongside,
+        }
+
+        # Update original paths if provided
+        if body.original_paths:
+            for i, op in enumerate(body.original_paths):
+                if i < len(job.original_paths):
+                    job.original_paths[i] = op
+
+        # Reset state for re-runs
+        job.status = "uploaded"
+        job.statuses = ["pending"] * len(job.files)
+        job.errors.clear()
+        job.results.clear()
+        job.txt_paths.clear()
+        job.progress_fraction = 0.0
+        job.progress_message = ""
+        job.cancel_event.clear()
+
+        # Create asyncio queue bound to the current event loop
+        loop = asyncio.get_running_loop()
+        job.progress_queue = asyncio.Queue()
+        job._loop = loop  # type: ignore[attr-defined]
+
+        # Launch background thread
+        thread = threading.Thread(target=_run_transcription, args=(job,), daemon=True)
+        thread.start()
+
+        return JSONResponse({"status": "started", "job_id": job_id})
+
+    # ------------------------------------------------------------------
+    # GET /api/progress/{job_id} — Server-Sent Events
+    # ------------------------------------------------------------------
+    @app.get("/api/progress/{job_id}")
+    async def progress_stream(job_id: str) -> StreamingResponse:
+        job = _get_job(job_id)
+
+        # Ensure there's a queue (may reconnect after start)
+        if job.progress_queue is None:
+            loop = asyncio.get_running_loop()
+            job.progress_queue = asyncio.Queue()
+            job._loop = loop  # type: ignore[attr-defined]
+
+        async def event_generator():
+            q = job.progress_queue
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # Send keepalive comment
+                    yield ": keepalive\n\n"
+                    continue
+
+                yield f"data: {json.dumps(event)}\n\n"
+
+                if event.get("type") in ("complete", "error"):
+                    # Also check for terminal "complete" to close stream
+                    if event.get("type") == "complete":
+                        break
+                    # For single-file error during retry, also close
+                    if event.get("type") == "error":
+                        break
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
-        retry_btn.click(
-            fn=run_retry_diarize,
-            inputs=[media_input, hf_token_input, cached_results],
-            outputs=_outputs,
+    # ------------------------------------------------------------------
+    # POST /api/cancel/{job_id}
+    # ------------------------------------------------------------------
+    @app.post("/api/cancel/{job_id}")
+    async def cancel_job(job_id: str) -> JSONResponse:
+        job = _get_job(job_id)
+        job.cancel_event.set()
+        return JSONResponse({"status": "cancel_requested"})
+
+    # ------------------------------------------------------------------
+    # GET /api/download/{job_id}
+    # ------------------------------------------------------------------
+    @app.get("/api/download/{job_id}", response_model=None)
+    async def download_transcripts(job_id: str):
+        job = _get_job(job_id)
+
+        valid_paths = [p for p in job.txt_paths if Path(p).is_file()]
+        if not valid_paths:
+            raise HTTPException(status_code=404, detail="No transcripts available")
+
+        if len(valid_paths) == 1:
+            p = Path(valid_paths[0])
+            return FileResponse(
+                path=str(p),
+                filename=p.name,
+                media_type="text/plain",
+            )
+
+        # Multiple files — return a zip
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in valid_paths:
+                zf.write(p, Path(p).name)
+        buf.seek(0)
+
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": "attachment; filename=transcripts.zip",
+            },
         )
 
-        # Copy button is handled by page-level JS event delegation (_page_js)
+    # ------------------------------------------------------------------
+    # POST /api/retry-diarize/{job_id}
+    # ------------------------------------------------------------------
+    @app.post("/api/retry-diarize/{job_id}")
+    async def retry_diarize_endpoint(job_id: str, body: RetryDiarizeRequest) -> JSONResponse:
+        job = _get_job(job_id)
 
-        def _on_download_click(path):
-            """Return the transcript file for download."""
-            if path and Path(path).exists():
-                return gr.File(value=path, visible=True)
-            return gr.File(value=None, visible=True)
+        if job.status == "processing":
+            raise HTTPException(status_code=409, detail="Job already processing")
 
-        download_btn.click(
-            fn=_on_download_click,
-            inputs=[txt_download],
-            outputs=[download_file_output],
-        ).then(
-            fn=None,
-            inputs=[],
-            outputs=[],
-            js="() => { const link = document.querySelector('.download-file-output a[download]'); if (link) link.click(); }",
+        file_index = body.file_index
+        if file_index < 0 or file_index >= len(job.files):
+            raise HTTPException(status_code=400, detail="Invalid file_index")
+
+        if file_index not in job.results:
+            raise HTTPException(
+                status_code=400,
+                detail="No transcription result for this file yet",
+            )
+
+        # Reset progress state
+        job.progress_fraction = 0.0
+        job.progress_message = ""
+        job.cancel_event.clear()
+
+        loop = asyncio.get_running_loop()
+        job.progress_queue = asyncio.Queue()
+        job._loop = loop  # type: ignore[attr-defined]
+
+        thread = threading.Thread(
+            target=_run_retry_diarize,
+            args=(job, file_index, body.hf_token, body.num_speakers),
+            daemon=True,
         )
+        thread.start()
 
-        cancel_btn.click(
-            fn=_on_cancel_click,
-            inputs=[cancel_state],
-            outputs=[cancel_btn],
-        )
+        return JSONResponse({"status": "started", "job_id": job_id, "file_index": file_index})
 
-        file_selector.change(
-            fn=_on_file_select,
-            inputs=[file_selector, cached_results, media_input],
-            outputs=[transcript_output, speaker_output, info_text, speaker_tab,
-                     summary_html, summary_col, file_results_html],
-        )
+    # ------------------------------------------------------------------
+    # GET /api/result/{job_id}/{file_index}
+    # ------------------------------------------------------------------
+    @app.get("/api/result/{job_id}/{file_index}")
+    async def get_result(job_id: str, file_index: int) -> JSONResponse:
+        job = _get_job(job_id)
+
+        if file_index < 0 or file_index >= len(job.files):
+            raise HTTPException(status_code=400, detail="Invalid file_index")
+
+        result = job.results.get(file_index)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No result for this file yet",
+            )
+
+        # Build speaker text from segments if available
+        segments = result.get("segments", [])
+        speaker_text = ""
+        if result.get("speakers") and segments:
+            speaker_text = "\n".join(
+                f"{seg.get('speaker', '?')}: {seg.get('text', '')}"
+                for seg in segments
+            )
+
+        return JSONResponse({
+            "filename": job.filenames[file_index],
+            "status": job.statuses[file_index],
+            "text": result.get("text", ""),
+            "speaker_text": speaker_text,
+            "segments_count": len(segments),
+            "language": result.get("language"),
+            "speakers": result.get("speakers"),
+            "has_speakers": bool(speaker_text),
+            "diarize_error": result.get("diarize_error"),
+        })
 
     return app
 
 
+# ---------------------------------------------------------------------------
+# Standalone entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    app = create_app()
-    app.launch(server_name="127.0.0.1", server_port=7860, theme=THEME, css=CUSTOM_CSS,
-               allowed_paths=[_tmp_dir.name])
+    import uvicorn
+
+    uvicorn.run(create_app(), host="127.0.0.1", port=7860)
