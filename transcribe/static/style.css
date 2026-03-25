@@ -1121,6 +1121,16 @@ a:focus-visible {
   font-weight: 600;
 }
 
+.summary-error {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.1);
+  border-radius: 6px;
+}
+
 /* ----------------------------------------------------------
    13. Speaker Empty State
    ---------------------------------------------------------- */

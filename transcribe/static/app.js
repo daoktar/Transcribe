@@ -78,6 +78,13 @@ async function loadConfig() {
                 .map(m => `<option value="${escapeHtml(m)}"${m === 'large-v3' ? ' selected' : ''}>${escapeHtml(m)}</option>`)
                 .join('');
         }
+        // Pre-fill HF token placeholder if set in environment
+        if (config.hf_token_set) {
+            const hfInput = document.getElementById('hf-token');
+            if (hfInput) {
+                hfInput.placeholder = 'Token loaded from environment';
+            }
+        }
     } catch (err) {
         console.error('Failed to load config:', err);
     }
@@ -459,6 +466,10 @@ function renderSummary(result) {
         <div class="summary-stat"><strong>${segs}</strong> segments</div>
         <div class="summary-stat"><strong>${escapeHtml(String(spk))}</strong> speakers</div>
     `;
+
+    if (result.diarize_error) {
+        bar.innerHTML += `<div class="summary-error">Speaker detection failed: ${escapeHtml(result.diarize_error)}. Enter your HuggingFace token above and click Retry.</div>`;
+    }
 }
 
 function renderFileSwitcher(filenames, activeIndex, statuses) {

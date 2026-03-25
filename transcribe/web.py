@@ -6,6 +6,7 @@ import asyncio
 import atexit
 import io
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -90,7 +91,7 @@ class TranscribeRequest(BaseModel):
 
 
 class RetryDiarizeRequest(BaseModel):
-    hf_token: str
+    hf_token: str | None = None
     num_speakers: int | None = None
     file_index: int = 0
 
@@ -305,6 +306,7 @@ def create_app() -> FastAPI:
         return JSONResponse({
             "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
             "model_choices": MODEL_CHOICES,
+            "hf_token_set": bool(os.environ.get("HF_TOKEN")),
         })
 
     # ------------------------------------------------------------------
@@ -391,7 +393,7 @@ def create_app() -> FastAPI:
             "model": body.model if body.model in MODEL_CHOICES else "large-v3",
             "language": body.language or None,
             "diarize": body.diarize,
-            "hf_token": body.hf_token or None,
+            "hf_token": body.hf_token or os.environ.get("HF_TOKEN"),
             "num_speakers": body.num_speakers,
             "save_alongside": body.save_alongside,
         }
@@ -540,7 +542,7 @@ def create_app() -> FastAPI:
 
         thread = threading.Thread(
             target=_run_retry_diarize,
-            args=(job, file_index, body.hf_token, body.num_speakers),
+            args=(job, file_index, body.hf_token or os.environ.get("HF_TOKEN"), body.num_speakers),
             daemon=True,
         )
         thread.start()
