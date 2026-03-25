@@ -6,16 +6,21 @@ import asyncio
 import atexit
 import io
 import json
+import os
+import re
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -39,6 +44,31 @@ from transcribe.paths import get_base_dir
 # ---------------------------------------------------------------------------
 
 MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
+
+# Maximum upload size per file: 2 GB
+MAX_UPLOAD_SIZE = 2 * 1024 * 1024 * 1024
+
+# Job limits
+MAX_JOBS = 100
+JOB_TTL = 86400  # 24 hours
+
+# Rate limiting
+_RATE_LIMIT_WINDOW = 60  # seconds
+_RATE_LIMIT_MAX_UPLOADS = 10  # max uploads per minute per IP
+_rate_limit_log: dict[str, list[float]] = defaultdict(list)
+
+# Whisper supported language codes (ISO 639-1)
+VALID_LANGUAGES = {
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs",
+    "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
+    "fo", "fr", "gl", "gu", "ha", "haw", "he", "hi", "hr", "ht", "hu", "hy",
+    "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn", "ko", "la", "lb",
+    "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru",
+    "sa", "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw",
+    "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi",
+    "yi", "yo", "yue", "zh",
+}
 
 # Single reusable temp directory — cleaned up on process exit
 _tmp_dir = tempfile.TemporaryDirectory(prefix="transcribe_")
@@ -70,9 +100,36 @@ class Job:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     progress_queue: asyncio.Queue | None = field(default=None, repr=False)
     settings: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=time.monotonic)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 _jobs: dict[str, Job] = {}
+
+
+def _cleanup_old_jobs() -> None:
+    """Evict expired jobs and their temp directories."""
+    now = time.monotonic()
+    expired = [
+        jid for jid, job in _jobs.items()
+        if now - job.created_at > JOB_TTL and job.status != "processing"
+    ]
+    for jid in expired:
+        job_dir = Path(_tmp_dir.name) / jid
+        if job_dir.is_dir():
+            shutil.rmtree(job_dir, ignore_errors=True)
+        del _jobs[jid]
+
+
+def _check_rate_limit(client_ip: str) -> None:
+    """Enforce upload rate limiting per IP."""
+    now = time.monotonic()
+    timestamps = _rate_limit_log[client_ip]
+    # Prune old entries
+    _rate_limit_log[client_ip] = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
+    if len(_rate_limit_log[client_ip]) >= _RATE_LIMIT_MAX_UPLOADS:
+        raise HTTPException(status_code=429, detail="Too many uploads. Try again later.")
+    _rate_limit_log[client_ip].append(now)
 
 # ---------------------------------------------------------------------------
 # Pydantic request bodies
@@ -116,9 +173,17 @@ def _enqueue(job: Job, event: dict[str, Any]) -> None:
     loop.call_soon_threadsafe(q.put_nowait, event)
 
 
+def _sanitize_error(msg: str) -> str:
+    """Strip file paths and limit length for user-facing error messages."""
+    # Remove absolute paths
+    msg = re.sub(r'(/[^\s:]+)+', '<path>', msg)
+    return msg[:500]
+
+
 def _run_transcription(job: Job) -> None:
     """Run transcription for all files in the job (called in a background thread)."""
-    job.status = "processing"
+    with job.lock:
+        job.status = "processing"
     done_count = 0
     error_count = 0
     first_result_index: int | None = None
@@ -192,11 +257,13 @@ def _run_transcription(job: Job) -> None:
             job.txt_paths.append(str(txt_path))
 
         except Exception as exc:
-            job.statuses[i] = "error"
-            job.errors[i] = str(exc)
+            with job.lock:
+                job.statuses[i] = "error"
+                job.errors[i] = _sanitize_error(str(exc))
             error_count += 1
 
-    job.status = "done"
+    with job.lock:
+        job.status = "done"
     job.progress_fraction = 1.0
     job.progress_message = "Complete"
     _enqueue(job, {
@@ -263,15 +330,18 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
         })
 
     except Exception as exc:
-        job.statuses[file_index] = "error"
-        job.errors[file_index] = str(exc)
+        sanitized = _sanitize_error(str(exc))
+        with job.lock:
+            job.statuses[file_index] = "error"
+            job.errors[file_index] = sanitized
         _enqueue(job, {
             "type": "error",
             "file_index": file_index,
-            "error": str(exc),
+            "error": sanitized,
         })
 
-    job.status = "done"
+    with job.lock:
+        job.status = "done"
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +349,48 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
 # ---------------------------------------------------------------------------
 
 
+def _load_hf_token_from_env() -> str | None:
+    """Load HuggingFace token from env var or .env file."""
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        return token
+    # Try loading from .env file in the project root
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    if env_file.is_file():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() == "HF_TOKEN":
+                value = value.strip().strip("'\"")
+                if value:
+                    return value
+    return None
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(title="Transcribe", docs_url="/docs")
+
+    # --- Security headers middleware ---
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'"
+        )
+        return response
+
+    # --- CORS — restrict to localhost origins ---
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://127\.0\.0\.1(:\d+)?$",
+        allow_methods=["GET", "POST"],
+        allow_credentials=False,
+    )
 
     # Mount static files if the directory exists
     if STATIC_DIR.is_dir():
@@ -312,10 +421,23 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------
     @app.post("/api/upload")
     async def upload_files(
+        request: Request,
         files: list[UploadFile] | None = None,
         paths: list[str] | None = None,
     ) -> JSONResponse:
         """Upload media files or reference local paths (native mode)."""
+        # Rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        _check_rate_limit(client_ip)
+
+        # Cleanup expired jobs and enforce capacity
+        _cleanup_old_jobs()
+        if len(_jobs) >= MAX_JOBS:
+            raise HTTPException(
+                status_code=503,
+                detail="Server at capacity. Try again later.",
+            )
+
         has_files = files and len(files) > 0
         has_paths = paths and len(paths) > 0
 
@@ -347,12 +469,22 @@ def create_app() -> FastAPI:
         else:
             # Browser mode: uploaded files
             for upload in files:  # type: ignore[union-attr]
-                filename = upload.filename or "unknown"
+                # Sanitize filename — strip directory components
+                raw_name = upload.filename or "unknown"
+                filename = Path(raw_name).name
                 suffix = Path(filename).suffix.lower()
                 if suffix not in SUPPORTED_EXTENSIONS:
                     raise HTTPException(
                         status_code=400,
                         detail=f"Unsupported file type: {suffix}",
+                    )
+
+                # Read with size limit
+                content = await upload.read()
+                if len(content) > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large (max {MAX_UPLOAD_SIZE // (1024**3)} GB)",
                     )
 
                 dest = job_dir / filename
@@ -361,7 +493,10 @@ def create_app() -> FastAPI:
                     dest = job_dir / f"{Path(filename).stem}_{counter}{suffix}"
                     counter += 1
 
-                content = await upload.read()
+                # Verify dest is inside job_dir (defense in depth)
+                if not dest.resolve().is_relative_to(job_dir.resolve()):
+                    raise HTTPException(status_code=400, detail="Invalid filename")
+
                 dest.write_bytes(content)
 
                 job.files.append(dest)
@@ -383,41 +518,53 @@ def create_app() -> FastAPI:
     async def start_transcription(job_id: str, body: TranscribeRequest) -> JSONResponse:
         job = _get_job(job_id)
 
-        if job.status == "processing":
-            raise HTTPException(status_code=409, detail="Job already processing")
+        with job.lock:
+            if job.status == "processing":
+                raise HTTPException(status_code=409, detail="Job already processing")
 
-        # Store settings
-        job.settings = {
-            "model": body.model if body.model in MODEL_CHOICES else "large-v3",
-            "language": body.language or None,
-            "diarize": body.diarize,
-            "hf_token": body.hf_token or None,
-            "num_speakers": body.num_speakers,
-            "save_alongside": body.save_alongside,
-        }
+            # Validate language code
+            language = body.language.strip() if body.language else None
+            if language and language not in VALID_LANGUAGES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid language code: {language}",
+                )
 
-        # Update original paths if provided
-        if body.original_paths:
-            for i, op in enumerate(body.original_paths):
-                if i < len(job.original_paths):
-                    job.original_paths[i] = op
+            # Resolve HF token: UI > env var > .env file
+            hf_token = body.hf_token or _load_hf_token_from_env()
 
-        # Reset state for re-runs
-        job.status = "uploaded"
-        job.statuses = ["pending"] * len(job.files)
-        job.errors.clear()
-        job.results.clear()
-        job.txt_paths.clear()
-        job.progress_fraction = 0.0
-        job.progress_message = ""
-        job.cancel_event.clear()
+            # Store settings — don't persist the raw HF token
+            job.settings = {
+                "model": body.model if body.model in MODEL_CHOICES else "large-v3",
+                "language": language,
+                "diarize": body.diarize,
+                "hf_token": hf_token,
+                "num_speakers": body.num_speakers,
+                "save_alongside": body.save_alongside,
+            }
 
-        # Create asyncio queue bound to the current event loop
-        loop = asyncio.get_running_loop()
-        job.progress_queue = asyncio.Queue()
-        job._loop = loop  # type: ignore[attr-defined]
+            # Update original paths if provided
+            if body.original_paths:
+                for i, op in enumerate(body.original_paths):
+                    if i < len(job.original_paths):
+                        job.original_paths[i] = op
 
-        # Launch background thread
+            # Reset state for re-runs
+            job.status = "uploaded"
+            job.statuses = ["pending"] * len(job.files)
+            job.errors.clear()
+            job.results.clear()
+            job.txt_paths.clear()
+            job.progress_fraction = 0.0
+            job.progress_message = ""
+            job.cancel_event.clear()
+
+            # Create asyncio queue bound to the current event loop
+            loop = asyncio.get_running_loop()
+            job.progress_queue = asyncio.Queue()
+            job._loop = loop  # type: ignore[attr-defined]
+
+        # Launch background thread (outside lock)
         thread = threading.Thread(target=_run_transcription, args=(job,), daemon=True)
         thread.start()
 
@@ -482,7 +629,23 @@ def create_app() -> FastAPI:
     async def download_transcripts(job_id: str):
         job = _get_job(job_id)
 
-        valid_paths = [p for p in job.txt_paths if Path(p).is_file()]
+        tmp_root = Path(_tmp_dir.name).resolve()
+        valid_paths = []
+        for p in job.txt_paths:
+            pp = Path(p)
+            if not pp.is_file():
+                continue
+            # Only serve files inside the temp directory or alongside originals
+            resolved = pp.resolve()
+            if resolved.is_relative_to(tmp_root):
+                valid_paths.append(p)
+            elif any(
+                op and resolved.parent == Path(op).resolve().parent
+                for op in job.original_paths
+            ):
+                valid_paths.append(p)
+            # else: skip — potential path traversal
+
         if not valid_paths:
             raise HTTPException(status_code=404, detail="No transcripts available")
 

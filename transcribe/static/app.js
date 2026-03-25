@@ -456,7 +456,7 @@ function renderSummary(result) {
 
     bar.innerHTML = `
         <div class="summary-stat"><strong>${escapeHtml(lang)}</strong> language</div>
-        <div class="summary-stat"><strong>${segs}</strong> segments</div>
+        <div class="summary-stat"><strong>${escapeHtml(String(segs))}</strong> segments</div>
         <div class="summary-stat"><strong>${escapeHtml(String(spk))}</strong> speakers</div>
     `;
 }
