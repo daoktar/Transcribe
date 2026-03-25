@@ -82,9 +82,20 @@ Identifies different speakers using pyannote.audio. Requires a free [HuggingFace
 [00:03] Speaker 2: I'm doing great, thanks for asking!
 ```
 
-**CLI:** set `HF_TOKEN` env var + `--speakers` flag. **Native app:** check "Detect Speakers" and paste token.
+### Providing Your Token
 
-Token security: never stored (only SHA-256 hash cached), never logged, password-masked in UI, env-var only on CLI.
+The app looks for a HuggingFace token in this order (first match wins):
+
+1. **Web UI field** — paste into the "HuggingFace Token" input (least preferred; token transits through the browser)
+2. **Environment variable** — `export HF_TOKEN=hf_...` before launching
+3. **`.env` file** — create a `.env` file in the project root (see `.env.example`):
+   ```
+   HF_TOKEN=hf_YourTokenHere
+   ```
+
+**CLI:** set `HF_TOKEN` env var + `--speakers` flag.
+
+Token security: never stored persistently (only SHA-256 hash cached for model reuse), never logged, password-masked in UI.
 
 ## How It Works
 
@@ -97,14 +108,17 @@ Token security: never stored (only SHA-256 hash cached), never logged, password-
 ## Building the macOS App
 
 ```bash
-# Build .app bundle
-bash scripts/build_macos.sh
+# Install build tools
+pip install pyinstaller
+brew install create-dmg   # optional, for .dmg creation
 
-# Build .dmg installer
-bash scripts/build_macos.sh --dmg
+# Build .app bundle + .dmg
+bash scripts/build_macos.sh
 ```
 
-Bundles ffmpeg, whisper models, and all Python dependencies into a standalone .app.
+The build excludes unused pyannote transitive dependencies (scipy, sklearn, pandas, matplotlib, onnxruntime) and torch subpackages (CUDA, distributed, JIT, ONNX) to minimize bundle size. A post-build cleanup step removes test data, metadata, and type stubs.
+
+To override the bundled ffmpeg: `FFMPEG_BIN=/path/to/ffmpeg FFPROBE_BIN=/path/to/ffprobe bash scripts/build_macos.sh`
 
 ## Privacy
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import sys
 import threading
 import time
 import urllib.request
@@ -237,8 +238,9 @@ def main():
         gui="cocoa",
     )
 
-    # Force-exit. Uvicorn runs in a daemon thread so it dies with us.
-    os._exit(0)
+    # Exit cleanly so atexit handlers run (e.g. temp dir cleanup).
+    # Uvicorn runs in a daemon thread so it dies with us.
+    sys.exit(0)
 
 
 if __name__ == "__main__":
