@@ -11,6 +11,9 @@ pip install -r requirements.txt
 # CLI transcription (video or audio)
 python -m transcribe.cli <media_file> [--model large-v3] [--language en] [--output-dir ./out]
 
+# Launch web UI (standalone, browser)
+python -m transcribe.web
+
 # Launch native macOS app
 python -m transcribe.app
 
@@ -38,8 +41,9 @@ The project is a Python package (`transcribe/`) with these modules:
   - Anti-hallucination params: `no_context=True`, `no_speech_thold=0.3`, `entropy_thold=2.4`, `max_tokens=100`
 
 - **`cli.py`** — CLI entry point via `argparse`. Calls `core.transcribe_media()` and saves TXT output.
-- **`web.py`** — Internal Gradio UI (used by the native app, not a standalone server). Provides `create_app()`, theme, and CSS consumed by `app.py`.
-- **`app.py`** — Native macOS app. Launches the Gradio server in a background thread and displays it inside a native WKWebView window via pywebview, with menu-bar tray integration via PyObjC.
+- **`web.py`** — FastAPI backend. REST API + SSE for progress streaming. Serves the frontend from `static/`. Key endpoints: `/api/upload`, `/api/transcribe/{job_id}`, `/api/progress/{job_id}` (SSE), `/api/result/{job_id}/{file_index}`, `/api/download/{job_id}`. In-memory job state with `asyncio.Queue` bridged from background threads for SSE. Provides `create_app()` returning a FastAPI app.
+- **`static/`** — Frontend: plain HTML/CSS/JS (no frameworks). `index.html` (3-tab SPA), `style.css` (dark navy theme with CSS variables), `app.js` (vanilla JS with SSE, drag-and-drop, native pywebview integration).
+- **`app.py`** — Native macOS app. Launches the FastAPI/uvicorn server in a daemon thread and displays it inside a native WKWebView window via pywebview, with menu-bar tray integration via PyObjC.
 - **`tray.py`** — macOS menu bar (system tray) integration via PyObjC.
 
 All transcription logic lives in `core.py`. CLI and native app are thin wrappers around it.
@@ -48,7 +52,8 @@ All transcription logic lives in `core.py`. CLI and native app are thin wrappers
 
 - `pywhispercpp` — Python bindings for whisper.cpp (requires system ffmpeg)
 - `webrtcvad-wheels` — WebRTC Voice Activity Detection (lightweight C extension, no PyTorch)
-- `gradio` — UI framework (used internally by the native app)
+- `fastapi` + `uvicorn` — Backend web framework and ASGI server
+- `python-multipart` — File upload handling for FastAPI
 - `pywebview` — Native WKWebView window for the macOS app
 - `pyobjc-framework-Cocoa` — macOS menu bar integration
 - `numpy` — Installed as a pywhispercpp dependency

@@ -1,7 +1,7 @@
 """Native macOS application wrapper for Media Transcriber.
 
-Launches the Gradio server in a background thread, displays it inside a
-native WKWebView window via pywebview, and adds a menu-bar (system tray)
+Launches the FastAPI/uvicorn server in a background thread, displays it inside
+a native WKWebView window via pywebview, and adds a menu-bar (system tray)
 icon via PyObjC so the app can be minimised to the tray.
 
 Usage::
@@ -11,19 +11,15 @@ Usage::
 from __future__ import annotations
 
 import os
-os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
-
-import json
 import shutil
 import socket
-import sys
+import threading
 import time
 import urllib.request
 
 import webview
 
 from transcribe.core import SUPPORTED_EXTENSIONS
-from transcribe.web import CUSTOM_CSS, THEME, create_app
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,7 +34,7 @@ def _find_free_port() -> int:
 
 
 def _wait_for_server(port: int, timeout: float = 30.0):
-    """Poll the local Gradio server until it responds or *timeout* expires."""
+    """Poll the local server until it responds or *timeout* expires."""
     deadline = time.monotonic() + timeout
     url = f"http://127.0.0.1:{port}/"
     while time.monotonic() < deadline:
@@ -47,7 +43,13 @@ def _wait_for_server(port: int, timeout: float = 30.0):
             return
         except Exception:
             time.sleep(0.15)
-    raise RuntimeError(f"Gradio server did not start within {timeout}s")
+    raise RuntimeError(f"Server did not start within {timeout}s")
+
+
+def _run_uvicorn(app, host: str, port: int):
+    """Run uvicorn in a background thread."""
+    import uvicorn
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 # ---------------------------------------------------------------------------
@@ -181,34 +183,9 @@ def _on_webview_started(window: webview.Window):
 
     callAfter(_install)
 
-    # Expose the JS API so Gradio pages can call window.pywebview.api.*
+    # Expose the JS API so pages can call window.pywebview.api.*
     api = JsApi(window)
     window.expose(api.pick_files, api.save_transcript)
-
-    # Inject a helper script that connects the native file picker to Gradio.
-    # When the user picks files via the native dialog, we populate the hidden
-    # #original_paths textarea so the Gradio backend knows the real paths,
-    # and programmatically add the files to the Gradio upload component.
-    window.evaluate_js("""
-    (function() {
-        // Make the native browse function available globally
-        window._nativeBrowse = async function() {
-            if (!window.pywebview || !window.pywebview.api) return;
-            const paths = await window.pywebview.api.pick_files();
-            if (!paths || paths.length === 0) return;
-
-            // Store original paths in the hidden textarea
-            const pathsInput = document.querySelector('#original_paths textarea');
-            if (pathsInput) {
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLTextAreaElement.prototype, 'value').set;
-                nativeInputValueSetter.call(pathsInput, JSON.stringify(paths));
-                pathsInput.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-        };
-
-    })();
-    """)
 
 
 # ---------------------------------------------------------------------------
@@ -217,18 +194,18 @@ def _on_webview_started(window: webview.Window):
 
 
 def main():
-    port = _find_free_port()
+    from transcribe.web import create_app
 
-    # Launch the Gradio server without blocking the main thread.
-    gradio_app = create_app(native_mode=True)
-    gradio_app.launch(
-        server_name="127.0.0.1",
-        server_port=port,
-        share=False,
-        prevent_thread_lock=True,
-        theme=THEME,
-        css=CUSTOM_CSS,
+    port = _find_free_port()
+    app = create_app()
+
+    # Launch the FastAPI/uvicorn server in a background thread.
+    server_thread = threading.Thread(
+        target=_run_uvicorn,
+        args=(app, "127.0.0.1", port),
+        daemon=True,
     )
+    server_thread.start()
 
     _wait_for_server(port)
 
@@ -260,12 +237,7 @@ def main():
         gui="cocoa",
     )
 
-    # Cleanup: shut down the Gradio server and force-exit.
-    # Gradio spawns non-daemon threads that prevent a clean exit.
-    try:
-        gradio_app.close()
-    except Exception:
-        pass
+    # Force-exit. Uvicorn runs in a daemon thread so it dies with us.
     os._exit(0)
 
 

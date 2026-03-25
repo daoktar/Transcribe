@@ -1,6 +1,7 @@
 pywhispercpp>=1.4.0,<2.0
-gradio>=6.7.0,<7.0
-pillow>=12.1.1,<13.0
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.34.0,<1.0
+python-multipart>=0.0.18,<1.0
 webrtcvad-wheels>=2.0.10,<3.0
 pyannote.audio>=3.1.0,<4.0
 torch>=2.0.0,<3.0
@@ -8,3 +9,4 @@ torchaudio>=2.0.0,<3.0
 pywebview>=5.0,<6.0
 pyobjc-framework-Cocoa>=10.0,<12.0; sys_platform == "darwin"
 pytest>=8.0.0,<9.0
+numpy>=1.24.0,<3.0
