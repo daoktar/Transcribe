@@ -582,6 +582,7 @@ def create_app() -> FastAPI:
             "speakers": result.get("speakers"),
             "has_speakers": bool(speaker_text),
             "diarize_error": result.get("diarize_error"),
+            "diarize_requested": job.settings.get("diarize", False),
         })
 
     return app

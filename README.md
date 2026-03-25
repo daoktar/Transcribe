@@ -7,7 +7,7 @@ Local video & audio transcription powered by [whisper.cpp](https://github.com/gg
 - **Multi-format support** — MP4, MKV, AVI, MOV, WebM, FLV, WMV, MP3, WAV, OGG, FLAC, AAC, M4A, WMA, Opus
 - **Voice Activity Detection** — WebRTC VAD skips silence and music, reducing hallucinations
 - **Speaker diarization** — identify and label speakers via pyannote.audio (optional, requires HuggingFace token)
-- **Multiple interfaces** — CLI and native macOS app (dark UI with Upload/Process/Review tabs) with menu bar tray
+- **Multiple interfaces** — CLI, standalone web UI, and native macOS app (dark navy theme with Upload/Process/Review tabs) with menu bar tray
 - **5 model sizes** — tiny, base, small, medium, large-v3
 - **Auto language detection** — or set manually with ISO 639-1 codes
 - **Standalone macOS app** — PyInstaller packaging with .dmg distribution
@@ -51,13 +51,27 @@ export HF_TOKEN=hf_YourTokenHere
 python -m transcribe.cli recording.mp4 --speakers --num-speakers 3
 ```
 
+### Web UI
+
+```bash
+python -m transcribe.web
+```
+
+Opens a standalone web interface at `http://127.0.0.1:7860` with a dark navy theme. Three-tab workflow:
+
+- **Upload** — Drag-and-drop or browse for files, configure model/language/speaker detection
+- **Process** — Real-time progress bar with SSE streaming, color-coded job queue with per-file status badges
+- **Review** — File-switcher pills for multi-file navigation, compact inline summary bar, monospace transcript viewer with copy/download/retry actions
+
+Responsive layout adapts to mobile (375px+) with stacked buttons, abbreviated labels, and 44px touch targets.
+
 ### Native macOS App
 
 ```bash
 python -m transcribe.app
 ```
 
-Opens a native window with a dark navy UI organized into three tabs — Upload, Process, and Review. Includes menu bar tray icon, minimize-to-tray, and Cmd+Q to quit.
+Opens a native WKWebView window running the same web UI. Includes menu bar tray icon, minimize-to-tray, and Cmd+Q to quit.
 
 ## Speaker Diarization
 
@@ -95,6 +109,15 @@ Bundles ffmpeg, whisper models, and all Python dependencies into a standalone .a
 ## Privacy
 
 All processing is local. No external API keys required for transcription. Media files never leave your machine.
+
+## Architecture
+
+- **`transcribe/core.py`** — Transcription engine (whisper.cpp + WebRTC VAD + optional pyannote diarization)
+- **`transcribe/cli.py`** — CLI entry point
+- **`transcribe/web.py`** — FastAPI backend (REST API + SSE progress streaming)
+- **`transcribe/static/`** — Frontend (vanilla HTML/CSS/JS, no frameworks)
+- **`transcribe/app.py`** — Native macOS app (pywebview + uvicorn)
+- **`transcribe/tray.py`** — macOS menu bar integration (PyObjC)
 
 ## Development
 

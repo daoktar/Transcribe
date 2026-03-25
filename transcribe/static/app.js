@@ -15,6 +15,7 @@ const state = {
     activeSubtab: 'transcript',
     currentFileIndex: 0,
     eventSource: null,
+    lastStatuses: [],
 };
 
 // --------------- Utilities ---------------
@@ -44,8 +45,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupCopyButton();
     setupDownloadButton();
     setupRetryButton();
-    setupFileSelector();
     setupTranscriptSubtabs();
+    setupMobileLabels();
 });
 
 // --------------- Config ---------------
@@ -62,7 +63,10 @@ async function loadConfig() {
             const shown = extensions.slice(0, 5);
             const more = extensions.length - shown.length;
             let html = shown.map(ext => `<span class="format-tag">${escapeHtml(ext.replace('.', '').toUpperCase())}</span>`).join('');
-            if (more > 0) html += `<span class="format-tag">+${more} More</span>`;
+            if (more > 0) {
+                const remaining = extensions.slice(5).map(ext => ext.replace('.', '').toUpperCase());
+                html += `<span class="format-tag" title="${escapeHtml(remaining.join(', '))}">+${more} More</span>`;
+            }
             tagsEl.innerHTML = html;
         }
 
@@ -293,11 +297,15 @@ function connectSSE(jobId) {
         if (data.type === 'progress') {
             updateProgressBar(data.fraction, data.message);
             updateJobQueue(state.filenames, data.statuses, data.errors);
+            if (data.statuses) state.lastStatuses = data.statuses;
         }
 
         if (data.type === 'complete') {
             es.close();
             state.eventSource = null;
+            if (!data.statuses && state.lastStatuses.length) {
+                data.statuses = state.lastStatuses;
+            }
             onTranscriptionComplete(data);
         }
 
@@ -327,6 +335,7 @@ function updateProgressBar(fraction, message) {
     fill.style.width = pct + '%';
     msg.textContent = message;
     pctEl.textContent = pct + '%';
+    pctEl.style.visibility = (pct === 0 || pct === 100) ? 'hidden' : 'visible';
 
     if (pct >= 100) {
         fill.classList.add('done');
@@ -350,7 +359,7 @@ function updateJobQueue(filenames, statuses, errors) {
         return `
             <div class="job-card ${status}">
                 <div class="job-card-row">
-                    <span class="status-badge ${status}">${capitalize(status)}</span>
+                    <span class="status-badge ${status}">${status.toUpperCase()}</span>
                 </div>
                 <div class="job-filename">${escapeHtml(name)}</div>
                 ${errorNote}
@@ -365,6 +374,7 @@ function updateJobQueue(filenames, statuses, errors) {
 async function onTranscriptionComplete(data) {
     const firstIndex = data.first_result_index || 0;
     state.currentFileIndex = firstIndex;
+    state.lastStatuses = data.statuses || [];
 
     // Switch to review tab
     switchTab('review');
@@ -372,17 +382,8 @@ async function onTranscriptionComplete(data) {
     // Show toolbar
     document.getElementById('review-toolbar').hidden = false;
 
-    // Populate file selector if multiple files
-    const selector = document.getElementById('file-selector');
-    if (state.filenames.length > 1) {
-        selector.hidden = false;
-        selector.innerHTML = state.filenames
-            .map((name, i) => `<option value="${i}">${escapeHtml(name)}</option>`)
-            .join('');
-        selector.value = firstIndex;
-    } else {
-        selector.hidden = true;
-    }
+    // Render file switcher pills
+    renderFileSwitcher(state.filenames, firstIndex, state.lastStatuses);
 
     // Load first result
     await loadFileResult(firstIndex);
@@ -393,20 +394,28 @@ async function onTranscriptionComplete(data) {
 
 // --------------- Review Tab ---------------
 
+let _loadRequestId = 0;
+
 async function loadFileResult(fileIndex) {
+    const requestId = ++_loadRequestId;
     state.currentFileIndex = fileIndex;
 
     try {
         const res = await fetch(`/api/result/${state.jobId}/${fileIndex}`);
         if (!res.ok) throw new Error('Failed to load result');
+        if (requestId !== _loadRequestId) return; // stale request
         const result = await res.json();
 
         // Transcript text
         document.getElementById('transcript-text').textContent = result.text || '';
 
-        // Speaker text
+        // Speaker text — show empty state if no speakers
         const speakerTextEl = document.getElementById('speaker-text');
-        speakerTextEl.textContent = result.speaker_text || '';
+        if (result.has_speakers) {
+            speakerTextEl.textContent = result.speaker_text || '';
+        } else {
+            speakerTextEl.innerHTML = '<div class="speaker-empty-state">No speaker data available. Enable speaker detection and retry.</div>';
+        }
 
         // Show/hide speaker sub-tab
         const tabsEl = document.getElementById('transcript-tabs');
@@ -414,79 +423,67 @@ async function loadFileResult(fileIndex) {
             tabsEl.hidden = false;
         } else {
             tabsEl.hidden = true;
-            // Ensure transcript subtab is active
             switchSubtab('transcript');
         }
 
-        // Show/hide retry button
+        // Show/hide retry button — only when diarize was requested AND there was an error
         const retryBtn = document.getElementById('retry-btn');
-        retryBtn.hidden = !result.diarize_error;
+        retryBtn.hidden = !(result.diarize_requested && result.diarize_error);
 
         // Render summary
         renderSummary(result);
 
-        // Render file results list
-        renderFileResults(state.filenames, fileIndex);
+        // Update file switcher active state
+        renderFileSwitcher(state.filenames, fileIndex, state.lastStatuses);
 
         // Show transcript content
         document.getElementById('transcript-content').hidden = false;
 
     } catch (err) {
-        console.error('Failed to load file result:', err);
+        if (requestId === _loadRequestId) {
+            console.error('Failed to load file result:', err);
+        }
     }
 }
 
 function renderSummary(result) {
-    const box = document.getElementById('summary-box');
-    box.hidden = false;
+    const bar = document.getElementById('summary-bar');
+    bar.hidden = false;
 
-    const statusClass = result.diarize_error ? 'warning' : 'success';
-    const statusLabel = result.diarize_error ? 'Warning' : 'Success';
-    const speakersText = result.speakers != null ? result.speakers : 'N/A';
+    const lang = result.language || 'Unknown';
+    const segs = result.segments_count ?? 0;
+    const spk = result.speakers != null ? result.speakers : 'N/A';
 
-    box.innerHTML = `
-        <span class="status-badge ${statusClass}">${statusLabel}</span>
-        <div class="summary-grid">
-            <div class="summary-item">
-                <span class="summary-label">Language</span>
-                <span class="summary-value">${escapeHtml(result.language || 'Unknown')}</span>
-            </div>
-            <div class="summary-item">
-                <span class="summary-label">Segments</span>
-                <span class="summary-value">${result.segments_count ?? 0}</span>
-            </div>
-            <div class="summary-item">
-                <span class="summary-label">Speakers</span>
-                <span class="summary-value">${escapeHtml(String(speakersText))}</span>
-            </div>
-        </div>
+    bar.innerHTML = `
+        <div class="summary-stat"><strong>${escapeHtml(lang)}</strong> language</div>
+        <div class="summary-stat"><strong>${segs}</strong> segments</div>
+        <div class="summary-stat"><strong>${escapeHtml(String(spk))}</strong> speakers</div>
     `;
 }
 
-function renderFileResults(filenames, activeIndex) {
-    const list = document.getElementById('file-results-list');
-    list.innerHTML = filenames.map((name, i) => {
-        const activeClass = i === activeIndex ? 'active' : '';
+function renderFileSwitcher(filenames, activeIndex, statuses) {
+    const container = document.getElementById('file-switcher');
+    if (filenames.length <= 1) {
+        container.hidden = true;
+        return;
+    }
+    container.hidden = false;
+    container.innerHTML = filenames.map((name, i) => {
+        const active = i === activeIndex ? 'active' : '';
+        const status = (statuses && statuses[i]) || 'done';
+        const statusClass = status === 'error' ? 'error' : (status === 'done' ? 'done' : 'warning');
         return `
-            <div class="file-result-row ${activeClass}" data-index="${i}">
-                <span class="file-result-icon">
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                        <path d="M4 1h5l4 4v9a1 1 0 01-1 1H4a1 1 0 01-1-1V2a1 1 0 011-1z" stroke="currentColor" stroke-width="1.2"/>
-                        <path d="M9 1v4h4" stroke="currentColor" stroke-width="1.2"/>
-                    </svg>
-                </span>
-                <span class="file-result-name">${escapeHtml(name)}</span>
-            </div>
+            <button class="file-pill ${active}" data-index="${i}">
+                <span class="pill-status ${statusClass}"></span>
+                <span class="pill-name">${escapeHtml(name)}</span>
+            </button>
         `;
     }).join('');
 
-    // Click handlers for file result rows
-    list.querySelectorAll('.file-result-row').forEach(row => {
-        row.addEventListener('click', () => {
-            const idx = parseInt(row.dataset.index, 10);
+    container.querySelectorAll('.file-pill').forEach(pill => {
+        pill.addEventListener('click', () => {
+            const idx = parseInt(pill.dataset.index, 10);
             loadFileResult(idx);
-            const selector = document.getElementById('file-selector');
-            if (!selector.hidden) selector.value = idx;
         });
     });
 }
@@ -521,14 +518,20 @@ function switchSubtab(subtab) {
     }
 }
 
-// --------------- File Selector ---------------
+// --------------- Mobile Button Labels ---------------
 
-function setupFileSelector() {
-    const selector = document.getElementById('file-selector');
-    selector.addEventListener('change', () => {
-        const idx = parseInt(selector.value, 10);
-        loadFileResult(idx);
-    });
+function setupMobileLabels() {
+    function updateLabels() {
+        const narrow = window.innerWidth <= 480;
+        const downloadBtn = document.getElementById('download-btn');
+        const copyBtn = document.getElementById('copy-btn');
+        if (downloadBtn) downloadBtn.textContent = narrow ? 'Download' : 'Download ALL (.zip)';
+        if (copyBtn && copyBtn.textContent !== 'Copied!' && copyBtn.textContent !== 'Copy failed') {
+            copyBtn.textContent = narrow ? 'Copy' : 'Copy Text';
+        }
+    }
+    updateLabels();
+    window.addEventListener('resize', updateLabels);
 }
 
 // --------------- Copy Button ---------------
@@ -538,7 +541,8 @@ function copyToClipboard(text) {
 
     function showFeedback(ok) {
         btn.textContent = ok ? 'Copied!' : 'Copy failed';
-        setTimeout(() => { btn.textContent = 'Copy Text'; }, 1500);
+        const narrow = window.innerWidth <= 480;
+        setTimeout(() => { btn.textContent = narrow ? 'Copy' : 'Copy Text'; }, 1500);
     }
 
     function fallbackCopy() {
@@ -600,6 +604,7 @@ function setupCancelButton() {
     const btn = document.getElementById('cancel-btn');
     btn.addEventListener('click', async () => {
         if (!state.jobId) return;
+        if (!confirm('Cancel all remaining files in the queue?')) return;
 
         btn.disabled = true;
         btn.textContent = 'Cancelling...';

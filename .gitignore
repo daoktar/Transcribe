@@ -58,6 +58,9 @@ htmlcov/
 *.p12
 *.pfx
 
+# Test files
+test-files/
+
 # Media files (videos, audio)
 *.mp4
 *.mkv
