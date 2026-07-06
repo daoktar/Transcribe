@@ -1,179 +1,149 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-    <meta http-equiv="Pragma" content="no-cache">
-    <meta http-equiv="Expires" content="0">
-    <title>Media Transcriber</title>
-    <link rel="stylesheet" href="/static/style.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcribe</title>
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <!-- Header -->
-    <header class="app-header">
-        <h1>Media Transcriber</h1>
+
+<header class="masthead reveal">
+  <h1 class="wordmark">Transcribe<span class="mark" aria-hidden="true">.</span></h1>
+  <p class="folio">Local machine &middot; whisper.cpp &middot; nothing leaves this Mac</p>
+</header>
+<div class="double-rule reveal" aria-hidden="true"></div>
+
+<main>
+  <p id="notice" class="notice" role="alert" hidden></p>
+
+  <!-- ============ SETUP ============ -->
+  <section id="stage-setup" class="stage">
+    <div id="dropzone" class="dropzone reveal d1" tabindex="0" role="button"
+         aria-label="Add audio or video files">
+      <div class="wave" id="wave" aria-hidden="true"></div>
+      <h2 class="drop-title">Drop a recording here<span class="mark">.</span></h2>
+      <p class="drop-sub">or click to browse &mdash; <span id="ext-list"></span></p>
+    </div>
+    <input type="file" id="file-input" multiple hidden>
+
+    <ol id="manifest" class="manifest" hidden></ol>
+
+    <section class="sheet reveal d2" aria-label="Settings">
+      <h3 class="sheet-label">Settings</h3>
+      <div class="grid">
+        <div class="field field--select">
+          <label for="model">Model</label>
+          <select id="model"></select>
+        </div>
+        <div class="field field--select">
+          <label for="engine">Engine</label>
+          <select id="engine"></select>
+        </div>
+        <div class="field field--select">
+          <label for="language">Language</label>
+          <select id="language">
+            <option value="">Auto detect</option>
+            <option value="ru">Русский</option>
+            <option value="en">English</option>
+            <option value="de">Deutsch</option>
+            <option value="es">Español</option>
+            <option value="fr">Français</option>
+            <option value="it">Italiano</option>
+            <option value="kk">Қазақша</option>
+            <option value="nl">Nederlands</option>
+            <option value="pl">Polski</option>
+            <option value="pt">Português</option>
+            <option value="tr">Türkçe</option>
+            <option value="uk">Українська</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="zh">中文</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="num-speakers">Speakers</label>
+          <input id="num-speakers" type="number" min="1" max="20" placeholder="auto" disabled>
+        </div>
+      </div>
+
+      <div class="switches">
+        <label class="check">
+          <input type="checkbox" id="diarize"><span class="box" aria-hidden="true"></span>
+          Label speakers (diarization)
+        </label>
+        <label class="check" id="save-alongside-wrap" hidden>
+          <input type="checkbox" id="save-alongside"><span class="box" aria-hidden="true"></span>
+          Save .txt next to the source files
+        </label>
+      </div>
+
+      <div class="field token-field" id="token-wrap" hidden>
+        <label for="hf-token">HuggingFace token</label>
+        <input id="hf-token" type="password" placeholder="hf_…" autocomplete="off"
+               spellcheck="false">
+      </div>
+      <p class="token-note" id="token-note" hidden>HF token found in environment ✓</p>
+    </section>
+
+    <button id="start-btn" class="btn-block reveal d3" disabled>Transcribe &rarr;</button>
+  </section>
+
+  <!-- ============ WORKING ============ -->
+  <section id="stage-work" class="stage" hidden>
+    <ol id="work-manifest" class="manifest manifest--status"></ol>
+
+    <div class="progress">
+      <div class="progress-rail"><div id="progress-fill" class="progress-fill"></div></div>
+      <div class="progress-row">
+        <p id="progress-msg" class="progress-msg" aria-live="polite">Starting…</p>
+        <p id="progress-pct" class="progress-pct">0%</p>
+      </div>
+    </div>
+
+    <div class="work-actions">
+      <button id="cancel-btn" class="btn-ghost">Cancel</button>
+      <button id="work-back-btn" class="btn-ghost" hidden>&larr; Start over</button>
+    </div>
+  </section>
+
+  <!-- ============ READING ============ -->
+  <section id="stage-read" class="stage" hidden>
+    <nav id="file-tabs" class="file-tabs" aria-label="Transcribed files" hidden></nav>
+
+    <header class="read-head">
+      <h2 id="read-title" class="read-title"></h2>
+      <p id="read-meta" class="read-meta"></p>
     </header>
 
-    <!-- Tab Navigation -->
-    <nav class="tab-nav">
-        <button class="tab-btn active" data-tab="upload">UPLOAD</button>
-        <button class="tab-btn" data-tab="process">PROCESS</button>
-        <button class="tab-btn" data-tab="review">REVIEW</button>
-    </nav>
+    <div id="view-toggle" class="view-toggle" role="group" aria-label="Transcript view" hidden>
+      <button data-view="plain" class="toggle-btn">Plain text</button>
+      <button data-view="speakers" class="toggle-btn">By speaker</button>
+    </div>
 
-    <!-- TAB 1: UPLOAD -->
-    <section id="tab-upload" class="tab-panel active">
-        <div class="upload-layout">
-            <!-- Left: Drop Zone -->
-            <div class="upload-left">
-                <div class="drop-zone" id="drop-zone">
-                    <div class="drop-zone-content">
-                        <svg class="drop-icon" width="64" height="64" viewBox="0 0 64 64" fill="none">
-                            <rect x="8" y="8" width="48" height="48" rx="8" stroke="#3e90ff" stroke-width="2" stroke-dasharray="4 4"/>
-                            <path d="M32 22v20M22 32l10-10 10 10" stroke="#3e90ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                        <p class="drop-text">Drop files here</p>
-                        <p class="drop-subtext">or click to browse</p>
-                    </div>
-                    <div class="format-tags" id="format-tags">
-                        <!-- Filled by JS from /api/config -->
-                    </div>
-                    <input type="file" id="file-input" multiple hidden>
-                </div>
-            </div>
+    <div id="diarize-note" class="diarize-note" hidden>
+      <p id="diarize-error-msg" class="diarize-error"></p>
+      <div class="retry-row">
+        <input id="retry-token" type="password" placeholder="hf_…" autocomplete="off"
+               spellcheck="false" hidden>
+        <button id="retry-btn" class="btn-small">Retry speaker detection</button>
+      </div>
+    </div>
 
-            <!-- Right: Settings Panel -->
-            <div class="upload-right">
-                <div class="settings-panel">
-                    <div class="settings-header">
-                        <span class="settings-icon">☰</span>
-                        <span class="section-title">Transcription Engine</span>
-                    </div>
+    <div class="read-actions">
+      <button id="copy-btn" class="btn-small">Copy</button>
+      <button id="download-btn" class="btn-small btn-small--primary">Save transcript</button>
+      <button id="reset-btn" class="btn-ghost">New transcription &rarr;</button>
+    </div>
 
-                    <div class="field">
-                        <label for="engine-select">ASR ENGINE</label>
-                        <select id="engine-select">
-                            <option value="whisper" selected>Whisper (whisper.cpp)</option>
-                            <option value="qwen">Qwen3-ASR-1.7B (MLX)</option>
-                        </select>
-                        <p class="field-info" id="engine-info">Qwen3-ASR: stronger on Russian / RU-EN (Apple Silicon)</p>
-                    </div>
+    <article id="transcript" class="transcript"></article>
+  </section>
+</main>
 
-                    <div class="field">
-                        <label for="model-select">MODEL ENGINE</label>
-                        <select id="model-select">
-                            <option value="tiny">tiny</option>
-                            <option value="base">base</option>
-                            <option value="small">small</option>
-                            <option value="medium">medium</option>
-                            <option value="large-v3" selected>large-v3</option>
-                        </select>
-                    </div>
+<footer class="colophon reveal d4">
+  <p>Set in New York &amp; JetBrains Mono &middot; proofed on this machine</p>
+</footer>
 
-                    <div class="field">
-                        <label for="language-input">LANGUAGE (DEFAULT IS 'ru')</label>
-                        <input type="text" id="language-input" value="ru" placeholder="e.g. 'en', 'fr' (empty for auto)">
-                    </div>
-
-                    <div class="field checkbox-field">
-                        <label>
-                            <input type="checkbox" id="diarize-checkbox">
-                            <span>Detect Speakers</span>
-                        </label>
-                        <p class="field-info">Identify unique voices in media</p>
-                    </div>
-
-                    <div class="field">
-                        <label for="hf-token">HUGGINGFACE TOKEN</label>
-                        <input type="password" id="hf-token" placeholder="hf_****************">
-                        <p class="field-info">Required for speaker detection diarization</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Transcribe Button -->
-        <div class="transcribe-btn-wrap">
-            <button id="transcribe-btn" class="btn-primary btn-large" disabled>Transcribe</button>
-            <p class="gpu-hint">Engine will utilize GPU acceleration if available.</p>
-        </div>
-    </section>
-
-    <!-- TAB 2: PROCESS -->
-    <section id="tab-process" class="tab-panel">
-        <div class="process-layout">
-            <!-- Left: Progress -->
-            <div class="process-left">
-                <div class="process-card">
-                    <div class="progress-section" id="progress-section">
-                        <div class="progress-label">Current Activity</div>
-                        <div class="progress-message" id="progress-message">Waiting to start...</div>
-                        <div class="progress-bar-wrap">
-                            <div class="progress-bar-track">
-                                <div class="progress-bar-fill" id="progress-bar-fill" style="width: 0%"></div>
-                            </div>
-                            <div class="progress-pct-row">
-                                <span>0%</span>
-                                <span class="progress-pct-current" id="progress-pct">0%</span>
-                                <span>100%</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Right: Job Queue -->
-            <div class="process-right">
-                <div class="job-queue">
-                    <div class="job-queue-header">Job Queue</div>
-                    <div id="job-queue-list">
-                        <p class="queue-empty">No files queued yet.</p>
-                    </div>
-                    <button id="cancel-btn" class="btn-cancel" hidden>Cancel Remaining</button>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- TAB 3: REVIEW -->
-    <section id="tab-review" class="tab-panel">
-        <!-- Header row -->
-        <div class="review-header-row">
-            <div class="review-header-left">
-                <h2 class="review-title">Review Results</h2>
-                <p class="review-subtitle">Verification and export of your batch processing queue.</p>
-            </div>
-        </div>
-
-        <!-- Transcript Canvas -->
-        <div class="transcript-canvas">
-            <!-- File switcher pills (multi-file) -->
-            <div id="file-switcher" class="file-switcher" hidden></div>
-
-            <!-- Inline summary bar -->
-            <div id="summary-bar" class="summary-inline" hidden></div>
-
-            <!-- Toolbar -->
-            <div class="review-toolbar" id="review-toolbar" hidden>
-                <button id="copy-btn" class="btn-tool">Copy Text</button>
-                <button id="download-btn" class="btn-primary btn-small">Download ALL (.zip)</button>
-                <button id="retry-btn" class="btn-retry" hidden>Retry Speaker Detection</button>
-            </div>
-
-            <!-- Transcript/Speakers sub-tabs -->
-            <div class="transcript-tabs" id="transcript-tabs" hidden>
-                <button class="transcript-tab active" data-subtab="transcript">Transcript</button>
-                <button class="transcript-tab" data-subtab="speakers">Speakers</button>
-            </div>
-
-            <div class="transcript-content" id="transcript-content">
-                <pre class="transcript-text" id="transcript-text"></pre>
-                <pre class="transcript-text" id="speaker-text" hidden></pre>
-            </div>
-        </div>
-    </section>
-
-    <script src="/static/app.js"></script>
+<script src="/static/app.js"></script>
 </body>
 </html>
