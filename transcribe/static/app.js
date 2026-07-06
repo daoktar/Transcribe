@@ -1,726 +1,591 @@
-/* ============================================================
-   Media Transcriber - app.js
-   Vanilla JS single-page app communicating with FastAPI backend
-   via REST + SSE.
-   ============================================================ */
+'use strict';
 
-// --------------- App State ---------------
+/* Transcribe frontend — setup → working → reading state machine.
+   Talks to the FastAPI backend; native pywebview hooks for file
+   picking and saving (WKWebView can't handle Content-Disposition). */
+
+const $ = (id) => document.getElementById(id);
 
 const state = {
-    jobId: null,
-    filenames: [],
-    files: [],
-    nativePaths: [],
-    activeTab: 'upload',
-    activeSubtab: 'transcript',
-    currentFileIndex: 0,
-    eventSource: null,
-    lastStatuses: [],
+  config: {
+    supported_extensions: [],
+    model_choices: [],
+    engine_choices: [],
+    qwen_available: false,
+    hf_token_set: false,
+  },
+  files: [],      // browser mode: File objects
+  paths: [],      // native mode: absolute paths from pick_files()
+  jobId: null,
+  filenames: [],
+  statuses: [],
+  errors: {},     // file index (string) -> message
+  results: {},    // file index (number) -> result payload
+  current: 0,
+  view: 'plain',
+  es: null,
+  running: false,
 };
 
-// --------------- Utilities ---------------
+const isNative = () => !!(window.pywebview && window.pywebview.api);
 
-function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
+// ---------------------------------------------------------------- boot
 
-function capitalize(str) {
-    return str.charAt(0).toUpperCase() + str.slice(1);
-}
-
-function isNative() {
-    return !!(window.pywebview && window.pywebview.api);
-}
-
-// --------------- Initialization ---------------
-
-document.addEventListener('DOMContentLoaded', async () => {
-    await loadConfig();
-    setupTabNavigation();
-    setupDropZone();
-    setupTranscribeButton();
-    setupCancelButton();
-    setupCopyButton();
-    setupDownloadButton();
-    setupRetryButton();
-    setupTranscriptSubtabs();
-    setupMobileLabels();
+document.addEventListener('DOMContentLoaded', init);
+// pywebview injects its API after load — reveal native-only UI then
+window.addEventListener('pywebviewready', () => {
+  $('save-alongside-wrap').hidden = false;
 });
 
-// --------------- Config ---------------
+async function init() {
+  buildWave();
+  wireDropzone();
+  wireSettings();
+  wireButtons();
+  if (isNative()) $('save-alongside-wrap').hidden = false;
 
-async function loadConfig() {
+  try {
+    const res = await fetch('/api/config');
+    if (res.ok) state.config = await res.json();
+  } catch {
+    notice('Could not reach the backend.');
+  }
+  applyConfig();
+}
+
+function applyConfig() {
+  const c = state.config;
+
+  const model = $('model');
+  model.textContent = '';
+  for (const m of c.model_choices) {
+    model.append(new Option(m, m, m === 'large-v3', m === 'large-v3'));
+  }
+
+  const engine = $('engine');
+  engine.textContent = '';
+  for (const e of c.engine_choices) {
+    const label = e === 'qwen' ? 'qwen3-asr' : 'whisper.cpp';
+    const opt = new Option(label, e, e === 'whisper', e === 'whisper');
+    if (e === 'qwen' && !c.qwen_available) {
+      opt.disabled = true;
+      opt.text += ' — unavailable';
+    }
+    engine.append(opt);
+  }
+
+  const exts = c.supported_extensions.map((e) => e.slice(1).toUpperCase());
+  $('ext-list').textContent = exts.join(' ');
+  $('file-input').accept = c.supported_extensions.join(',');
+}
+
+function buildWave() {
+  const wave = $('wave');
+  for (let i = 0; i < 28; i++) wave.append(document.createElement('span'));
+}
+
+// ---------------------------------------------------------------- files
+
+function wireDropzone() {
+  const dz = $('dropzone');
+  const input = $('file-input');
+
+  dz.addEventListener('click', pickFiles);
+  dz.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pickFiles(); }
+  });
+  input.addEventListener('change', () => {
+    addBrowserFiles([...input.files]);
+    input.value = '';
+  });
+
+  for (const t of ['dragenter', 'dragover']) {
+    dz.addEventListener(t, (e) => { e.preventDefault(); dz.classList.add('drag'); });
+  }
+  for (const t of ['dragleave', 'drop']) {
+    dz.addEventListener(t, (e) => { e.preventDefault(); dz.classList.remove('drag'); });
+  }
+  dz.addEventListener('drop', (e) => addBrowserFiles([...e.dataTransfer.files]));
+}
+
+async function pickFiles() {
+  if (isNative() && typeof window.pywebview.api.pick_files === 'function') {
     try {
-        const res = await fetch('/api/config');
-        const config = await res.json();
-
-        // Populate format tags
-        const tagsEl = document.getElementById('format-tags');
-        const extensions = config.supported_extensions || config.extensions || [];
-        if (extensions.length && tagsEl) {
-            const shown = extensions.slice(0, 5);
-            const more = extensions.length - shown.length;
-            let html = shown.map(ext => `<span class="format-tag">${escapeHtml(ext.replace('.', '').toUpperCase())}</span>`).join('');
-            if (more > 0) {
-                const remaining = extensions.slice(5).map(ext => ext.replace('.', '').toUpperCase());
-                html += `<span class="format-tag" title="${escapeHtml(remaining.join(', '))}">+${more} More</span>`;
-            }
-            tagsEl.innerHTML = html;
+      const paths = await window.pywebview.api.pick_files();
+      if (paths && paths.length) {
+        state.files = []; // modes are exclusive
+        for (const p of paths) {
+          if (!state.paths.includes(p)) state.paths.push(p);
         }
-
-        // Populate model select
-        const models = config.model_choices || config.models || [];
-        const modelSelect = document.getElementById('model-select');
-        if (models.length && modelSelect) {
-            modelSelect.innerHTML = models
-                .map(m => `<option value="${escapeHtml(m)}"${m === 'large-v3' ? ' selected' : ''}>${escapeHtml(m)}</option>`)
-                .join('');
-        }
-
-        // Engine select: disable Qwen when MLX (Apple Silicon) is unavailable, and
-        // grey out the whisper model-size picker while the Qwen engine is selected.
-        const engineSelect = document.getElementById('engine-select');
-        if (engineSelect) {
-            const qwenOption = engineSelect.querySelector('option[value="qwen"]');
-            if (qwenOption && config.qwen_available === false) {
-                qwenOption.disabled = true;
-                qwenOption.textContent = 'Qwen3-ASR-1.7B — unavailable (Apple Silicon only)';
-            }
-            const syncModelState = () => {
-                if (modelSelect) modelSelect.disabled = (engineSelect.value === 'qwen');
-            };
-            engineSelect.addEventListener('change', syncModelState);
-            syncModelState();
-        }
-        // Pre-fill HF token placeholder if set in environment
-        if (config.hf_token_set) {
-            const hfInput = document.getElementById('hf-token');
-            if (hfInput) {
-                hfInput.placeholder = 'Token loaded from environment';
-            }
-            const diarizeCheckbox = document.getElementById('diarize-checkbox');
-            if (diarizeCheckbox) {
-                diarizeCheckbox.checked = true;
-            }
-        }
-    } catch (err) {
-        console.error('Failed to load config:', err);
+        renderManifest();
+      }
+    } catch {
+      notice('File picker failed.');
     }
+    return;
+  }
+  $('file-input').click();
 }
 
-// --------------- Tab Navigation ---------------
-
-function setupTabNavigation() {
-    const tabBtns = document.querySelectorAll('.tab-btn');
-    tabBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-            const tab = btn.dataset.tab;
-            switchTab(tab);
-        });
-    });
-}
-
-function switchTab(tabName) {
-    state.activeTab = tabName;
-
-    // Update buttons
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.tab === tabName);
-    });
-
-    // Update panels
-    document.querySelectorAll('.tab-panel').forEach(panel => {
-        panel.classList.toggle('active', panel.id === `tab-${tabName}`);
-    });
-}
-
-// --------------- Drop Zone ---------------
-
-function setupDropZone() {
-    const zone = document.getElementById('drop-zone');
-    const fileInput = document.getElementById('file-input');
-
-    // Click to browse
-    zone.addEventListener('click', async (e) => {
-        if (e.target === fileInput) return;
-
-        // Native file picker via pywebview
-        if (isNative() && window.pywebview.api.pick_files) {
-            try {
-                const paths = await window.pywebview.api.pick_files();
-                if (paths && paths.length > 0) {
-                    state.nativePaths = paths;
-                    state.files = [];
-                    state.filenames = paths.map(p => p.split('/').pop().split('\\').pop());
-                    updateDropZoneFiles(state.filenames);
-                }
-            } catch (err) {
-                console.error('Native file picker error:', err);
-            }
-            return;
-        }
-
-        fileInput.click();
-    });
-
-    // File input change
-    fileInput.addEventListener('change', () => {
-        const files = Array.from(fileInput.files);
-        if (files.length === 0) return;
-        state.files = files;
-        state.nativePaths = [];
-        state.filenames = files.map(f => f.name);
-        updateDropZoneFiles(state.filenames);
-    });
-
-    // Drag events
-    zone.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        zone.classList.add('dragover');
-    });
-
-    zone.addEventListener('dragleave', (e) => {
-        e.preventDefault();
-        zone.classList.remove('dragover');
-    });
-
-    zone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        zone.classList.remove('dragover');
-        const files = Array.from(e.dataTransfer.files);
-        if (files.length === 0) return;
-        state.files = files;
-        state.nativePaths = [];
-        state.filenames = files.map(f => f.name);
-        updateDropZoneFiles(state.filenames);
-    });
-}
-
-function updateDropZoneFiles(filenames) {
-    const zone = document.getElementById('drop-zone');
-    const transcribeBtn = document.getElementById('transcribe-btn');
-
-    if (filenames.length === 0) {
-        zone.classList.remove('has-files');
-        zone.innerHTML = `
-            <div class="drop-zone-content">
-                <svg class="drop-icon" width="64" height="64" viewBox="0 0 64 64" fill="none">
-                    <rect x="8" y="8" width="48" height="48" rx="8" stroke="#3e90ff" stroke-width="2" stroke-dasharray="4 4"/>
-                    <path d="M32 22v20M22 32l10-10 10 10" stroke="#3e90ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-                <p class="drop-text">Drop files here</p>
-                <p class="drop-subtext">or click to browse</p>
-            </div>
-            <input type="file" id="file-input" multiple hidden>
-        `;
-        transcribeBtn.disabled = true;
-        return;
+function addBrowserFiles(files) {
+  const ok = state.config.supported_extensions;
+  let rejected = 0;
+  let accepted = 0;
+  for (const f of files) {
+    const ext = '.' + f.name.split('.').pop().toLowerCase();
+    if (!ok.includes(ext)) { rejected++; continue; }
+    if (!state.files.some((x) => x.name === f.name && x.size === f.size)) {
+      state.files.push(f);
+      accepted++;
     }
-
-    zone.classList.add('has-files');
-    const content = zone.querySelector('.drop-zone-content');
-    if (content) {
-        content.innerHTML = `
-            <svg class="drop-icon" width="64" height="64" viewBox="0 0 64 64" fill="none">
-                <rect x="8" y="8" width="48" height="48" rx="8" stroke="#3e90ff" stroke-width="2"/>
-                <path d="M20 34l8 8 16-16" stroke="#3e90ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            <p class="drop-text">${filenames.length} file(s) selected</p>
-            <p class="drop-subtext">Click to change or drop new files</p>
-        `;
-    }
-    transcribeBtn.disabled = false;
+  }
+  if (accepted) state.paths = []; // modes are exclusive
+  if (rejected) notice(`Skipped ${rejected} unsupported file${rejected > 1 ? 's' : ''}.`);
+  renderManifest();
 }
 
-// --------------- Transcribe ---------------
-
-function setupTranscribeButton() {
-    const btn = document.getElementById('transcribe-btn');
-    btn.addEventListener('click', async () => {
-        if (state.files.length === 0 && state.nativePaths.length === 0) return;
-
-        btn.disabled = true;
-
-        try {
-            // Step 1: Upload files
-            const formData = new FormData();
-            if (state.nativePaths.length > 0) {
-                // Native mode: send paths as form fields
-                state.nativePaths.forEach(p => formData.append('paths', p));
-            } else {
-                state.files.forEach(f => formData.append('files', f));
-            }
-
-            const uploadRes = await fetch('/api/upload', { method: 'POST', body: formData });
-            if (!uploadRes.ok) throw new Error('Upload failed');
-            const uploadData = await uploadRes.json();
-
-            state.jobId = uploadData.job_id;
-            state.filenames = uploadData.filenames;
-
-            // Step 2: Start transcription
-            const settings = {
-                model: document.getElementById('model-select').value,
-                engine: document.getElementById('engine-select').value,
-                language: document.getElementById('language-input').value.trim(),
-                diarize: document.getElementById('diarize-checkbox').checked,
-                hf_token: document.getElementById('hf-token').value.trim(),
-                save_alongside: false,
-                original_paths: state.nativePaths.length > 0 ? state.nativePaths : [],
-            };
-
-            const transcribeRes = await fetch(`/api/transcribe/${state.jobId}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settings),
-            });
-            if (!transcribeRes.ok) throw new Error('Transcribe request failed');
-
-            // Step 3: Switch to process tab and connect SSE
-            switchTab('process');
-            resetProgressUI();
-            connectSSE(state.jobId);
-
-            // Show cancel button
-            const cancelBtn = document.getElementById('cancel-btn');
-            cancelBtn.hidden = false;
-            cancelBtn.disabled = false;
-            cancelBtn.textContent = 'Cancel Remaining';
-
-        } catch (err) {
-            console.error('Transcription start error:', err);
-            alert('Error: ' + err.message);
-            btn.disabled = false;
-        }
-    });
+function fileEntries() {
+  return state.paths.length
+    ? state.paths.map((p) => ({ name: p.split('/').pop(), size: null }))
+    : state.files.map((f) => ({ name: f.name, size: f.size }));
 }
 
-function resetProgressUI() {
-    updateProgressBar(0, 'Waiting to start...');
-    document.getElementById('job-queue-list').innerHTML =
-        '<p class="queue-empty">Preparing files...</p>';
+function removeFile(i) {
+  if (state.paths.length) state.paths.splice(i, 1);
+  else state.files.splice(i, 1);
+  renderManifest();
 }
 
-// --------------- SSE Progress ---------------
+function renderManifest() {
+  const list = $('manifest');
+  const entries = fileEntries();
+  list.textContent = '';
+  list.hidden = entries.length === 0;
+  $('dropzone').classList.toggle('compact', entries.length > 0);
 
-function connectSSE(jobId) {
-    if (state.eventSource) {
-        state.eventSource.close();
-        state.eventSource = null;
-    }
+  entries.forEach((f, i) => {
+    const li = document.createElement('li');
+    li.append(
+      el('span', 'm-idx', String(i + 1).padStart(2, '0')),
+      el('span', 'm-name', f.name),
+      el('span', 'm-size', f.size != null ? fmtSize(f.size) : 'local file'),
+    );
+    const rm = el('button', 'm-remove', '×');
+    rm.setAttribute('aria-label', `Remove ${f.name}`);
+    rm.addEventListener('click', () => removeFile(i));
+    li.append(rm);
+    list.append(li);
+  });
 
-    const es = new EventSource(`/api/progress/${jobId}`);
-    state.eventSource = es;
+  $('start-btn').disabled = entries.length === 0;
+}
 
-    es.onmessage = (event) => {
-        let data;
-        try {
-            data = JSON.parse(event.data);
-        } catch {
-            return;
-        }
+function fmtSize(bytes) {
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1048576).toFixed(1) + ' MB';
+  return (bytes / 1073741824).toFixed(2) + ' GB';
+}
 
-        if (data.type === 'progress') {
-            updateProgressBar(data.fraction, data.message);
-            updateJobQueue(state.filenames, data.statuses, data.errors);
-            if (data.statuses) state.lastStatuses = data.statuses;
-        }
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
 
-        if (data.type === 'complete') {
-            es.close();
-            state.eventSource = null;
-            if (!data.statuses && state.lastStatuses.length) {
-                data.statuses = state.lastStatuses;
-            }
-            onTranscriptionComplete(data);
-        }
+// ---------------------------------------------------------------- settings
 
-        if (data.type === 'error') {
-            es.close();
-            state.eventSource = null;
-            alert('Error: ' + data.message);
-            document.getElementById('transcribe-btn').disabled = false;
-        }
+// clamp to the backend's 1–20 range; empty/garbage -> null (auto)
+function numSpeakers() {
+  const n = parseInt($('num-speakers').value, 10);
+  return Number.isNaN(n) ? null : Math.min(20, Math.max(1, n));
+}
+
+function wireSettings() {
+  $('diarize').addEventListener('change', () => {
+    const on = $('diarize').checked;
+    $('num-speakers').disabled = !on;
+    $('token-wrap').hidden = !on || state.config.hf_token_set;
+    $('token-note').hidden = !on || !state.config.hf_token_set;
+  });
+}
+
+// ---------------------------------------------------------------- run
+
+function wireButtons() {
+  $('start-btn').addEventListener('click', start);
+  $('cancel-btn').addEventListener('click', cancelJob);
+  $('work-back-btn').addEventListener('click', () => showStage('setup'));
+  $('reset-btn').addEventListener('click', reset);
+  $('copy-btn').addEventListener('click', copyTranscript);
+  $('download-btn').addEventListener('click', download);
+  $('retry-btn').addEventListener('click', retryDiarize);
+  for (const btn of $('view-toggle').querySelectorAll('.toggle-btn')) {
+    btn.addEventListener('click', () => setView(btn.dataset.view));
+  }
+}
+
+async function start() {
+  const btn = $('start-btn');
+  btn.disabled = true;
+  btn.textContent = 'Uploading…';
+
+  try {
+    const fd = new FormData();
+    if (state.paths.length) for (const p of state.paths) fd.append('paths', p);
+    else for (const f of state.files) fd.append('files', f, f.name);
+
+    const up = await fetch('/api/upload', { method: 'POST', body: fd });
+    const upData = await up.json().catch(() => ({}));
+    if (!up.ok) throw new Error(upData.detail || `Upload failed (${up.status})`);
+
+    state.jobId = upData.job_id;
+    state.filenames = upData.filenames;
+
+    const body = {
+      model: $('model').value,
+      engine: $('engine').value,
+      language: $('language').value || null,
+      diarize: $('diarize').checked,
+      hf_token: $('hf-token').value.trim() || null,
+      num_speakers: $('diarize').checked ? numSpeakers() : null,
+      save_alongside: $('save-alongside').checked,
+      original_paths: state.paths.length ? state.paths : null,
     };
+    const tr = await fetch(`/api/transcribe/${state.jobId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const trData = await tr.json().catch(() => ({}));
+    if (!tr.ok) throw new Error(trData.detail || `Could not start (${tr.status})`);
 
-    es.onerror = () => {
-        es.close();
-        state.eventSource = null;
-        console.error('SSE connection lost');
-    };
+    state.statuses = state.filenames.map(() => 'pending');
+    state.errors = {};
+    state.results = {};
+    state.running = true;
+
+    const cancel = $('cancel-btn');
+    cancel.hidden = false;
+    cancel.disabled = false;
+    cancel.textContent = 'Cancel';
+    $('work-back-btn').hidden = true;
+
+    showStage('work');
+    renderWorkManifest();
+    setProgress(0, 'Starting…');
+    openStream(onRunComplete);
+  } catch (err) {
+    notice(err.message);
+  } finally {
+    btn.disabled = fileEntries().length === 0;
+    btn.textContent = 'Transcribe →';
+  }
 }
 
-// --------------- Progress Bar ---------------
+function openStream(onDone) {
+  closeStream();
+  const es = new EventSource(`/api/progress/${state.jobId}`);
+  state.es = es;
+  es.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
 
-function updateProgressBar(fraction, message) {
-    const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)));
-    const fill = document.getElementById('progress-bar-fill');
-    const msg = document.getElementById('progress-message');
-    const pctEl = document.getElementById('progress-pct');
-
-    fill.style.width = pct + '%';
-    msg.textContent = message;
-    pctEl.textContent = pct + '%';
-    pctEl.style.visibility = (pct === 0 || pct === 100) ? 'hidden' : 'visible';
-
-    if (pct >= 100) {
-        fill.classList.add('done');
-    } else {
-        fill.classList.remove('done');
+    if (ev.type === 'progress') {
+      if (ev.statuses) state.statuses = ev.statuses;
+      if (ev.errors) state.errors = ev.errors;
+      renderWorkManifest();
+      setProgress(ev.fraction, ev.message);
+    } else if (ev.type === 'complete' || ev.type === 'error') {
+      closeStream();
+      onDone(ev);
     }
+  };
+  // network hiccups: EventSource reconnects on its own; nothing to do
 }
 
-// --------------- Job Queue ---------------
-
-function updateJobQueue(filenames, statuses, errors) {
-    const list = document.getElementById('job-queue-list');
-    list.innerHTML = filenames.map((name, i) => {
-        const status = statuses[i] || 'pending';
-        const errorNote = errors[i]
-            ? `<div class="job-note">${escapeHtml(errors[i])}</div>`
-            : '';
-        const miniBar = status === 'processing'
-            ? '<div class="job-progress-mini"><div class="job-progress-mini-fill"></div></div>'
-            : '';
-        return `
-            <div class="job-card ${status}">
-                <div class="job-card-row">
-                    <span class="status-badge ${status}">${status.toUpperCase()}</span>
-                </div>
-                <div class="job-filename">${escapeHtml(name)}</div>
-                ${errorNote}
-                ${miniBar}
-            </div>
-        `;
-    }).join('');
+function closeStream() {
+  if (state.es) { state.es.close(); state.es = null; }
 }
 
-// --------------- Transcription Complete ---------------
+async function onRunComplete(ev) {
+  state.running = false;
+  document.title = 'Transcribe';
+  if (ev.statuses) state.statuses = ev.statuses;
+  if (ev.errors) state.errors = ev.errors;
+  renderWorkManifest();
 
-async function onTranscriptionComplete(data) {
-    const firstIndex = data.first_result_index || 0;
-    state.currentFileIndex = firstIndex;
-    state.lastStatuses = data.statuses || [];
-
-    // Switch to review tab
-    switchTab('review');
-
-    // Show toolbar
-    document.getElementById('review-toolbar').hidden = false;
-
-    // Render file switcher pills
-    renderFileSwitcher(state.filenames, firstIndex, state.lastStatuses);
-
-    // Load first result
-    await loadFileResult(firstIndex);
-
-    // Re-enable transcribe button for next run
-    document.getElementById('transcribe-btn').disabled = false;
+  if (ev.done_count > 0) {
+    state.current = ev.first_result_index ?? 0;
+    await loadResult(state.current);
+    showStage('read');
+    if (ev.cancelled) notice('Cancelled — showing what finished.');
+    else if (ev.error_count > 0) notice(`${ev.error_count} file(s) failed — see the list.`);
+  } else {
+    setProgress(1, ev.cancelled ? 'Cancelled.' : 'Finished with errors.');
+    $('cancel-btn').hidden = true;
+    $('work-back-btn').hidden = false;
+  }
 }
 
-// --------------- Review Tab ---------------
+function renderWorkManifest() {
+  const list = $('work-manifest');
+  list.textContent = '';
+  const LABELS = {
+    pending: 'queued',
+    processing: 'working',
+    done: 'done ✓',
+    error: 'error ✕',
+    cancelled: 'cancelled',
+  };
+  state.filenames.forEach((name, i) => {
+    const s = state.statuses[i] || 'pending';
+    const li = document.createElement('li');
+    li.append(
+      el('span', 'm-idx', String(i + 1).padStart(2, '0')),
+      el('span', 'm-name', name),
+      el('span', `m-status is-${s}`, LABELS[s] || s),
+    );
+    const err = state.errors[String(i)];
+    if (err) li.append(el('p', 'm-err', err));
+    list.append(li);
+  });
+}
 
-let _loadRequestId = 0;
+function setProgress(fraction, message) {
+  const pct = Math.round((fraction || 0) * 100);
+  $('progress-fill').style.width = pct + '%';
+  $('progress-pct').textContent = pct + '%';
+  if (message) $('progress-msg').textContent = message;
+  if (state.running) document.title = `${pct}% · Transcribe`;
+}
 
-async function loadFileResult(fileIndex) {
-    const requestId = ++_loadRequestId;
-    state.currentFileIndex = fileIndex;
+async function cancelJob() {
+  if (!state.jobId) return;
+  if (!confirm('Stop transcription? Files already finished are kept.')) return;
+  const btn = $('cancel-btn');
+  btn.disabled = true;
+  btn.textContent = 'Cancelling…';
+  try {
+    await fetch(`/api/cancel/${state.jobId}`, { method: 'POST' });
+  } catch {
+    notice('Could not reach the backend to cancel.');
+    btn.disabled = false;
+    btn.textContent = 'Cancel';
+  }
+}
 
+// ---------------------------------------------------------------- reading
+
+function renderTabs() {
+  const nav = $('file-tabs');
+  nav.textContent = '';
+  nav.hidden = state.filenames.length < 2;
+  if (nav.hidden) return;
+  state.filenames.forEach((name, i) => {
+    const b = el('button', 'tab' + (i === state.current ? ' active' : ''),
+      `${String(i + 1).padStart(2, '0')} ${name}`);
+    b.disabled = state.statuses[i] !== 'done';
+    b.addEventListener('click', () => loadResult(i));
+    nav.append(b);
+  });
+}
+
+async function loadResult(i) {
+  state.current = i;
+  let r = state.results[i];
+  if (!r) {
     try {
-        const res = await fetch(`/api/result/${state.jobId}/${fileIndex}`);
-        if (!res.ok) throw new Error('Failed to load result');
-        if (requestId !== _loadRequestId) return; // stale request
-        const result = await res.json();
-
-        // Transcript text
-        document.getElementById('transcript-text').textContent = result.text || '';
-
-        // Speaker text — show empty state if no speakers
-        const speakerTextEl = document.getElementById('speaker-text');
-        if (result.has_speakers) {
-            speakerTextEl.textContent = result.speaker_text || '';
-        } else {
-            speakerTextEl.innerHTML = '<div class="speaker-empty-state">No speaker data available. Enable speaker detection and retry.</div>';
-        }
-
-        // Show/hide speaker sub-tab
-        const tabsEl = document.getElementById('transcript-tabs');
-        if (result.has_speakers) {
-            tabsEl.hidden = false;
-        } else {
-            tabsEl.hidden = true;
-            switchSubtab('transcript');
-        }
-
-        // Show/hide retry button — only when diarize was requested AND there was an error
-        const retryBtn = document.getElementById('retry-btn');
-        retryBtn.hidden = !(result.diarize_requested && result.diarize_error);
-
-        // Render summary
-        renderSummary(result);
-
-        // Update file switcher active state
-        renderFileSwitcher(state.filenames, fileIndex, state.lastStatuses);
-
-        // Show transcript content
-        document.getElementById('transcript-content').hidden = false;
-
-    } catch (err) {
-        if (requestId === _loadRequestId) {
-            console.error('Failed to load file result:', err);
-        }
+      const res = await fetch(`/api/result/${state.jobId}/${i}`);
+      if (!res.ok) throw new Error();
+      r = await res.json();
+      state.results[i] = r;
+    } catch {
+      notice('Could not load this result.');
+      return;
     }
+  }
+  renderResult(r);
+  renderTabs();
 }
 
-function renderSummary(result) {
-    const bar = document.getElementById('summary-bar');
-    bar.hidden = false;
+function renderResult(r) {
+  $('read-title').textContent = r.filename;
 
-    const lang = result.language || 'Unknown';
-    const segs = result.segments_count ?? 0;
-    const spk = result.speakers != null ? result.speakers : 'N/A';
+  const meta = [];
+  if (r.language) meta.push(r.language);
+  if (r.engine) meta.push(r.engine);
+  if (r.fallback) meta.push('fell back to qwen');
+  $('read-meta').textContent = meta.join(' · ');
 
-    bar.innerHTML = `
-        <div class="summary-stat"><strong>${escapeHtml(lang)}</strong> language</div>
-        <div class="summary-stat"><strong>${escapeHtml(String(segs))}</strong> segments</div>
-        <div class="summary-stat"><strong>${escapeHtml(String(spk))}</strong> speakers</div>
-    `;
+  $('view-toggle').hidden = !r.has_speakers;
+  state.view = r.has_speakers ? 'speakers' : 'plain';
+  paintToggle();
+  renderTranscript(r);
 
-    if (result.diarize_error) {
-        bar.innerHTML += `<div class="summary-error">Speaker detection failed: ${escapeHtml(result.diarize_error)}. Enter your HuggingFace token above and click Retry.</div>`;
-    }
+  const failed = r.diarize_requested && r.diarize_error;
+  $('diarize-note').hidden = !failed;
+  if (failed) {
+    $('diarize-error-msg').textContent = 'Speaker detection failed: ' + r.diarize_error;
+    $('retry-token').hidden = state.config.hf_token_set;
+  }
 }
 
-function renderFileSwitcher(filenames, activeIndex, statuses) {
-    const container = document.getElementById('file-switcher');
-    if (filenames.length <= 1) {
-        container.hidden = true;
-        return;
-    }
-    container.hidden = false;
-    container.innerHTML = filenames.map((name, i) => {
-        const active = i === activeIndex ? 'active' : '';
-        const status = (statuses && statuses[i]) || 'done';
-        const statusClass = status === 'error' ? 'error' : (status === 'done' ? 'done' : 'warning');
-        return `
-            <button class="file-pill ${active}" data-index="${i}">
-                <span class="pill-status ${statusClass}"></span>
-                <span class="pill-name">${escapeHtml(name)}</span>
-            </button>
-        `;
-    }).join('');
+function setView(view) {
+  state.view = view;
+  paintToggle();
+  renderTranscript(state.results[state.current]);
+}
 
-    container.querySelectorAll('.file-pill').forEach(pill => {
-        pill.addEventListener('click', () => {
-            const idx = parseInt(pill.dataset.index, 10);
-            loadFileResult(idx);
-        });
+function paintToggle() {
+  for (const btn of $('view-toggle').querySelectorAll('.toggle-btn')) {
+    btn.classList.toggle('active', btn.dataset.view === state.view);
+  }
+}
+
+function renderTranscript(r) {
+  const box = $('transcript');
+  box.textContent = '';
+  box.classList.remove('empty', 'plain');
+
+  if (state.view === 'speakers' && r.speaker_text) {
+    // merge consecutive lines from the same speaker into one block
+    let spk = null;
+    let buf = [];
+    const flush = () => {
+      if (!buf.length) return;
+      const p = el('p', 'line');
+      p.append(el('span', 'spk', spk || '?'), document.createTextNode(buf.join(' ')));
+      box.append(p);
+      buf = [];
+    };
+    for (const line of r.speaker_text.split('\n')) {
+      const i = line.indexOf(':');
+      const who = i > 0 ? line.slice(0, i).trim() : '?';
+      const text = i > 0 ? line.slice(i + 1).trim() : line.trim();
+      if (!text) continue;
+      if (who !== spk) { flush(); spk = who; }
+      buf.push(text);
+    }
+    flush();
+    return;
+  }
+
+  const text = (r.text || '').trim();
+  if (!text) {
+    box.classList.add('empty');
+    box.textContent = '— no speech detected —';
+    return;
+  }
+  box.classList.add('plain');
+  for (const par of text.split(/\n{2,}/)) box.append(el('p', '', par.trim()));
+}
+
+async function copyTranscript() {
+  const r = state.results[state.current];
+  if (!r) return;
+  const text = state.view === 'speakers' && r.speaker_text ? r.speaker_text : r.text;
+  const btn = $('copy-btn');
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = 'Copied ✓';
+  } catch {
+    btn.textContent = 'Copy failed';
+  }
+  setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+}
+
+async function download() {
+  if (!state.jobId) return;
+  // Native: WKWebView renders attachments inline, replacing the app window —
+  // must go through the pywebview save dialog instead.
+  if (isNative()) {
+    const api = window.pywebview.api || {};
+    if (typeof api.save_transcript !== 'function') {
+      notice('Native save is unavailable — try reopening the app.');
+      return;
+    }
+    try {
+      const result = await api.save_transcript(`/api/download/${state.jobId}`);
+      if (typeof result === 'string' && result.startsWith('error:')) {
+        notice('Save failed: ' + result.slice(6).trim());
+      }
+    } catch {
+      notice('Save failed.');
+    }
+    return;
+  }
+  window.location.href = `/api/download/${state.jobId}`;
+}
+
+async function retryDiarize() {
+  const btn = $('retry-btn');
+  const token = $('retry-token').value.trim() || $('hf-token').value.trim() || null;
+  const body = {
+    hf_token: token,
+    num_speakers: numSpeakers(),
+    file_index: state.current,
+  };
+  try {
+    const res = await fetch(`/api/retry-diarize/${state.jobId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
-}
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Could not start retry.');
+  } catch (err) {
+    notice(err.message);
+    return;
+  }
 
-// --------------- Transcript Sub-tabs ---------------
-
-function setupTranscriptSubtabs() {
-    const tabs = document.querySelectorAll('.transcript-tab');
-    tabs.forEach(tab => {
-        tab.addEventListener('click', () => {
-            switchSubtab(tab.dataset.subtab);
-        });
-    });
-}
-
-function switchSubtab(subtab) {
-    state.activeSubtab = subtab;
-
-    document.querySelectorAll('.transcript-tab').forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.subtab === subtab);
-    });
-
-    const transcriptText = document.getElementById('transcript-text');
-    const speakerText = document.getElementById('speaker-text');
-
-    if (subtab === 'transcript') {
-        transcriptText.hidden = false;
-        speakerText.hidden = true;
-    } else {
-        transcriptText.hidden = true;
-        speakerText.hidden = false;
+  btn.disabled = true;
+  btn.textContent = 'Working…';
+  openStream(async (ev) => {
+    btn.disabled = false;
+    btn.textContent = 'Retry speaker detection';
+    if (ev.type === 'error') {
+      notice(ev.error || 'Speaker detection failed again.');
+      return;
     }
+    delete state.results[state.current];
+    await loadResult(state.current);
+  });
 }
 
-// --------------- Mobile Button Labels ---------------
+// ---------------------------------------------------------------- stages
 
-function setupMobileLabels() {
-    function updateLabels() {
-        const narrow = window.innerWidth <= 480;
-        const downloadBtn = document.getElementById('download-btn');
-        const copyBtn = document.getElementById('copy-btn');
-        if (downloadBtn) downloadBtn.textContent = narrow ? 'Download' : 'Download ALL (.zip)';
-        if (copyBtn && copyBtn.textContent !== 'Copied!' && copyBtn.textContent !== 'Copy failed') {
-            copyBtn.textContent = narrow ? 'Copy' : 'Copy Text';
-        }
-    }
-    updateLabels();
-    window.addEventListener('resize', updateLabels);
+function showStage(name) {
+  for (const s of ['setup', 'work', 'read']) {
+    $(`stage-${s}`).hidden = s !== name;
+  }
+  window.scrollTo(0, 0);
 }
 
-// --------------- Copy Button ---------------
-
-function copyToClipboard(text) {
-    const btn = document.getElementById('copy-btn');
-
-    function showFeedback(ok) {
-        btn.textContent = ok ? 'Copied!' : 'Copy failed';
-        const narrow = window.innerWidth <= 480;
-        setTimeout(() => { btn.textContent = narrow ? 'Copy' : 'Copy Text'; }, 1500);
-    }
-
-    function fallbackCopy() {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
-        document.body.appendChild(ta);
-        ta.select();
-        try {
-            showFeedback(document.execCommand('copy'));
-        } catch {
-            showFeedback(false);
-        }
-        ta.remove();
-    }
-
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text)
-            .then(() => showFeedback(true))
-            .catch(() => fallbackCopy());
-    } else {
-        fallbackCopy();
-    }
+function reset() {
+  closeStream();
+  state.files = [];
+  state.paths = [];
+  state.jobId = null;
+  state.filenames = [];
+  state.statuses = [];
+  state.errors = {};
+  state.results = {};
+  state.current = 0;
+  state.running = false;
+  document.title = 'Transcribe';
+  renderManifest();
+  showStage('setup');
 }
 
-function setupCopyButton() {
-    document.getElementById('copy-btn').addEventListener('click', () => {
-        const activeText = state.activeSubtab === 'speakers'
-            ? document.getElementById('speaker-text').textContent
-            : document.getElementById('transcript-text').textContent;
-        copyToClipboard(activeText);
-    });
-}
+// ---------------------------------------------------------------- misc
 
-// --------------- Download Button ---------------
+let noticeTimer = null;
 
-function setupDownloadButton() {
-    document.getElementById('download-btn').addEventListener('click', async () => {
-        if (!state.jobId) return;
-
-        // Native mode: use pywebview save dialog. Critical: never fall
-        // through to window.location.href — WKWebView doesn't handle
-        // Content-Disposition: attachment and would render the file inline,
-        // replacing the whole app window with raw transcript text.
-        if (isNative()) {
-            const api = window.pywebview.api || {};
-            if (typeof api.save_transcript !== 'function') {
-                console.error('Native download: save_transcript not exposed', Object.keys(api));
-                alert('Native save API is unavailable. Try reopening the app.');
-                return;
-            }
-            try {
-                const result = await api.save_transcript(`/api/download/${state.jobId}`);
-                if (typeof result === 'string' && result.startsWith('error:')) {
-                    console.error('Native download error:', result);
-                    alert('Failed to save transcript: ' + result.slice(6).trim());
-                }
-            } catch (err) {
-                console.error('Native download error:', err);
-                alert('Failed to save transcript.');
-            }
-            return;
-        }
-
-        // Browser mode: direct download
-        window.location.href = `/api/download/${state.jobId}`;
-    });
-}
-
-// --------------- Cancel Button ---------------
-
-function setupCancelButton() {
-    const btn = document.getElementById('cancel-btn');
-    btn.addEventListener('click', async () => {
-        if (!state.jobId) return;
-        if (!confirm('Cancel all remaining files in the queue?')) return;
-
-        btn.disabled = true;
-        btn.textContent = 'Cancelling...';
-
-        try {
-            await fetch(`/api/cancel/${state.jobId}`, { method: 'POST' });
-        } catch (err) {
-            console.error('Cancel error:', err);
-        }
-    });
-}
-
-// --------------- Retry Button ---------------
-
-function setupRetryButton() {
-    document.getElementById('retry-btn').addEventListener('click', async () => {
-        if (!state.jobId) return;
-
-        const hfToken = document.getElementById('hf-token').value.trim();
-        const retryBtn = document.getElementById('retry-btn');
-        retryBtn.disabled = true;
-
-        try {
-            const res = await fetch(`/api/retry-diarize/${state.jobId}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ hf_token: hfToken }),
-            });
-            if (!res.ok) throw new Error('Retry request failed');
-
-            // Switch to process tab and reconnect SSE
-            switchTab('process');
-            resetProgressUI();
-            connectSSE(state.jobId);
-
-            // Override complete handler to go back to review
-            const origOnMessage = state.eventSource.onmessage;
-            state.eventSource.onmessage = (event) => {
-                let data;
-                try {
-                    data = JSON.parse(event.data);
-                } catch {
-                    return;
-                }
-
-                if (data.type === 'progress') {
-                    updateProgressBar(data.fraction, data.message);
-                    updateJobQueue(state.filenames, data.statuses, data.errors);
-                }
-
-                if (data.type === 'complete') {
-                    state.eventSource.close();
-                    state.eventSource = null;
-                    switchTab('review');
-                    loadFileResult(state.currentFileIndex);
-                    retryBtn.disabled = false;
-                }
-
-                if (data.type === 'error') {
-                    state.eventSource.close();
-                    state.eventSource = null;
-                    alert('Retry error: ' + data.message);
-                    retryBtn.disabled = false;
-                }
-            };
-
-        } catch (err) {
-            console.error('Retry error:', err);
-            alert('Retry failed: ' + err.message);
-            retryBtn.disabled = false;
-        }
-    });
+function notice(msg) {
+  const n = $('notice');
+  n.textContent = msg;
+  n.hidden = false;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { n.hidden = true; }, 7000);
 }

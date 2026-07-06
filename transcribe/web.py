@@ -336,6 +336,8 @@ def _run_transcription(job: Job) -> None:
         "done_count": done_count,
         "error_count": error_count,
         "first_result_index": first_result_index if first_result_index is not None else 0,
+        "statuses": list(job.statuses),
+        "errors": {str(k): v for k, v in job.errors.items()},
     })
 
 
