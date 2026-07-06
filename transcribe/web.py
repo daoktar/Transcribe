@@ -30,7 +30,6 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from transcribe import qwen_engine
 from transcribe.core import (
@@ -84,25 +83,6 @@ _tmp_dir = tempfile.TemporaryDirectory(prefix="transcribe_")
 atexit.register(_tmp_dir.cleanup)
 
 STATIC_DIR = get_base_dir() / "static"
-
-
-class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add security headers to every response."""
-
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        # Prevent WKWebView/browsers from serving stale frontend assets across
-        # app restarts — critical for the pywebview desktop build where the
-        # embedded webview otherwise caches app.js indefinitely.
-        path = request.url.path
-        if path == "/" or path.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-            response.headers["Expires"] = "0"
-        return response
 
 # ---------------------------------------------------------------------------
 # Job state
@@ -445,17 +425,22 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(title="Transcribe", docs_url="/docs")
-    app.add_middleware(_SecurityHeadersMiddleware)
 
-    # --- Security headers middleware ---
+    # --- Security headers (one middleware for every response) ---
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'"
         )
+        # Stop WKWebView/browsers serving stale frontend assets across app restarts.
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
         return response
 
     # --- CORS — restrict to localhost origins ---
