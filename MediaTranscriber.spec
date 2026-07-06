@@ -24,6 +24,30 @@ torch_datas, torch_binaries, torch_hiddenimports = collect_all("torch")
 pyannote_datas, _, pyannote_hiddenimports = collect_all("pyannote")
 
 # ---------------------------------------------------------------------------
+# MLX stack for the Qwen3-ASR fallback engine (Apple Silicon only). Optional:
+# if MLX isn't installed at build time the app is packaged whisper-only.
+# collect_all() cannot see mlx_audio's runtime importlib.import_module of the
+# model classes, so the qwen3_asr / qwen3_forced_aligner modules are named
+# explicitly below.
+# ---------------------------------------------------------------------------
+mlx_datas, mlx_binaries, mlx_hiddenimports = [], [], []
+for _mlx_pkg in ("mlx", "mlx_metal", "mlx_audio", "mlx_lm"):
+    try:
+        _d, _b, _h = collect_all(_mlx_pkg)
+        mlx_datas += _d
+        mlx_binaries += _b
+        mlx_hiddenimports += _h
+    except Exception as _mlx_err:  # noqa: BLE001 — build-time best effort
+        print(f"[spec] MLX package '{_mlx_pkg}' not collected ({_mlx_err})")
+if mlx_hiddenimports:
+    mlx_hiddenimports += [
+        "transcribe.qwen_engine",
+        "transcribe.qwen_prompt",
+        "mlx_audio.stt.models.qwen3_asr",
+        "mlx_audio.stt.models.qwen3_forced_aligner",
+    ]
+
+# ---------------------------------------------------------------------------
 # Locate bundled ffmpeg/ffprobe (Homebrew or env override)
 # ---------------------------------------------------------------------------
 _ffmpeg = os.environ.get("FFMPEG_BIN", shutil.which("ffmpeg") or "ffmpeg")
@@ -38,13 +62,16 @@ a = Analysis(
     datas=[
         ("transcribe/assets", "transcribe/assets"),
         ("transcribe/static", "transcribe/static"),
+        ("transcribe/qwen_context_prompt.txt", "transcribe"),
         *torch_datas,
         *pyannote_datas,
+        *mlx_datas,
     ],
     binaries=[
         (_ffmpeg, "."),
         (_ffprobe, "."),
         *torch_binaries,
+        *mlx_binaries,
     ],
     hiddenimports=[
         "transcribe",
@@ -71,6 +98,7 @@ a = Analysis(
         "webview",
         *torch_hiddenimports,
         *pyannote_hiddenimports,
+        *mlx_hiddenimports,
     ],
     excludes=[
         # ---------------------------------------------------------------

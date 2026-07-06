@@ -65,8 +65,9 @@ _FILE_TYPES = (f"Media Files ({_ext_list})",)
 class JsApi:
     """Python functions callable from JavaScript inside the webview."""
 
-    def __init__(self, window: webview.Window):
+    def __init__(self, window: "webview.Window | None" = None, base_url: str = ""):
         self._window = window
+        self._base_url = base_url.rstrip("/")
 
     def pick_files(self) -> list[str]:
         """Open a native macOS file dialog and return selected file paths."""
@@ -77,23 +78,87 @@ class JsApi:
         )
         return list(result) if result else []
 
-    def save_transcript(self, src_path: str) -> str:
-        """Open a native Save dialog and copy the transcript file there."""
+    def save_transcript(self, url_or_path: str) -> str:
+        """Save a transcript via native Save dialog.
+
+        Accepts either a local filesystem path (legacy) or a URL (absolute or
+        server-relative like ``/api/download/<job_id>``). For URLs, the file
+        is fetched over loopback HTTP from the embedded uvicorn server, and
+        the filename is taken from the ``Content-Disposition`` header.
+        Returns the destination path on success, ``""`` on cancel, or a
+        string starting with ``"error: "`` on failure.
+        """
         from pathlib import Path
-        src = Path(src_path)
-        if not src.exists():
-            return ""
-        save_types = ("Text Files (*.txt;*.zip)",)
+
+        # Legacy branch: existing local file → copy as before.
+        if url_or_path and not url_or_path.startswith(("/", "http://", "https://")):
+            src = Path(url_or_path)
+            if src.exists():
+                save_types = ("Text Files (*.txt;*.zip)",)
+                result = self._window.create_file_dialog(
+                    webview.SAVE_DIALOG,
+                    save_filename=src.name,
+                    file_types=save_types,
+                )
+                if result:
+                    dest = result if isinstance(result, str) else result[0]
+                    shutil.copy2(str(src), dest)
+                    return dest
+                return ""
+            return f"error: file not found: {url_or_path}"
+
+        # URL branch: fetch from the loopback server.
+        if url_or_path.startswith(("http://", "https://")):
+            url = url_or_path
+        else:
+            if not self._base_url:
+                return "error: server base URL not configured"
+            url = self._base_url + url_or_path
+
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                data = resp.read()
+                content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                disposition = resp.headers.get("Content-Disposition") or ""
+        except Exception as exc:  # noqa: BLE001
+            print(f"save_transcript: fetch failed: {exc}", file=sys.stderr)
+            return f"error: fetch failed: {exc}"
+
+        # Parse filename from Content-Disposition via stdlib email parser.
+        filename = ""
+        if disposition:
+            from email.message import Message
+            msg = Message()
+            msg["Content-Disposition"] = disposition
+            filename = msg.get_filename() or ""
+        if not filename:
+            # Fallback: last URL path segment, then sensible default.
+            tail = url.rsplit("/", 1)[-1].split("?", 1)[0]
+            if tail and "." in tail:
+                filename = tail
+            else:
+                filename = "transcripts.zip" if content_type == "application/zip" else "transcript.txt"
+
+        if content_type == "application/zip":
+            save_types = ("Zip Archive (*.zip)",)
+        else:
+            save_types = ("Text Files (*.txt)",)
+
         result = self._window.create_file_dialog(
             webview.SAVE_DIALOG,
-            save_filename=src.name,
+            save_filename=filename,
             file_types=save_types,
         )
-        if result:
-            dest = result if isinstance(result, str) else result[0]
-            shutil.copy2(str(src), dest)
-            return dest
-        return ""
+        if not result:
+            return ""  # user cancelled
+
+        dest = result if isinstance(result, str) else result[0]
+        try:
+            Path(dest).write_bytes(data)
+        except Exception as exc:  # noqa: BLE001
+            print(f"save_transcript: write failed: {exc}", file=sys.stderr)
+            return f"error: write failed: {exc}"
+        return dest
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +249,20 @@ def _on_webview_started(window: webview.Window):
 
     callAfter(_install)
 
-    # Expose the JS API so pages can call window.pywebview.api.*
-    api = JsApi(window)
-    window.expose(api.pick_files, api.save_transcript)
+    # Bind the real window to the JsApi instance that was attached via
+    # js_api= at create_window() time. We cannot pass window into JsApi at
+    # construction because the window doesn't exist yet.
+    api = getattr(window, "_js_api", None)
+    if api is not None:
+        api._window = window
+        api._base_url = getattr(window, "_server_base_url", "").rstrip("/")
+        # Also expose explicitly — belt-and-suspenders. In some pywebview
+        # versions / configurations js_api= and expose() behave differently,
+        # and we want every JsApi method reachable as window.pywebview.api.*
+        try:
+            window.expose(api.pick_files, api.save_transcript)
+        except Exception as exc:  # noqa: BLE001
+            print(f"_on_webview_started: expose failed: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +286,11 @@ def main():
 
     _wait_for_server(port)
 
+    # Create the JS API up front so we can pass it to create_window via
+    # js_api=. The window reference and base_url are filled in inside
+    # _on_webview_started once the window exists.
+    js_api = JsApi(window=None, base_url="")  # type: ignore[arg-type]
+
     window = webview.create_window(
         title="Media Transcriber",
         url=f"http://127.0.0.1:{port}",
@@ -217,7 +298,11 @@ def main():
         height=900,
         min_size=(800, 600),
         background_color="#0b1326",
+        js_api=js_api,
     )
+    # Stash server URL and api instance so _on_webview_started can wire them up.
+    window._server_base_url = f"http://127.0.0.1:{port}"
+    window._js_api = js_api
 
     # Intercept window close-button → hide to tray instead of quitting.
     # Cmd+Q sets _quitting=True first, so the handler lets it through.
@@ -232,10 +317,14 @@ def main():
     window.events.closing += _closing_handler
 
     # Start the native Cocoa event loop (blocks until window.destroy()).
+    # Debug mode can be toggled via TRANSCRIBE_DEBUG=1 — enables the
+    # WKWebView DevTools (right-click → Inspect Element) and verbose logs.
+    debug = os.environ.get("TRANSCRIBE_DEBUG", "").strip() not in ("", "0", "false", "False")
     webview.start(
         func=_on_webview_started,
         args=(window,),
         gui="cocoa",
+        debug=debug,
     )
 
     # Exit cleanly so atexit handlers run (e.g. temp dir cleanup).

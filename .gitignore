@@ -75,6 +75,7 @@ test-files/
 # Transcription output
 *.txt
 !requirements.txt
+!transcribe/qwen_context_prompt.txt
 *.srt
 *.vtt
 

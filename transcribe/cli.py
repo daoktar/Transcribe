@@ -23,6 +23,14 @@ def main():
         help="Whisper model size (default: large-v3)",
     )
     parser.add_argument(
+        "--engine",
+        default="whisper",
+        choices=["whisper", "qwen"],
+        help="Transcription engine: 'whisper' (default, whisper.cpp) or 'qwen' "
+             "(Qwen3-ASR-1.7B via MLX, Apple Silicon). Qwen is also used automatically "
+             "as a fallback if the whisper engine fails.",
+    )
+    parser.add_argument(
         "--language",
         default=None,
         help="Language code (e.g. 'en'). Auto-detected if omitted.",
@@ -77,7 +85,9 @@ def main():
             print(f"\n[{idx}/{total}] Transcribing: {media_path}")
         else:
             print(f"Transcribing: {media_path}")
-        print(f"Model: {args.model}")
+        print(f"Engine: {args.engine}" + ("" if args.engine == "whisper" else " (Qwen3-ASR-1.7B)"))
+        if args.engine == "whisper":
+            print(f"Model: {args.model}")
         print(f"Language: {args.language or 'auto-detect'}")
         if args.speakers:
             print("Speaker diarization: enabled")
@@ -92,6 +102,7 @@ def main():
                 diarize=args.speakers,
                 num_speakers=args.num_speakers,
                 hf_token=hf_token,
+                engine=args.engine,
             )
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)

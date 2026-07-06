@@ -641,16 +641,19 @@ class TestTranscribeVideoValidation:
                 str(video), language="en", progress_callback=track_progress
             )
 
-        # Should have at least: loading, audio extraction, VAD, language, done
+        # Should have at least: audio extraction, VAD, model loading, language, done
         assert len(progress_calls) >= 5
-        assert progress_calls[0][0] == 0.0  # loading starts at 0
-        assert "Loading model" in progress_calls[0][1]
+        assert progress_calls[0][0] < 0.12  # setup (audio extraction) reports first, low fraction
         assert progress_calls[-1][0] == 1.0  # done at 100%
         assert "Done" in progress_calls[-1][1]
-        # Check VAD stages exist
+        # Fractions are monotonically non-decreasing
+        fractions = [f for f, _ in progress_calls]
+        assert fractions == sorted(fractions)
+        # Check the expected stages exist (model now loads inside the engine, after VAD)
         messages = [m for _, m in progress_calls]
         assert any("Extracting audio" in m for m in messages)
         assert any("speech region" in m for m in messages)
+        assert any("Loading model" in m for m in messages)
 
     def test_return_dict_shape(self, tmp_path):
         video = tmp_path / "video.mp4"
@@ -842,3 +845,176 @@ class TestTranscribeVideoSegmentProcessing:
         # Chunk 2 segment: 10.0 + 0.0 = 10.0, 10.0 + 2.0 = 12.0
         assert result["segments"][1] == {"start": 10.0, "end": 12.0, "text": "World."}
         assert result["text"] == "Hello. World."
+
+
+# ---------------------------------------------------------------------------
+# Engine selection & Qwen3-ASR fallback
+# ---------------------------------------------------------------------------
+
+
+class TestEngineDispatch:
+    """The engine= arg selects whisper/qwen; whisper failure falls back to qwen."""
+
+    def _common_patches(self, whisper_side_effect=None):
+        fake_audio = np.zeros(16000 * 10, dtype=np.float32)
+        model_patch = (
+            patch("transcribe.core.Model", side_effect=whisper_side_effect)
+            if whisper_side_effect is not None
+            else patch("transcribe.core.Model", return_value=MagicMock())
+        )
+        return [
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core._get_media_duration", return_value=10.0),
+            patch("transcribe.core._extract_audio_pcm", return_value=fake_audio),
+            patch("transcribe.core._detect_speech_regions", return_value=[(0.0, 10.0)]),
+            patch("transcribe.core._merge_speech_regions", return_value=[(0.0, 10.0)]),
+            model_patch,
+        ]
+
+    def test_qwen_engine_selected_skips_whisper(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        qwen_ret = ([{"start": 0.0, "end": 10.0, "text": "привет"}], "ru")
+        patches = self._common_patches()
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.transcribe_regions", return_value=qwen_ret) as mock_qwen,
+        ):
+            result = transcribe_video(str(video), engine="qwen")
+        mock_qwen.assert_called_once()
+        assert result["text"] == "привет"
+        assert result["language"] == "ru"
+
+    def test_qwen_engine_uses_default_context_prompt(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        from transcribe.qwen_prompt import DEFAULT_CONTEXT_PROMPT
+        qwen_ret = ([{"start": 0.0, "end": 10.0, "text": "текст"}], "ru")
+        patches = self._common_patches()
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.transcribe_regions", return_value=qwen_ret) as mock_qwen,
+        ):
+            transcribe_video(str(video), engine="qwen")
+        _, kwargs = mock_qwen.call_args
+        assert kwargs["system_prompt"] == DEFAULT_CONTEXT_PROMPT
+
+    def test_custom_context_prompt_forwarded(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        qwen_ret = ([{"start": 0.0, "end": 10.0, "text": "x"}], "ru")
+        patches = self._common_patches()
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.transcribe_regions", return_value=qwen_ret) as mock_qwen,
+        ):
+            transcribe_video(str(video), engine="qwen", qwen_context="MY CONTEXT")
+        _, kwargs = mock_qwen.call_args
+        assert kwargs["system_prompt"] == "MY CONTEXT"
+
+    def test_fallback_to_qwen_on_whisper_failure(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        qwen_ret = ([{"start": 0.0, "end": 10.0, "text": "fallback text"}], "ru")
+        patches = self._common_patches(whisper_side_effect=RuntimeError("whisper boom"))
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.is_available", return_value=True),
+            patch("transcribe.core.qwen_engine.is_model_cached", return_value=True),
+            patch("transcribe.core.qwen_engine.transcribe_regions", return_value=qwen_ret) as mock_qwen,
+        ):
+            result = transcribe_video(str(video), language="en", allow_qwen_fallback=True)
+        mock_qwen.assert_called_once()
+        assert result["text"] == "fallback text"
+        # Provenance: the fallback engine and flag must be recorded.
+        assert result["engine"] == "qwen"
+        assert result["fallback"] is True
+
+    def test_memory_error_is_not_retried_on_qwen(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        patches = self._common_patches(whisper_side_effect=MemoryError("oom"))
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.is_available", return_value=True),
+            patch("transcribe.core.qwen_engine.is_model_cached", return_value=True),
+            patch("transcribe.core.qwen_engine.transcribe_regions") as mock_qwen,
+        ):
+            with pytest.raises(MemoryError):
+                transcribe_video(str(video), language="en")
+        mock_qwen.assert_not_called()  # must NOT load a bigger model after an OOM
+
+    def test_fallback_skipped_when_weights_not_cached(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        patches = self._common_patches(whisper_side_effect=RuntimeError("whisper boom"))
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.is_available", return_value=True),
+            patch("transcribe.core.qwen_engine.is_model_cached", return_value=False),
+            patch("transcribe.core.qwen_engine.transcribe_regions") as mock_qwen,
+        ):
+            with pytest.raises(RuntimeError, match="whisper boom"):
+                transcribe_video(str(video), language="en")
+        mock_qwen.assert_not_called()  # no multi-GB download for an unattended fallback
+
+    def test_no_fallback_when_disabled_reraises(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        patches = self._common_patches(whisper_side_effect=RuntimeError("whisper boom"))
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.transcribe_regions") as mock_qwen,
+        ):
+            with pytest.raises(RuntimeError, match="whisper boom"):
+                transcribe_video(str(video), language="en", allow_qwen_fallback=False)
+        mock_qwen.assert_not_called()
+
+    def test_fallback_unavailable_reraises_original(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        patches = self._common_patches(whisper_side_effect=RuntimeError("whisper boom"))
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.is_available", return_value=False),
+            patch("transcribe.core.qwen_engine.transcribe_regions") as mock_qwen,
+        ):
+            with pytest.raises(RuntimeError, match="whisper boom"):
+                transcribe_video(str(video), language="en")
+        mock_qwen.assert_not_called()
+
+    def _run_qwen(self, tmp_path, mock_qwen, **kwargs):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        qwen_ret = ([{"start": 0.0, "end": 10.0, "text": "привет."}], "ru")
+        mock_qwen.return_value = qwen_ret
+        patches = self._common_patches()
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch("transcribe.core.qwen_engine.is_model_cached", return_value=True),
+            patch("transcribe.core.qwen_engine.transcribe_regions", mock_qwen),
+        ):
+            return transcribe_video(str(video), engine="qwen", **kwargs)
+
+    def test_qwen_align_defaults_off_without_diarize(self, tmp_path):
+        mock_qwen = MagicMock()
+        self._run_qwen(tmp_path, mock_qwen)
+        assert mock_qwen.call_args.kwargs["align"] is False
+
+    def test_engine_provenance_recorded_for_direct_qwen(self, tmp_path):
+        mock_qwen = MagicMock()
+        result = self._run_qwen(tmp_path, mock_qwen)
+        assert result["engine"] == "qwen"
+        assert "fallback" not in result  # only set when whisper fell back
+
+    def test_qwen_align_explicit_true(self, tmp_path):
+        mock_qwen = MagicMock()
+        self._run_qwen(tmp_path, mock_qwen, qwen_align=True)
+        assert mock_qwen.call_args.kwargs["align"] is True
+
+    def test_diarize_auto_enables_alignment(self, tmp_path):
+        mock_qwen = MagicMock()
+        labeled = [{"start": 0.0, "end": 10.0, "text": "привет.", "speaker": "Speaker 1"}]
+        with patch("transcribe.diarize.diarize", return_value=(labeled, 1)):
+            self._run_qwen(tmp_path, mock_qwen, language="ru", diarize=True, hf_token="tok")
+        assert mock_qwen.call_args.kwargs["align"] is True

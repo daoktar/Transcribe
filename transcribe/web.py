@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from transcribe import qwen_engine
 from transcribe.core import (
     SUPPORTED_EXTENSIONS,
     retry_diarize,
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
+ENGINE_CHOICES = ["whisper", "qwen"]
 
 # Maximum upload size per file: 2 GB
 MAX_UPLOAD_SIZE = 2 * 1024 * 1024 * 1024
@@ -92,6 +94,14 @@ class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
+        # Prevent WKWebView/browsers from serving stale frontend assets across
+        # app restarts — critical for the pywebview desktop build where the
+        # embedded webview otherwise caches app.js indefinitely.
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
         return response
 
 # ---------------------------------------------------------------------------
@@ -157,6 +167,7 @@ def _check_rate_limit(client_ip: str) -> None:
 
 class TranscribeRequest(BaseModel):
     model: str = "large-v3"
+    engine: str = "whisper"
     language: str | None = None
     diarize: bool = False
     hf_token: str | None = None
@@ -170,6 +181,11 @@ class TranscribeRequest(BaseModel):
         if v is not None and (v < 1 or v > MAX_NUM_SPEAKERS):
             raise ValueError(f"num_speakers must be 1–{MAX_NUM_SPEAKERS}")
         return v
+
+    @field_validator("engine")
+    @classmethod
+    def _validate_engine(cls, v: str) -> str:
+        return v if v in ENGINE_CHOICES else "whisper"
 
 
 class RetryDiarizeRequest(BaseModel):
@@ -294,6 +310,7 @@ def _run_transcription(job: Job) -> None:
             result = transcribe_media(
                 media_path=str(fpath),
                 model_size=job.settings.get("model", "large-v3"),
+                engine=job.settings.get("engine", "whisper"),
                 language=job.settings.get("language"),
                 progress_callback=_progress_cb,
                 diarize=job.settings.get("diarize", False),
@@ -471,6 +488,8 @@ def create_app() -> FastAPI:
         return JSONResponse({
             "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
             "model_choices": MODEL_CHOICES,
+            "engine_choices": ENGINE_CHOICES,
+            "qwen_available": qwen_engine.is_available(),
             "hf_token_set": bool(_get_env_hf_token()),
         })
 
@@ -586,12 +605,21 @@ def create_app() -> FastAPI:
                     detail=f"Invalid language code: {language}",
                 )
 
+            # Reject the Qwen engine early when MLX isn't available (non-Apple-Silicon),
+            # rather than failing later at transcription time with a cryptic import error.
+            if body.engine == "qwen" and not qwen_engine.is_available():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Qwen engine is unavailable on this server (requires Apple Silicon + MLX).",
+                )
+
             # Resolve HF token: UI > env var (kept separate from settings)
             job._hf_token = body.hf_token or _get_env_hf_token()
 
             # Store settings — don't persist the raw HF token
             job.settings = {
                 "model": body.model if body.model in MODEL_CHOICES else "large-v3",
+                "engine": body.engine if body.engine in ENGINE_CHOICES else "whisper",
                 "language": language,
                 "diarize": body.diarize,
                 "num_speakers": body.num_speakers,
@@ -609,8 +637,11 @@ def create_app() -> FastAPI:
                             logger.warning("Rejected original_path: %s", op)
                             job.original_paths[i] = None
 
-            # Reset state for re-runs
-            job.status = "uploaded"
+            # Reset state for re-runs. Set the busy sentinel *inside* the lock so the
+            # "already processing" guard above is authoritative — otherwise a double
+            # submit in the window before the worker thread flips the status could
+            # spawn a second worker on the same Job.
+            job.status = "processing"
             job.statuses = ["pending"] * len(job.files)
             job.errors.clear()
             job.results.clear()
@@ -808,6 +839,8 @@ def create_app() -> FastAPI:
             "has_speakers": bool(speaker_text),
             "diarize_error": result.get("diarize_error"),
             "diarize_requested": job.settings.get("diarize", False),
+            "engine": result.get("engine"),
+            "fallback": result.get("fallback", False),
         })
 
     return app

@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Media Transcriber</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -46,6 +49,15 @@
                     <div class="settings-header">
                         <span class="settings-icon">☰</span>
                         <span class="section-title">Transcription Engine</span>
+                    </div>
+
+                    <div class="field">
+                        <label for="engine-select">ASR ENGINE</label>
+                        <select id="engine-select">
+                            <option value="whisper" selected>Whisper (whisper.cpp)</option>
+                            <option value="qwen">Qwen3-ASR-1.7B (MLX)</option>
+                        </select>
+                        <p class="field-info" id="engine-info">Qwen3-ASR: stronger on Russian / RU-EN (Apple Silicon)</p>
                     </div>
 
                     <div class="field">
