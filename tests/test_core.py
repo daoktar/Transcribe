@@ -12,13 +12,12 @@ from transcribe.core import (
     _detect_speech_regions,
     _extract_audio_pcm,
     _format_eta,
-    _format_timestamp,
     _get_media_duration,
     _merge_speech_regions,
     retry_diarize,
     save_txt,
     save_txt_alongside,
-    transcribe_video,
+    transcribe_media as transcribe_video,
 )
 
 
@@ -45,27 +44,6 @@ class TestFormatEta:
     def test_fractional_seconds(self):
         assert _format_eta(0.7) == "0s"
         assert _format_eta(5.9) == "5s"
-
-
-# ---------------------------------------------------------------------------
-# _format_timestamp
-# ---------------------------------------------------------------------------
-
-class TestFormatTimestamp:
-    def test_zero(self):
-        assert _format_timestamp(0.0) == "00:00"
-
-    def test_seconds_only(self):
-        assert _format_timestamp(45.0) == "00:45"
-
-    def test_minutes_and_seconds(self):
-        assert _format_timestamp(125.0) == "02:05"
-
-    def test_hours(self):
-        assert _format_timestamp(3661.0) == "01:01:01"
-
-    def test_fractional_truncated(self):
-        assert _format_timestamp(90.9) == "01:30"
 
 
 # ---------------------------------------------------------------------------

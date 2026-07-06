@@ -30,16 +30,6 @@ def _format_eta(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
-def _format_timestamp(seconds: float) -> str:
-    """Format seconds as MM:SS or HH:MM:SS timestamp."""
-    total = int(seconds)
-    h, remainder = divmod(total, 3600)
-    m, s = divmod(remainder, 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
 def _get_media_duration(file_path: str) -> float | None:
     """Get media duration in seconds using ffprobe.
 
@@ -700,10 +690,6 @@ def transcribe_media(
     if diarize_error:
         result["diarize_error"] = diarize_error
     return result
-
-
-# Backward-compatible alias
-transcribe_video = transcribe_media
 
 
 def save_txt(result: dict, output_path: str | Path) -> Path:
