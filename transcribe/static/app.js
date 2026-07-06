@@ -78,6 +78,22 @@ async function loadConfig() {
                 .map(m => `<option value="${escapeHtml(m)}"${m === 'large-v3' ? ' selected' : ''}>${escapeHtml(m)}</option>`)
                 .join('');
         }
+
+        // Engine select: disable Qwen when MLX (Apple Silicon) is unavailable, and
+        // grey out the whisper model-size picker while the Qwen engine is selected.
+        const engineSelect = document.getElementById('engine-select');
+        if (engineSelect) {
+            const qwenOption = engineSelect.querySelector('option[value="qwen"]');
+            if (qwenOption && config.qwen_available === false) {
+                qwenOption.disabled = true;
+                qwenOption.textContent = 'Qwen3-ASR-1.7B — unavailable (Apple Silicon only)';
+            }
+            const syncModelState = () => {
+                if (modelSelect) modelSelect.disabled = (engineSelect.value === 'qwen');
+            };
+            engineSelect.addEventListener('change', syncModelState);
+            syncModelState();
+        }
         // Pre-fill HF token placeholder if set in environment
         if (config.hf_token_set) {
             const hfInput = document.getElementById('hf-token');
@@ -247,6 +263,7 @@ function setupTranscribeButton() {
             // Step 2: Start transcription
             const settings = {
                 model: document.getElementById('model-select').value,
+                engine: document.getElementById('engine-select').value,
                 language: document.getElementById('language-input').value.trim(),
                 diarize: document.getElementById('diarize-checkbox').checked,
                 hf_token: document.getElementById('hf-token').value.trim(),
@@ -598,12 +615,26 @@ function setupDownloadButton() {
     document.getElementById('download-btn').addEventListener('click', async () => {
         if (!state.jobId) return;
 
-        // Native mode: use pywebview save dialog
-        if (isNative() && window.pywebview.api.save_transcript) {
+        // Native mode: use pywebview save dialog. Critical: never fall
+        // through to window.location.href — WKWebView doesn't handle
+        // Content-Disposition: attachment and would render the file inline,
+        // replacing the whole app window with raw transcript text.
+        if (isNative()) {
+            const api = window.pywebview.api || {};
+            if (typeof api.save_transcript !== 'function') {
+                console.error('Native download: save_transcript not exposed', Object.keys(api));
+                alert('Native save API is unavailable. Try reopening the app.');
+                return;
+            }
             try {
-                await window.pywebview.api.save_transcript(`/api/download/${state.jobId}`);
+                const result = await api.save_transcript(`/api/download/${state.jobId}`);
+                if (typeof result === 'string' && result.startsWith('error:')) {
+                    console.error('Native download error:', result);
+                    alert('Failed to save transcript: ' + result.slice(6).trim());
+                }
             } catch (err) {
                 console.error('Native download error:', err);
+                alert('Failed to save transcript.');
             }
             return;
         }

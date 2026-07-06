@@ -23,6 +23,15 @@ def get_assets_dir() -> Path:
     return get_base_dir() / "assets"
 
 
+def get_user_config_dir() -> Path:
+    """Return the user-writable config directory (not created here).
+
+    Used for files a user may edit to override bundled defaults (e.g. the Qwen
+    context prompt) — a stable location that survives app updates.
+    """
+    return Path.home() / "Library" / "Application Support" / "Media Transcriber"
+
+
 def get_ffmpeg_path() -> str:
     """Return path to ffmpeg, preferring the bundled copy."""
     if is_bundled():

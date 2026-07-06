@@ -11,3 +11,9 @@ pyobjc-framework-Cocoa>=10.0,<12.0; sys_platform == "darwin"
 pytest>=8.0.0,<9.0
 numpy>=1.24.0,<3.0
 python-dotenv>=1.0.0,<2.0
+
+# --- Qwen3-ASR fallback engine (Apple Silicon only; Metal via MLX, no PyTorch) ---
+mlx-audio>=0.4.4; sys_platform == "darwin" and platform_machine == "arm64"
+# mlx-lm 0.31.3 breaks on transformers 5.13+ (AutoTokenizer.register API change);
+# pin to the 5.5–5.12 range it targets.
+transformers>=5.5.0,<5.13; sys_platform == "darwin" and platform_machine == "arm64"

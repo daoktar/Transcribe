@@ -1,4 +1,6 @@
 import collections
+import gc
+import logging
 import shutil
 import subprocess
 import time
@@ -9,7 +11,10 @@ import numpy as np
 import webrtcvad
 from pywhispercpp.model import Model
 
+from transcribe import qwen_engine
 from transcribe.paths import get_ffmpeg_path, get_ffprobe_path
+
+logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 
@@ -309,6 +314,183 @@ SUPPORTED_EXTENSIONS = {
     ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".opus",
 }
 
+# Transcription range on the 0..1 progress bar (setup takes 0..0.12; diarization,
+# when enabled, takes the tail 0.85..0.99).
+_TRANSCRIBE_START_FRAC = 0.12
+
+
+def _transcribe_whisper_regions(
+    model_size: str,
+    media_path: str,
+    audio_pcm: np.ndarray,
+    speech_regions: list[tuple[float, float]],
+    language: str | None,
+    diarize: bool,
+    report: Callable[[float, str], None],
+) -> tuple[list[dict], str]:
+    """Transcribe VAD speech regions with whisper.cpp (the default engine).
+
+    Loads the model, detects the language if needed, then transcribes each region,
+    streaming per-segment progress. Returns ``(segments, detected_language)``.
+    """
+    # --- Load model (Metal GPU acceleration is automatic on Apple Silicon) ---
+    report(_TRANSCRIBE_START_FRAC, f"Loading model '{model_size}'...")
+    t0 = time.monotonic()
+    model = Model(model_size, print_realtime=False, print_progress=False)
+    report(_TRANSCRIBE_START_FRAC, f"Model loaded in {_format_eta(time.monotonic() - t0)}.")
+
+    # --- Detect language if not specified (on original file) ---
+    if language is None:
+        report(_TRANSCRIBE_START_FRAC, "Detecting language...")
+        t0 = time.monotonic()
+        detected_language, lang_error = _detect_language(model, media_path)
+        detect_time = time.monotonic() - t0
+        if lang_error:
+            report(_TRANSCRIBE_START_FRAC,
+                   f"Language: unknown (detection failed, {_format_eta(detect_time)}). Transcribing...")
+        else:
+            report(_TRANSCRIBE_START_FRAC,
+                   f"Language: {detected_language} (detected in {_format_eta(detect_time)}). Transcribing...")
+    else:
+        detected_language = language
+        report(_TRANSCRIBE_START_FRAC, f"Language: {language}. Transcribing...")
+
+    transcribe_start = time.monotonic()
+    all_segments: list[dict] = []
+    total_speech_duration = sum(end - start for start, end in speech_regions)
+    cumulative_speech = 0.0
+
+    transcribe_kwargs = {
+        # --- Anti-hallucination / anti-repetition parameters ---
+        "no_context": True,
+        "no_speech_thold": 0.3,
+        "entropy_thold": 2.4,
+        "max_tokens": 100,
+        "suppress_blank": True,
+    }
+    if language is not None:
+        transcribe_kwargs["language"] = language
+
+    transcribe_range = 0.73 if diarize else 0.88
+
+    for chunk_idx, (chunk_start, chunk_end) in enumerate(speech_regions):
+        start_sample = int(chunk_start * SAMPLE_RATE)
+        end_sample = int(chunk_end * SAMPLE_RATE)
+        chunk_audio = audio_pcm[start_sample:end_sample]
+
+        chunk_segments: list[dict] = []
+        chunk_duration = chunk_end - chunk_start
+
+        def _on_new_segment(
+            segment,
+            _offset=chunk_start,
+            _chunk_dur=chunk_duration,
+            _chunk_idx=chunk_idx,
+        ):
+            nonlocal cumulative_speech
+            try:
+                # pywhispercpp timestamps are in centiseconds (10ms units)
+                seg_start = segment.t0 / 100.0 + _offset
+                seg_end = segment.t1 / 100.0 + _offset
+                seg_text = segment.text.strip()
+
+                if not seg_text or seg_end <= seg_start:
+                    return
+
+                chunk_segments.append({
+                    "start": round(seg_start, 3),
+                    "end": round(seg_end, 3),
+                    "text": seg_text,
+                })
+
+                elapsed = time.monotonic() - transcribe_start
+                if total_speech_duration > 0:
+                    chunk_progress = min(
+                        (segment.t1 / 100.0) / _chunk_dur, 1.0
+                    ) if _chunk_dur > 0 else 1.0
+                    current_speech = cumulative_speech + _chunk_dur * chunk_progress
+                    fraction = min(current_speech / total_speech_duration, 0.99)
+                    scaled = _TRANSCRIBE_START_FRAC + fraction * transcribe_range
+                    if elapsed > 0.5 and fraction > 0.01:
+                        eta_seconds = elapsed / fraction * (1.0 - fraction)
+                        report(
+                            scaled,
+                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}"
+                            f"... {fraction:.0%} — ~{_format_eta(eta_seconds)} remaining",
+                        )
+                    else:
+                        report(
+                            scaled,
+                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}...",
+                        )
+            except Exception:
+                # Never let a progress reporting error abort the transcription
+                pass
+
+        model.transcribe(
+            chunk_audio,
+            new_segment_callback=_on_new_segment,
+            **transcribe_kwargs,
+        )
+
+        all_segments.extend(chunk_segments)
+        cumulative_speech += chunk_duration
+
+    return all_segments, detected_language
+
+
+def _transcribe_qwen_regions(
+    audio_pcm: np.ndarray,
+    speech_regions: list[tuple[float, float]],
+    language: str | None,
+    qwen_context: str | None,
+    qwen_model: str,
+    diarize: bool,
+    align: bool,
+    report: Callable[[float, str], None],
+) -> tuple[list[dict], str]:
+    """Transcribe VAD speech regions with the Qwen3-ASR MLX engine (fallback).
+
+    Uses the distilled domain context prompt by default. When ``align`` is True, each
+    region is force-aligned into phrase-level segments (finer timestamps for diarization/
+    subtitles). Returns ``(segments, detected_language)``.
+    """
+    if qwen_context is None:
+        from transcribe.qwen_prompt import load_context_prompt
+
+        qwen_context = load_context_prompt()
+
+    transcribe_range = 0.73 if diarize else 0.88
+    align_suffix = " (+alignment)" if align else ""
+    transcribe_start = time.monotonic()
+
+    def _progress(done: int, total: int) -> None:
+        fraction = min(done / total, 0.99) if total else 0.99
+        scaled = _TRANSCRIBE_START_FRAC + fraction * transcribe_range
+        elapsed = time.monotonic() - transcribe_start
+        if elapsed > 0.5 and fraction > 0.01:
+            eta = elapsed / fraction * (1.0 - fraction)
+            report(scaled, f"Transcribing chunk {done}/{total} with Qwen3-ASR{align_suffix}"
+                           f"... ~{_format_eta(eta)} remaining")
+        else:
+            report(scaled, f"Transcribing chunk {done}/{total} with Qwen3-ASR{align_suffix}...")
+
+    # A first-run download is multi-GB and slow — say so, so a stalled bar is explainable.
+    if not qwen_engine.is_model_cached(qwen_model):
+        report(_TRANSCRIBE_START_FRAC, "Downloading Qwen3-ASR weights (~3.4 GB, first run only)...")
+    else:
+        report(_TRANSCRIBE_START_FRAC,
+               "Loading Qwen3-ASR-1.7B" + (" + ForcedAligner" if align else "") + " model...")
+    return qwen_engine.transcribe_regions(
+        audio_pcm,
+        speech_regions,
+        language=language,
+        system_prompt=qwen_context,
+        model_path=qwen_model,
+        align=align,
+        progress_callback=_progress,
+    )
+
 
 def transcribe_media(
     media_path: str,
@@ -319,11 +501,22 @@ def transcribe_media(
     diarize: bool = False,
     num_speakers: int | None = None,
     hf_token: str | None = None,
+    engine: str = "whisper",
+    qwen_context: str | None = None,
+    qwen_model: str = qwen_engine.DEFAULT_QWEN_MODEL,
+    qwen_align: bool | None = None,
+    allow_qwen_fallback: bool = True,
 ) -> dict:
-    """Transcribe a media file (video or audio) using whisper.cpp via pywhispercpp.
+    """Transcribe a media file (video or audio).
 
     Uses WebRTC VAD to detect speech regions first, then transcribes only
     those regions to avoid hallucination on silence/music/noise sections.
+
+    Two engines are available. The default ``"whisper"`` runs whisper.cpp via
+    pywhispercpp (Metal-accelerated). ``"qwen"`` runs Qwen3-ASR-1.7B via MLX and is
+    also used automatically as a fallback when the whisper engine fails (unless
+    ``allow_qwen_fallback`` is False). The VAD, deduplication and diarization stages
+    are shared by both engines.
 
     Args:
         media_path: Path to the media file (video or audio).
@@ -335,6 +528,15 @@ def transcribe_media(
         diarize: If True, run speaker diarization after transcription.
         num_speakers: Force a specific speaker count (only used when diarize=True).
         hf_token: HuggingFace access token (required when diarize=True).
+        engine: Transcription engine, ``"whisper"`` (default) or ``"qwen"``.
+        qwen_context: Domain context prompt for Qwen3-ASR. Defaults to the distilled
+            prompt in :mod:`transcribe.qwen_prompt` when the Qwen engine is used.
+        qwen_model: HF repo id of the MLX Qwen3-ASR model to use for the Qwen engine.
+        qwen_align: For the Qwen engine, force-align each region into phrase-level segments
+            (finer timestamps for diarization/subtitles). None (default) auto-enables this
+            only when ``diarize`` is True; True/False overrides.
+        allow_qwen_fallback: If True, fall back to Qwen3-ASR when the whisper engine
+            raises (and MLX is available). Set False to surface whisper errors.
 
     Returns:
         Dict with keys: text, segments, language.
@@ -369,14 +571,9 @@ def transcribe_media(
         if progress_callback is not None:
             progress_callback(fraction, msg)
 
-    # --- Load model (Metal GPU acceleration is automatic on Apple Silicon) ---
-    _report(0.0, f"Loading model '{model_size}'...")
-    t0 = time.monotonic()
-    model = Model(model_size, print_realtime=False, print_progress=False)
-    load_time = time.monotonic() - t0
-    _report(0.03, f"Model loaded in {_format_eta(load_time)}.")
-
     # --- Get media duration for ETA calculation ---
+    # (The transcription model is loaded lazily by the selected engine below, so the
+    # shared VAD preprocessing is ready before either engine — including the fallback.)
     duration = _get_media_duration(str(media_path))
 
     # --- Extract audio for VAD analysis ---
@@ -402,111 +599,58 @@ def transcribe_media(
             "text": "",
             "segments": [],
             "language": language or "unknown",
+            "engine": (engine or "whisper").lower(),
         }
 
-    # --- Detect language if not specified (on original file) ---
-    if language is None:
-        _report(0.10, "Detecting language...")
-        t0 = time.monotonic()
-        detected_language, lang_error = _detect_language(model, str(media_path))
-        detect_time = time.monotonic() - t0
-        if lang_error:
-            _report(0.12, f"Language: unknown (detection failed, {_format_eta(detect_time)}). Transcribing...")
-        else:
-            _report(0.12, f"Language: {detected_language} (detected in {_format_eta(detect_time)}). Transcribing...")
-    else:
-        detected_language = language
-        _report(0.12, f"Language: {language}. Transcribing...")
-
-    # --- Transcribe each speech region ---
-    transcribe_start = time.monotonic()
-    all_segments: list[dict] = []
-
-    # Total speech duration for progress tracking
-    total_speech_duration = sum(end - start for start, end in speech_regions)
-    cumulative_speech = 0.0
-
-    transcribe_kwargs = {
-        # --- Anti-hallucination / anti-repetition parameters ---
-        "no_context": True,
-        "no_speech_thold": 0.3,
-        "entropy_thold": 2.4,
-        "max_tokens": 100,
-        "suppress_blank": True,
-    }
-    if language is not None:
-        transcribe_kwargs["language"] = language
-
-    for chunk_idx, (chunk_start, chunk_end) in enumerate(speech_regions):
-        # Slice the audio numpy array for this chunk
-        start_sample = int(chunk_start * SAMPLE_RATE)
-        end_sample = int(chunk_end * SAMPLE_RATE)
-        chunk_audio = audio_pcm[start_sample:end_sample]
-
-        chunk_segments: list[dict] = []
-        chunk_duration = chunk_end - chunk_start
-
-        def _on_new_segment(
-            segment,
-            _offset=chunk_start,
-            _chunk_dur=chunk_duration,
-            _chunk_idx=chunk_idx,
-        ):
-            nonlocal cumulative_speech
-            try:
-                # pywhispercpp timestamps are in centiseconds (10ms units)
-                # Add chunk offset to get absolute timestamps
-                seg_start = segment.t0 / 100.0 + _offset
-                seg_end = segment.t1 / 100.0 + _offset
-                seg_text = segment.text.strip()
-
-                # Skip empty or malformed segments
-                if not seg_text or seg_end <= seg_start:
-                    return
-
-                chunk_segments.append({
-                    "start": round(seg_start, 3),
-                    "end": round(seg_end, 3),
-                    "text": seg_text,
-                })
-
-                # Report progress across all chunks
-                elapsed = time.monotonic() - transcribe_start
-                if total_speech_duration > 0:
-                    chunk_progress = min(
-                        (segment.t1 / 100.0) / _chunk_dur, 1.0
-                    ) if _chunk_dur > 0 else 1.0
-                    current_speech = cumulative_speech + _chunk_dur * chunk_progress
-                    fraction = min(current_speech / total_speech_duration, 0.99)
-                    transcribe_range = 0.73 if diarize else 0.88
-                    scaled = 0.12 + fraction * transcribe_range
-                    if elapsed > 0.5 and fraction > 0.01:
-                        eta_seconds = elapsed / fraction * (1.0 - fraction)
-                        eta_str = _format_eta(eta_seconds)
-                        _report(
-                            scaled,
-                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}"
-                            f"... {fraction:.0%} — ~{eta_str} remaining",
-                        )
-                    else:
-                        _report(
-                            scaled,
-                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}...",
-                        )
-            except Exception:
-                # Never let a progress reporting error abort the transcription
-                pass
-
-        model.transcribe(
-            chunk_audio,
-            new_segment_callback=_on_new_segment,
-            **transcribe_kwargs,
+    # --- Transcribe via the selected engine (whisper default; Qwen3-ASR fallback) ---
+    engine_name = (engine or "whisper").lower()
+    # Alignment produces fine per-phrase timestamps; auto-enable it when diarizing.
+    align = diarize if qwen_align is None else qwen_align
+    engine_used = engine_name
+    fell_back = False
+    if engine_name == "qwen":
+        all_segments, detected_language = _transcribe_qwen_regions(
+            audio_pcm, speech_regions, language, qwen_context, qwen_model, diarize, align, _report,
         )
+    else:
+        try:
+            all_segments, detected_language = _transcribe_whisper_regions(
+                model_size, str(media_path), audio_pcm, speech_regions, language, diarize, _report,
+            )
+        except MemoryError:
+            # Never "recover" from memory exhaustion by loading an even larger model.
+            raise
+        except Exception as exc:
+            # Only fall back when Qwen is usable AND already downloaded — an unattended
+            # job must not kick off a multi-GB download precisely when things are failing.
+            can_fallback = (
+                allow_qwen_fallback
+                and qwen_engine.is_available()
+                and qwen_engine.is_model_cached(qwen_model)
+            )
+            if not can_fallback:
+                raise
+            # Preserve the real cause: log it and free whisper's (native/Metal) buffers
+            # before loading Qwen so the two model stacks don't co-reside.
+            logger.exception("Whisper engine failed; falling back to Qwen3-ASR")
+            gc.collect()
+            _report(
+                _TRANSCRIBE_START_FRAC,
+                f"Whisper engine failed ({type(exc).__name__}); falling back to Qwen3-ASR-1.7B...",
+            )
+            try:
+                all_segments, detected_language = _transcribe_qwen_regions(
+                    audio_pcm, speech_regions, language, qwen_context, qwen_model, diarize, align, _report,
+                )
+            except Exception as qexc:
+                raise qexc from exc
+            engine_used, fell_back = "qwen", True
 
-        all_segments.extend(chunk_segments)
-        cumulative_speech += chunk_duration
-
-    # --- Post-processing: remove hallucinated repetition ---
+    # --- Post-processing ---
+    # Adjacent VAD sub-chunks overlap slightly (padding when a long region is split),
+    # so segments at those boundaries can be marginally out of order — sort by start so
+    # deduplication, diarization and any subtitle output see a monotonic timeline.
+    all_segments.sort(key=lambda s: (s["start"], s["end"]))
     # Deduplication remains as a second safety net after VAD filtering.
     cleaned_segments = _deduplicate_segments(all_segments, max_repeats=2)
     removed = len(all_segments) - len(cleaned_segments)
@@ -545,7 +689,12 @@ def transcribe_media(
         "text": " ".join(seg["text"] for seg in cleaned_segments),
         "segments": cleaned_segments,
         "language": detected_language,
+        "engine": engine_used,
     }
+    if fell_back:
+        # The transcript came from a different engine/prompt than requested — make that
+        # auditable in the saved output, the web view and retry-diarize.
+        result["fallback"] = True
     if diarize:
         result["speakers"] = speaker_count
     if diarize_error:
