@@ -5,6 +5,9 @@ import os
 import shutil
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
+# Bundle version — kept in sync with scripts/build_macos.sh via the VERSION env var.
+_VERSION = os.environ.get("VERSION", "1.4.0")
+
 # ---------------------------------------------------------------------------
 # Disable broken contrib hook for webrtcvad (incompatible with webrtcvad-wheels)
 # ---------------------------------------------------------------------------
@@ -212,8 +215,8 @@ app = BUNDLE(
         "CFBundleName": "Media Transcriber",
         "CFBundleDisplayName": "Media Transcriber",
         "CFBundleIdentifier": "com.mediatranscriber.app",
-        "CFBundleVersion": "1.1.0",
-        "CFBundleShortVersionString": "1.1.0",
+        "CFBundleVersion": _VERSION,
+        "CFBundleShortVersionString": _VERSION,
         "CFBundlePackageType": "APPL",
         "CFBundleSignature": "MTSC",
         "CFBundleExecutable": "MediaTranscriber",
