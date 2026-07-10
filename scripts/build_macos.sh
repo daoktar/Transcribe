@@ -16,7 +16,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${VERSION:-1.4.0}"  # ponytail: env-overridable so a release bump is one env var, not a source edit
+VERSION="${VERSION:-1.4.1}"  # ponytail: env-overridable so a release bump is one env var, not a source edit
 APP_NAME="Media Transcriber"
 DMG_NAME="MediaTranscriber-${VERSION}-arm64"
 
