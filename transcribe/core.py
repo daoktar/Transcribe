@@ -4,6 +4,7 @@ import logging
 import shutil
 import subprocess
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 
@@ -621,8 +622,11 @@ def transcribe_media(
             if not can_fallback:
                 raise
             # Preserve the real cause: log it and free whisper's (native/Metal) buffers
-            # before loading Qwen so the two model stacks don't co-reside.
+            # before loading Qwen so the two model stacks don't co-reside. The in-flight
+            # traceback keeps the failed Model alive via its frame locals — clearing them
+            # is what actually lets Model.__del__ release the Metal context here.
             logger.exception("Whisper engine failed; falling back to Qwen3-ASR")
+            traceback.clear_frames(exc.__traceback__)
             gc.collect()
             _report(
                 _TRANSCRIBE_START_FRAC,

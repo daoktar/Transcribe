@@ -908,6 +908,38 @@ class TestEngineDispatch:
         assert result["engine"] == "qwen"
         assert result["fallback"] is True
 
+    def test_whisper_is_released_before_qwen_fallback(self, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.touch()
+        released = []
+
+        class FailingWhisper:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def transcribe(self, *_args, **_kwargs):
+                raise RuntimeError("whisper boom")
+
+            def __del__(self):
+                released.append(True)
+
+        def qwen_fallback(*_args, **_kwargs):
+            assert released == [True]
+            return ([{"start": 0.0, "end": 10.0, "text": "fallback text"}], "en")
+
+        patches = self._common_patches()
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4],
+            patch("transcribe.core.Model", FailingWhisper),
+            patch("transcribe.core.qwen_engine.is_available", return_value=True),
+            patch("transcribe.core.qwen_engine.is_model_cached", return_value=True),
+            patch("transcribe.core.qwen_engine.transcribe_regions", side_effect=qwen_fallback),
+        ):
+            result = transcribe_video(str(video), language="en")
+
+        assert result["fallback"] is True
+        assert released == [True]
+
     def test_memory_error_is_not_retried_on_qwen(self, tmp_path):
         video = tmp_path / "v.mp4"
         video.touch()
