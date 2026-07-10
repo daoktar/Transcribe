@@ -127,11 +127,25 @@ def test_is_model_cached_returns_bool_without_network():
     assert qwen_engine.is_model_cached("nonexistent-org/nonexistent-repo-xyz") is False
 
 
+def test_is_model_cached_rejects_config_only_cache():
+    """A partial cache must not trigger an automatic multi-GB model download."""
+    with patch(
+        "huggingface_hub.try_to_load_from_cache",
+        side_effect=lambda _repo, filename: "/tmp/config.json" if filename == "config.json" else None,
+    ):
+        assert qwen_engine.is_model_cached() is False
+
+
+def test_is_model_cached_accepts_complete_default_cache():
+    with patch("huggingface_hub.try_to_load_from_cache", return_value="/tmp/cached-file"):
+        assert qwen_engine.is_model_cached() is True
+
+
 class TestModelCache:
     def test_load_qwen_model_caches(self):
         qwen_engine._MODEL_CACHE.clear()
         sentinel = object()
-        with patch("mlx_audio.stt.utils.load_model", return_value=sentinel) as loader:
+        with patch("transcribe.qwen_engine._load_mlx_model", return_value=sentinel) as loader:
             first = qwen_engine.load_qwen_model("fake/repo")
             second = qwen_engine.load_qwen_model("fake/repo")
         assert first is sentinel and second is sentinel
@@ -140,7 +154,15 @@ class TestModelCache:
 
 
 def test_is_available_returns_bool():
-    assert isinstance(qwen_engine.is_available(), bool)
+    with patch("transcribe.qwen_engine.importlib.import_module", return_value=object()) as loader:
+        assert qwen_engine.is_available() is True
+    assert loader.call_args_list[0].args == ("mlx.core",)
+    assert loader.call_args_list[1].args == ("mlx_audio.stt.utils",)
+
+
+def test_is_available_handles_import_failure():
+    with patch("transcribe.qwen_engine.importlib.import_module", side_effect=ImportError):
+        assert qwen_engine.is_available() is False
 
 
 class TestRegroupWithAlignment:

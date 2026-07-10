@@ -11,6 +11,7 @@ the app (and non-macOS installs) keep working without it — call :func:`is_avai
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from collections.abc import Callable
@@ -62,8 +63,8 @@ def _normalize_language(value: str | None) -> str:
 def is_available() -> bool:
     """Return True if the MLX stack needed for Qwen3-ASR is importable on this machine."""
     try:
-        import mlx.core  # noqa: F401
-        import mlx_audio.stt.utils  # noqa: F401
+        importlib.import_module("mlx.core")
+        importlib.import_module("mlx_audio.stt.utils")
 
         return True
     except Exception as exc:
@@ -74,28 +75,37 @@ def is_available() -> bool:
 
 
 def is_model_cached(model_path: str = DEFAULT_QWEN_MODEL) -> bool:
-    """Return True if the model's weights are already in the local HF cache.
+    """Return True if the model can load from the local HF cache.
 
     Used to gate the automatic whisper→Qwen fallback so an unattended job never kicks
-    off a multi-GB download. Checks for config.json in the cache (always fetched by the
-    loader) — a full snapshot check is too strict since only a subset of repo files is
-    downloaded.
+    off a multi-GB download. Requires both config.json and the unsharded weight file —
+    checking config.json alone is insufficient since it can remain after an interrupted
+    download. Sharded custom models (no single model.safetensors) are treated
+    conservatively and report uncached.
     """
     try:
         from huggingface_hub import try_to_load_from_cache
 
-        return isinstance(try_to_load_from_cache(model_path, "config.json"), str)
+        return all(
+            isinstance(try_to_load_from_cache(model_path, filename), str)
+            for filename in ("config.json", "model.safetensors")
+        )
     except Exception:
         return False
+
+
+def _load_mlx_model(model_path: str):
+    """Load one MLX model while keeping the optional import local and mockable."""
+    from mlx_audio.stt.utils import load_model
+
+    return load_model(model_path)
 
 
 def load_qwen_model(model_path: str = DEFAULT_QWEN_MODEL):
     """Load (and cache) a Qwen3-ASR MLX model. Downloads weights from HF on first use."""
     cached = _MODEL_CACHE.get(model_path)
     if cached is None:
-        from mlx_audio.stt.utils import load_model
-
-        cached = load_model(model_path)
+        cached = _load_mlx_model(model_path)
         _MODEL_CACHE[model_path] = cached
     return cached
 
