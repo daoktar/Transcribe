@@ -110,6 +110,115 @@ def load_qwen_model(model_path: str = DEFAULT_QWEN_MODEL):
     return cached
 
 
+# Qwen3-ASR sometimes decodes its own system_prompt instead of the audio. It is not tied
+# to silence — measured on a region with 98% voiced frames and normal level — the model
+# simply copies the context (visible in miniature as a short prompt leaking in as a
+# prefix). With alignment on, the aligner then smears that echo word-by-word across the
+# region, so it interleaves with real speech and no per-segment heuristic can tell the
+# fragments apart. The give-away is whole-file: a contaminated file reproduces most of the
+# prompt verbatim, a clean one only ever matches a few stop-words by chance. This filter
+# is the net under the per-region retry below.
+_ECHO_COVERAGE_THRESHOLD = 0.3
+
+
+# A region that decoded the prompt instead of its audio is recoverable: the failure sits
+# on a knife edge, and the same speech transcribes correctly when the window moves by
+# ~100 ms (measured: a 10 ms shift already flips it) or when the prompt is withheld.
+_ECHO_RUN_WORDS = 8      # verbatim prompt words in a row that mark a region as echoing
+_ECHO_NUDGE_S = 0.1      # how far to move the window on the retry
+
+
+def _is_prompt_echo(text: str | None, system_prompt: str | None) -> bool:
+    """True if ``text`` reproduces a long verbatim run of the context prompt.
+
+    Per-region check, deliberately stricter than the whole-file one in
+    :func:`_strip_prompt_echo`: it must hold on a single region with no corroboration,
+    so it only fires on a run no real utterance would contain by chance.
+    """
+    if not text or not system_prompt:
+        return False
+    words = _normalize_for_echo(system_prompt).split()
+    if len(words) < _ECHO_RUN_WORDS:
+        return False
+    haystack = f" {_normalize_for_echo(text)} "
+    return any(
+        f" {' '.join(words[i:i + _ECHO_RUN_WORDS])} " in haystack
+        for i in range(len(words) - _ECHO_RUN_WORDS + 1)
+    )
+
+
+def _retranscribe_echo_region(
+    model,
+    audio_pcm: np.ndarray,
+    start_sample: int,
+    end_sample: int,
+    *,
+    language: str | None,
+    system_prompt: str | None,
+    sample_rate: int,
+) -> tuple[object, np.ndarray, float] | None:
+    """Re-run a region that echoed the prompt. Returns ``(out, chunk, offset_s)`` or None.
+
+    Nudges the window (earlier first, so no speech is lost — the region carries padding),
+    then falls back to a prompt-free pass. None means every attempt echoed again and the
+    caller should keep the original output for the whole-file filter to drop.
+    """
+    nudge = int(_ECHO_NUDGE_S * sample_rate)
+    attempts = [
+        (max(0, start_sample - nudge), end_sample, system_prompt),
+        (min(start_sample + nudge, end_sample), end_sample, system_prompt),
+        (start_sample, end_sample, None),
+    ]
+    for begin, finish, prompt in attempts:
+        chunk = np.ascontiguousarray(audio_pcm[begin:finish], dtype=np.float32)
+        if chunk.size == 0:
+            continue
+        out = model.generate(chunk, language=language, system_prompt=prompt, temperature=0.0)
+        if not _is_prompt_echo(getattr(out, "text", ""), system_prompt):
+            return out, chunk, begin / sample_rate
+    return None
+
+
+def _normalize_for_echo(text: str) -> str:
+    """Lowercase, drop punctuation and collapse whitespace for prompt-echo matching."""
+    return " ".join(
+        "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.lower()).split()
+    )
+
+
+def _strip_prompt_echo(segments: list[dict], system_prompt: str | None) -> list[dict]:
+    """Remove segments in which the model echoed its own context prompt.
+
+    A segment is a *candidate* when its normalized text appears in the normalized prompt
+    as a whole-word run. Candidates are only dropped if together they cover at least
+    ``_ECHO_COVERAGE_THRESHOLD`` of the prompt's words — otherwise the matches are
+    coincidence (someone actually said "Redash") and everything is kept.
+    """
+    prompt = _normalize_for_echo(system_prompt or "")
+    if not prompt or not segments:
+        return segments
+
+    padded = f" {prompt} "
+    total_words = len(prompt.split())
+    matched = [
+        seg for seg in segments
+        if (norm := _normalize_for_echo(seg["text"])) and f" {norm} " in padded
+    ]
+    # Matches can overlap (the same prompt word appears in two segments), so this ratio
+    # can exceed 1 — it is a contamination score, not true coverage. Clamped when shown.
+    covered = sum(len(_normalize_for_echo(seg["text"]).split()) for seg in matched)
+    if covered / total_words < _ECHO_COVERAGE_THRESHOLD:
+        return segments
+
+    logger.warning(
+        "Qwen echoed its context prompt: dropped %d/%d segments (~%.0f%% of the prompt "
+        "reproduced verbatim)", len(matched), len(segments),
+        100 * min(1.0, covered / total_words),
+    )
+    dropped = {id(seg) for seg in matched}
+    return [seg for seg in segments if id(seg) not in dropped]
+
+
 def _regroup_with_alignment(
     region_text: str,
     items: list,
@@ -230,6 +339,8 @@ def transcribe_regions(
     total = len(speech_regions)
     n_samples = len(audio_pcm)
     align_fallbacks = 0
+    echo_recovered = 0
+    echo_unrecovered = 0
 
     for idx, (start, end) in enumerate(speech_regions):
         start_sample = int(start * sample_rate)
@@ -249,12 +360,24 @@ def transcribe_regions(
 
         if chunk.size > 0:
             chunk = np.ascontiguousarray(chunk, dtype=np.float32)
+            align_offset = float(start)
             out = model.generate(
                 chunk,
                 language=language,
                 system_prompt=system_prompt,
                 temperature=0.0,
             )
+
+            if _is_prompt_echo(getattr(out, "text", ""), system_prompt):
+                retry = _retranscribe_echo_region(
+                    model, audio_pcm, start_sample, end_sample,
+                    language=language, system_prompt=system_prompt, sample_rate=sample_rate,
+                )
+                if retry is not None:
+                    out, chunk, align_offset = retry
+                    echo_recovered += 1
+                else:
+                    echo_unrecovered += 1
 
             # out.language is a list (one entry per internal sub-chunk); count this
             # region's first non-empty value toward a whole-file majority vote.
@@ -271,7 +394,7 @@ def transcribe_regions(
                 fine = None
                 if aligner is not None:
                     region_code = _normalize_language(language or region_lang)
-                    fine = _align_region(aligner, chunk, text, region_code, float(start))
+                    fine = _align_region(aligner, chunk, text, region_code, align_offset)
                     if fine is None:
                         align_fallbacks += 1
                 if fine:
@@ -294,6 +417,15 @@ def transcribe_regions(
             "(unsupported language, aligner error, or token mismatch)",
             align_fallbacks, total,
         )
+
+    if echo_recovered or echo_unrecovered:
+        logger.warning(
+            "Qwen decoded the context prompt on %d region(s): %d re-transcribed "
+            "successfully, %d left to the whole-file filter",
+            echo_recovered + echo_unrecovered, echo_recovered, echo_unrecovered,
+        )
+
+    segments = _strip_prompt_echo(segments, system_prompt)
 
     if language:
         detected_language = _normalize_language(language)
