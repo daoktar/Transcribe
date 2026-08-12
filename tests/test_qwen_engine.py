@@ -262,3 +262,113 @@ class TestTranscribeRegionsWithAlignment:
         with patch("transcribe.qwen_engine.load_qwen_model", return_value=asr):
             segs, _lang = qwen_engine.transcribe_regions(audio, [(0.0, 20.0)], language="ru")
         assert segs == [{"start": 0.0, "end": 20.0, "text": "Привет. Как дела?"}]
+
+
+class TestPromptEchoFilter:
+    """Qwen sometimes returns its own system_prompt instead of speech (see _strip_prompt_echo)."""
+
+    PROMPT = (
+        "Это рабочие созвоны команды по модерации рекламы. Частые имена: Сергей, Андрей. "
+        "Английские технические термины сохраняй латиницей, не транслитерируй в кириллицу. "
+        "Инструменты: Jira, Confluence, Redash."
+    )
+
+    def _run(self, texts, prompt):
+        audio = np.zeros(16000 * 10 * len(texts), dtype=np.float32)
+        regions = [(float(i * 10), float(i * 10 + 5)) for i in range(len(texts))]
+        model = MagicMock()
+        model.generate.side_effect = [_out(t, ["ru"]) for t in texts]
+        with patch("transcribe.qwen_engine.load_qwen_model", return_value=model):
+            segs, _lang = qwen_engine.transcribe_regions(
+                audio, regions, language="ru", system_prompt=prompt
+            )
+        return [s["text"] for s in segs]
+
+    def test_echoed_prompt_is_dropped(self):
+        # Contaminated file: most of the prompt comes back verbatim, smeared across regions
+        # and interleaved with real speech.
+        texts = [
+            "Давайте обсудим медиатеку.",
+            "Это рабочие созвоны команды по модерации рекламы.",
+            "Частые имена: Сергей, Андрей.",
+            "Английские технические термины",
+            "сохраняй латиницей,",
+            "не транслитерируй в кириллицу.",
+            "Инструменты: Jira,",
+            "Confluence,",
+            "Redash.",
+            "Файл привязан к рекламодателю.",
+        ]
+        assert self._run(texts, self.PROMPT) == [
+            "Давайте обсудим медиатеку.",
+            "Файл привязан к рекламодателю.",
+        ]
+
+    def test_incidental_matches_are_kept(self):
+        # Clean file: a few segments happen to be substrings of the prompt (stop-words, a
+        # tool name someone actually said). Coverage stays low, nothing may be dropped.
+        texts = ["Я", "Да.", "Redash.", "Мы тянем блок ER из Redash, а не из DWH."]
+        assert self._run(texts, self.PROMPT) == texts
+
+    def test_no_prompt_means_no_filtering(self):
+        assert self._run(["Инструменты: Jira,"], None) == ["Инструменты: Jira,"]
+
+
+class TestPromptEchoRetry:
+    """A region that decodes the prompt is re-transcribed, not just deleted."""
+
+    PROMPT = (
+        "Это рабочие созвоны команды по модерации рекламы и по борьбе с дублями объявлений. "
+        "Английские технические термины сохраняй латиницей, не транслитерируй в кириллицу."
+    )
+
+    def test_echoing_region_is_retranscribed_with_nudged_window(self):
+        audio = np.zeros(16000 * 40, dtype=np.float32)
+        model = MagicMock()
+        model.generate.side_effect = [_out(self.PROMPT, ["ru"]), _out("Водник медиатеки.", ["ru"])]
+        with patch("transcribe.qwen_engine.load_qwen_model", return_value=model):
+            segs, _lang = qwen_engine.transcribe_regions(
+                audio, [(5.0, 36.0)], language="ru", system_prompt=self.PROMPT
+            )
+        assert [s["text"] for s in segs] == ["Водник медиатеки."]
+        # retry moved the window 100 ms earlier and kept the prompt
+        assert model.generate.call_count == 2
+        first, second = (c.args[0].size for c in model.generate.call_args_list)
+        assert second == first + 1600
+
+    def test_prompt_free_pass_is_the_last_resort(self):
+        audio = np.zeros(16000 * 40, dtype=np.float32)
+        model = MagicMock()
+        model.generate.side_effect = [
+            _out(self.PROMPT, ["ru"]),   # original
+            _out(self.PROMPT, ["ru"]),   # nudge earlier
+            _out(self.PROMPT, ["ru"]),   # nudge later
+            _out("настоящая речь", ["ru"]),  # without the prompt
+        ]
+        with patch("transcribe.qwen_engine.load_qwen_model", return_value=model):
+            segs, _lang = qwen_engine.transcribe_regions(
+                audio, [(5.0, 36.0)], language="ru", system_prompt=self.PROMPT
+            )
+        assert [s["text"] for s in segs] == ["настоящая речь"]
+        assert model.generate.call_args_list[-1].kwargs["system_prompt"] is None
+
+    def test_unrecoverable_region_falls_through_to_the_file_filter(self):
+        audio = np.zeros(16000 * 40, dtype=np.float32)
+        model = MagicMock()
+        model.generate.return_value = _out(self.PROMPT, ["ru"])  # echoes every time
+        with patch("transcribe.qwen_engine.load_qwen_model", return_value=model):
+            segs, _lang = qwen_engine.transcribe_regions(
+                audio, [(5.0, 36.0)], language="ru", system_prompt=self.PROMPT
+            )
+        assert segs == []  # dropped by _strip_prompt_echo, never reaches the transcript
+
+    def test_real_speech_is_not_retried(self):
+        audio = np.zeros(16000 * 40, dtype=np.float32)
+        model = MagicMock()
+        model.generate.return_value = _out("Обсуждаем медиатеку и дубли объявлений.", ["ru"])
+        with patch("transcribe.qwen_engine.load_qwen_model", return_value=model):
+            segs, _lang = qwen_engine.transcribe_regions(
+                audio, [(5.0, 36.0)], language="ru", system_prompt=self.PROMPT
+            )
+        assert model.generate.call_count == 1
+        assert len(segs) == 1
