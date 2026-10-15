@@ -352,6 +352,10 @@ def _transcribe_whisper_regions(
     cumulative_speech = 0.0
 
     transcribe_kwargs = {
+        # Always pass a language: whisper.cpp's default is "en", which translates other speech.
+        # "" auto-detects per chunk, so RU/EN speaker switches survive ("auto" works too, but
+        # pywhispercpp logs "unknown language" for it on every call).
+        "language": language or "",
         # --- Anti-hallucination / anti-repetition parameters ---
         "no_context": True,
         "no_speech_thold": 0.3,
@@ -359,8 +363,6 @@ def _transcribe_whisper_regions(
         "max_tokens": 100,
         "suppress_blank": True,
     }
-    if language is not None:
-        transcribe_kwargs["language"] = language
 
     transcribe_range = 0.73 if diarize else 0.88
 

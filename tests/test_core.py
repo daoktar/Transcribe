@@ -757,6 +757,35 @@ class TestTranscribeVideoSegmentProcessing:
         assert result["language"] == "fr"
         mock_model.auto_detect_language.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("language", "detect", "expected"),
+        [
+            (None, {"return_value": (("ru", 0.99), {"ru": 0.99})}, ""),  # per-chunk auto-detect
+            (None, {"side_effect": RuntimeError("model error")}, ""),    # detection failed
+            ("ru", None, "ru"),
+        ],
+    )
+    def test_language_always_passed_to_whisper(self, tmp_path, language, detect, expected):
+        """An omitted language makes whisper.cpp fall back to "en" and translate Russian."""
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        mock_model = MagicMock()
+        if detect:
+            mock_model.auto_detect_language.configure_mock(**detect)
+        mock_model.transcribe = MagicMock()
+        p1, p2, p3 = _vad_patches(10.0)
+
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=mock_model),
+            patch("transcribe.core._get_media_duration", return_value=10.0),
+            p1, p2, p3,
+        ):
+            transcribe_video(str(video), language=language)
+
+        assert mock_model.transcribe.call_args.kwargs["language"] == expected
+
     def test_no_speech_detected_returns_empty(self, tmp_path):
         """When VAD finds no speech, return empty result without transcribing."""
         video = tmp_path / "video.mp4"

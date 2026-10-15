@@ -38,6 +38,7 @@ The project is a Python package (`transcribe/`) with these modules:
   - pywhispercpp segment timestamps (`t0`/`t1`) are in **centiseconds** — divided by 100 to get seconds
   - `model.transcribe()` accepts `np.ndarray` directly (float32, 16kHz, mono) — no temp files needed for chunks
   - Closure-in-loop: segment callbacks use default arguments (`_offset=chunk_start`) to capture per-chunk values
+  - `language` is always passed to `model.transcribe()`: whisper.cpp's own default is `en` (it translates other speech). Without `--language`, `""` = per-chunk auto-detect; the file-level `_detect_language` result is only the reported label
   - Anti-hallucination params: `no_context=True`, `no_speech_thold=0.3`, `entropy_thold=2.4`, `max_tokens=100`
   - **Engine dispatch:** `transcribe_media(engine=...)` selects the transcriber. The shared VAD/dedup/diarize scaffolding wraps two per-region transcribers: `_transcribe_whisper_regions` (default) and `_transcribe_qwen_regions`. If the whisper path raises and `allow_qwen_fallback` is set (and MLX is available), it falls back to Qwen3-ASR automatically. Both return `(segments, detected_language)`.
 
