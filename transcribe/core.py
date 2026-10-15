@@ -212,8 +212,9 @@ def _detect_speech_regions(
             num_unvoiced = sum(1 for _, s in ring_buffer if not s)
             if num_unvoiced > 0.9 * ring_buffer.maxlen:
                 triggered = False
-                # Region ends at current position
-                region_end = timestamp + frame_duration_s
+                # Region ends after the current frame (same grid math as region_start, so a
+                # region resuming on the very next frame touches this one exactly)
+                region_end = (frame_index + 1) * frame_duration_s
                 speech_regions.append((region_start, region_end))
                 ring_buffer.clear()
 
@@ -239,31 +240,31 @@ def _merge_speech_regions(
     """Merge adjacent speech regions into Whisper-friendly chunks.
 
     Combines regions that are close together, applies padding, filters
-    very short regions, and splits overly long regions.
+    very short regions, and cuts overly long stretches inside pauses.
 
     Args:
         regions: List of (start, end) speech region timestamps in seconds.
         max_gap: Maximum gap in seconds between regions to merge them.
-        max_segment: Maximum segment duration in seconds (Whisper works
-            best with <=30s chunks).
-        padding: Padding in seconds to add before/after each region.
+        max_segment: Maximum speech span per chunk in seconds (Whisper works
+            best with <=30s chunks). A longer stretch is cut in its longest
+            pause within reach; only unbroken speech is cut blindly.
+        padding: Padding in seconds to add before/after each chunk. At a cut
+            inside a stretch it stops at the middle of the pause, so
+            neighbouring chunks never overlap (no phrase is transcribed twice).
         min_duration: Minimum region duration in seconds. Shorter regions
-            are filtered out (likely noise, not meaningful speech).
+            don't start or extend a stretch (likely noise, not meaningful
+            speech), but inside one they are kept and never cut through.
         total_duration: Total audio duration for clamping padding.
 
     Returns:
-        List of merged (start, end) tuples.
+        List of merged (start, end) tuples, sorted and non-overlapping.
     """
-    if not regions:
-        return []
+    regions = sorted(regions)
 
     # Filter out very short regions (noise, not speech)
     filtered = [(s, e) for s, e in regions if (e - s) >= min_duration]
     if not filtered:
         return []
-
-    # Sort by start time
-    filtered.sort(key=lambda r: r[0])
 
     # Merge regions separated by less than max_gap
     merged: list[list[float]] = [list(filtered[0])]
@@ -274,24 +275,42 @@ def _merge_speech_regions(
         else:
             merged.append([start, end])
 
-    # Split any region longer than max_segment
-    split: list[tuple[float, float]] = []
-    for start, end in merged:
-        while (end - start) > max_segment:
-            split.append((start, start + max_segment))
-            start += max_segment
-        split.append((start, end))
+    chunks: list[tuple[float, float]] = []
+    i = 0
+    for group_start, group_end in merged:
+        # Pauses inside the stretch: gaps between all raw regions, short ones included.
+        # Touching regions count too: a VAD region ends with 300 ms of hangover silence.
+        pauses: list[tuple[float, float]] = []
+        reach = group_start
+        while i < len(regions) and regions[i][0] < group_end:
+            s, e = regions[i]
+            if s >= reach:
+                pauses.append((reach, s))
+            reach = max(reach, e)
+            i += 1
 
-    # Apply padding (clamped to valid range)
-    padded: list[tuple[float, float]] = []
-    for start, end in split:
-        padded_start = max(0.0, start - padding)
-        padded_end = end + padding
-        if total_duration is not None:
-            padded_end = min(padded_end, total_duration)
-        padded.append((padded_start, padded_end))
+        lead = max(group_start - padding, chunks[-1][1] if chunks else 0.0)
+        start = group_start  # speech onset the max_segment budget counts from
+        while group_end - start > max_segment:
+            limit = start + max_segment
+            fits = [(a, b) for a, b in pauses if start < a <= limit]
+            if fits:
+                # ponytail: greedy per window, favouring pieces >= max_segment/2 — whisper pays a
+                # full 30 s encoder pass per chunk however short. A DP over all cuts if placement matters.
+                late = [p for p in fits if p[0] - start >= max_segment / 2] or fits
+                # Longest pause, latest on ties (rounded: VAD's 30 ms frames make many pauses equal)
+                a, b = max(late, key=lambda p: (round(p[1] - p[0], 2), p[0]))
+                # Pad both sides of the cut, but only up to the middle of the pause
+                mid = (a + b) / 2
+                chunks.append((lead, min(a + padding, mid)))
+                lead, start = max(b - padding, mid), b
+            else:
+                chunks.append((lead, limit))  # unbroken speech longer than max_segment: hard cut
+                lead = start = limit
+        end = group_end + padding
+        chunks.append((lead, min(end, total_duration) if total_duration is not None else end))
 
-    return padded
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +660,8 @@ def transcribe_media(
             engine_used, fell_back = "qwen", True
 
     # --- Post-processing ---
-    # Adjacent VAD sub-chunks overlap slightly (padding when a long region is split),
-    # so segments at those boundaries can be marginally out of order — sort by start so
+    # VAD chunks no longer overlap, but a segment can still start a little before its
+    # chunk (Qwen's prompt-echo retry moves the window 100 ms earlier) — sort by start so
     # deduplication, diarization and any subtitle output see a monotonic timeline.
     all_segments.sort(key=lambda s: (s["start"], s["end"]))
     # Deduplication remains as a second safety net after VAD filtering.
