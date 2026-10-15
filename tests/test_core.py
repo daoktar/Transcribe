@@ -337,13 +337,69 @@ class TestMergeSpeechRegions:
         assert result[0][0] == pytest.approx(4.5, abs=0.01)
 
     def test_splits_long_regions(self):
-        """Regions longer than max_segment are split."""
+        """A single region longer than max_segment is hard-split into touching pieces."""
         regions = [(0.0, 90.0)]  # 90s > 30s default max
         result = _merge_speech_regions(regions, max_segment=30.0, total_duration=90.0)
         assert len(result) == 3
         # Each sub-chunk should be at most ~30s + padding
         for start, end in result:
             assert (end - start) <= 31.5  # 30 + padding tolerance
+        # No padding at the cuts: neighbours touch, nothing is transcribed twice
+        assert [r[1] for r in result[:-1]] == [r[0] for r in result[1:]]
+
+    def test_split_lands_in_a_pause_without_overlap(self):
+        """Reproducer: the old blind cut + padding put "Sounds good." (30.69s) in both chunks."""
+        regions = [(1.23, 10.35), (11.34, 21.36), (22.53, 29.7), (30.69, 34.53)]
+        result = _merge_speech_regions(regions, total_duration=36.0)
+        assert len(result) == 2
+        assert result[0][0] == pytest.approx(0.73)
+        assert result[-1][1] == pytest.approx(35.03)
+        assert result[0][1] <= result[1][0]
+        # Both sides of the cut are inside the same pause — never inside speech
+        assert any(e <= result[0][1] and result[1][0] <= s for (_, e), (s, _) in zip(regions, regions[1:]))
+        # Every utterance lands in exactly one chunk
+        for s, e in regions:
+            assert sum(a <= s and e <= b for a, b in result) == 1
+
+    def test_split_prefers_longest_pause(self):
+        """The cut goes in the longest pause within reach, not the last one."""
+        regions = [(0.0, 16.0), (18.0, 27.0), (27.4, 40.0)]
+        result = _merge_speech_regions(regions, total_duration=60.0)
+        assert len(result) == 2
+        assert 16.0 <= result[0][1] <= 18.0
+
+    def test_split_equal_pauses_takes_latest(self):
+        """Pauses equal at VAD resolution (float noise aside) -> the latest, for longer pieces."""
+        # VAD timestamps from a TTS clip: every pause is 0.90 or 0.93s,
+        # yet 30.599999999999998 - 29.67 < 21.27 - 20.34 in floats
+        regions = [(1.02, 5.5200000000000005), (6.45, 10.469999999999999),
+                   (11.37, 15.509999999999998), (16.439999999999998, 20.34), (21.27, 25.71),
+                   (26.61, 29.67), (30.599999999999998, 31.77)]
+        result = _merge_speech_regions(regions, total_duration=36.0)
+        assert len(result) == 2
+        assert 29.67 <= result[0][1] <= result[1][0] <= 30.6
+
+    def test_split_never_cuts_through_short_region(self):
+        """A sub-min_duration region inside a stretch (a "да") is speech too: no cut through it."""
+        regions = [(0.0, 14.0), (15.5, 16.2), (16.3, 35.0)]
+        result = _merge_speech_regions(regions, total_duration=60.0)
+        assert len(result) == 2
+        assert any(a <= 15.5 and 16.2 <= b for a, b in result)
+
+    def test_long_conversation_never_overlaps(self):
+        """Minutes of back-to-back speech: chunks never overlap and hold every region whole."""
+        long = [(t, t + 4.0) for t in np.arange(0.0, 180.0, 5.4)]
+        short = [(t + 4.4, t + 5.0) for t in np.arange(0.0, 175.0, 5.4)]  # "да" between, 0.4s pauses
+        regions = sorted(long + short)
+        regions.append((regions[-1][1] + 5.1, regions[-1][1] + 9.0))  # separate stretch
+        result = _merge_speech_regions(regions, total_duration=200.0)
+        assert len(result) > 6
+        for (_, prev_end), (next_start, _) in zip(result, result[1:]):
+            assert prev_end <= next_start
+        for start, end in result:
+            assert end - start <= 31.0  # max_segment + padding on both sides
+        for s, e in regions:
+            assert sum(a <= s and e <= b for a, b in result) == 1
 
     def test_padding_clamped_to_zero(self):
         """Padding should not produce negative start times."""
