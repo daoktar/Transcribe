@@ -1,8 +1,10 @@
 import collections
 import gc
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
 import time
 import traceback
 from collections.abc import Callable
@@ -10,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import webrtcvad
+from pywhispercpp.constants import MODELS_DIR
 from pywhispercpp.model import Model
 from pywhispercpp.utils import download_model
 
@@ -73,16 +76,29 @@ _MIN_LANGUAGE_ID_SECONDS = 2.0
 # one: ~12 ms a region instead of ~0.3 s on large-v3. On 69 RU/EN test chunks it flagged every
 # chunk large-v3 cuts. base is worse: it hears 6 s of Russian as Ukrainian (p=0.95).
 _SCREEN_MODEL = "tiny"
+# ponytail: exact size of whisper.cpp's ggml-tiny.bin (sha1 bd577a11...). If upstream ever
+# republishes it, every auto-language run downloads and rejects it (screen off) until updated.
+_SCREEN_MODEL_BYTES = 77_691_713
 
 
 def _load_screen_model() -> Model | None:
     """whisper tiny for ``_language_windows``, or None: the main model then identifies every region."""
+    path = Path(MODELS_DIR) / f"ggml-{_SCREEN_MODEL}.bin"
     try:
-        path = Path(download_model(_SCREEN_MODEL))  # 78 MB on first use; raises when offline
-        with path.open("rb") as f:
-            # download_model saves an HTTP error page as the model, and whisper.cpp segfaults on it
-            if f.read(4) != b"lmgg":
-                raise ValueError(f"{path} is not a ggml model")
+        # download_model writes in place and never checks the HTTP status, so a download cut short
+        # (Ctrl-C, quitting the app) or a saved error page would sit at the model path. whisper.cpp
+        # "loads" either and segfaults on first use, which no except can catch. So download beside
+        # it and move only a complete file into place, atomically: a job still writing the path in
+        # place (--model tiny) then opens the complete file, and nothing is ever deleted under it.
+        # ponytail: a download killed outright (SIGKILL) leaves a stray tmp* dir in the models dir.
+        if not path.is_file() or path.stat().st_size != _SCREEN_MODEL_BYTES:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
+                part = Path(download_model(_SCREEN_MODEL, download_dir=tmp))  # 78 MB; raises offline
+                size = part.stat().st_size
+                if size != _SCREEN_MODEL_BYTES:
+                    raise ValueError(f"downloaded {part.name} is {size} bytes, not {_SCREEN_MODEL_BYTES}")
+                os.replace(part, path)
         return Model(str(path))
     except Exception:
         logger.warning("Language screen model unavailable; identifying every region with the "

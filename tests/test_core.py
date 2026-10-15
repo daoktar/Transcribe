@@ -223,36 +223,82 @@ class TestLanguageWindows:
 # _load_screen_model
 # ---------------------------------------------------------------------------
 
+COMPLETE_MODEL = b"lmgg" + bytes(16)  # as long as the patched _SCREEN_MODEL_BYTES
+
+
+def _download_writing(content, dirs=None):
+    """download_model side effect: writes *content* into download_dir like pywhispercpp does."""
+    def download(name, download_dir=None):
+        if dirs is not None:
+            dirs.append(Path(download_dir))
+        path = Path(download_dir) / f"ggml-{name}.bin"
+        path.write_bytes(content)
+        return str(path)
+    return download
+
+
+@patch("transcribe.core._SCREEN_MODEL_BYTES", len(COMPLETE_MODEL))
 class TestLoadScreenModel:
-    def test_loads_the_downloaded_ggml_file(self, tmp_path):
-        path = tmp_path / "ggml-tiny.bin"
-        path.write_bytes(b"lmgg" + bytes(16))
+    @pytest.fixture(autouse=True)
+    def models_dir(self, tmp_path):
+        with patch("transcribe.core.MODELS_DIR", str(tmp_path)):
+            yield tmp_path
+
+    def test_uses_a_complete_cached_model(self, models_dir):
+        (models_dir / "ggml-tiny.bin").write_bytes(COMPLETE_MODEL)
         with (
-            patch("transcribe.core.download_model", return_value=str(path)) as download,
+            patch("transcribe.core.download_model") as download,
             patch("transcribe.core.Model") as model_cls,
         ):
             assert _load_screen_model() is model_cls.return_value
-        download.assert_called_once_with("tiny")
-        model_cls.assert_called_once_with(str(path))
+        download.assert_not_called()
+        model_cls.assert_called_once_with(str(models_dir / "ggml-tiny.bin"))
 
-    def test_offline_leaves_every_region_to_the_main_model(self):
+    def test_downloads_beside_the_model_path_and_moves_it_in_whole(self, models_dir):
+        dirs = []
+        with (
+            patch("transcribe.core.download_model", side_effect=_download_writing(COMPLETE_MODEL, dirs)),
+            patch("transcribe.core.Model") as model_cls,
+        ):
+            assert _load_screen_model() is model_cls.return_value
+        assert dirs[0].parent == models_dir  # same filesystem, so the move is atomic
+        assert list(models_dir.iterdir()) == [models_dir / "ggml-tiny.bin"]  # temp dir gone
+        assert (models_dir / "ggml-tiny.bin").read_bytes() == COMPLETE_MODEL
+        model_cls.assert_called_once_with(str(models_dir / "ggml-tiny.bin"))
+
+    def test_replaces_a_download_cut_short(self, models_dir):
+        """A truncated file keeps the ggml magic; whisper.cpp "loads" it and segfaults on use."""
+        (models_dir / "ggml-tiny.bin").write_bytes(COMPLETE_MODEL[:12])
+        with (
+            patch("transcribe.core.download_model", side_effect=_download_writing(COMPLETE_MODEL)),
+            patch("transcribe.core.Model") as model_cls,
+        ):
+            assert _load_screen_model() is model_cls.return_value
+        assert (models_dir / "ggml-tiny.bin").read_bytes() == COMPLETE_MODEL
+
+    @pytest.mark.parametrize(
+        "content", [COMPLETE_MODEL[:12], b"<html>429 Too Many Requests</html>"], ids=["cut-short", "error-page"],
+    )
+    def test_bad_download_never_reaches_the_model_path(self, models_dir, content):
+        """download_model keeps a download cut short and saves an HTTP error page as the model."""
+        with (
+            patch("transcribe.core.download_model", side_effect=_download_writing(content)),
+            patch("transcribe.core.Model") as model_cls,
+        ):
+            assert _load_screen_model() is None
+        model_cls.assert_not_called()
+        assert list(models_dir.iterdir()) == []
+
+    def test_offline_leaves_every_region_to_the_main_model(self, models_dir):
+        partial = models_dir / "ggml-tiny.bin"
+        partial.write_bytes(COMPLETE_MODEL[:12])  # maybe a --model tiny job is still writing it
         with (
             patch("transcribe.core.download_model", side_effect=ConnectionError("offline")),
             patch("transcribe.core.Model") as model_cls,
         ):
             assert _load_screen_model() is None
         model_cls.assert_not_called()
-
-    def test_never_loads_a_file_that_is_not_a_ggml_model(self, tmp_path):
-        """download_model saves an HTTP error page as the model; whisper.cpp segfaults on it."""
-        path = tmp_path / "ggml-tiny.bin"
-        path.write_bytes(b"<html>429 Too Many Requests</html>")
-        with (
-            patch("transcribe.core.download_model", return_value=str(path)),
-            patch("transcribe.core.Model") as model_cls,
-        ):
-            assert _load_screen_model() is None
-        model_cls.assert_not_called()
+        assert partial.read_bytes() == COMPLETE_MODEL[:12]  # never deleted under a writer
 
 
 # ---------------------------------------------------------------------------
@@ -1073,18 +1119,19 @@ class TestTranscribeVideoSegmentProcessing:
 
         mock_model = MagicMock()
         mock_model.auto_detect_language.return_value = (("ru", 0.99), {"ru": 0.99})
-        p1, p2, p3 = _vad_patches(10.0)
+        p1, p2, _ = _vad_patches(10.0)
 
         with (
             patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
             patch("transcribe.core.Model", return_value=mock_model),
             patch("transcribe.core._load_screen_model", return_value=None) as load_screen,
             patch("transcribe.core._get_media_duration", return_value=10.0),
-            p1, p2, p3,
+            patch("transcribe.core._merge_speech_regions", return_value=[(0.0, 5.0), (5.0, 10.0)]),
+            p1, p2,
         ):
             transcribe_video(str(video), model_size=model_size, language=language)
 
-        assert load_screen.called == loads_screen
+        assert load_screen.call_count == int(loads_screen)  # once per transcription, not per chunk
 
 
 # ---------------------------------------------------------------------------
