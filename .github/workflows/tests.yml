@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # ponytail: the suite mocks torch/pyannote/mlx-audio/pywebview, so only the modules
+      # imported at collection time are installed (full requirements.txt pulls GBs of CUDA
+      # torch on Linux). Pins come from requirements.txt; huggingface_hub is transitive there.
+      # A new top-level import fails here with ModuleNotFoundError: add it to the list.
+      - name: Install test dependencies
+        run: |
+          grep -E '^(pywhispercpp|fastapi|python-multipart|webrtcvad-wheels|numpy|python-dotenv|pytest)\b' \
+            requirements.txt > "$RUNNER_TEMP/test-requirements.txt"
+          python -m pip install -r "$RUNNER_TEMP/test-requirements.txt" "huggingface_hub>=1.0"
+
+      - name: Run pytest
+        run: python -m pytest tests/ -q
