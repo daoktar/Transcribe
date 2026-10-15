@@ -58,11 +58,14 @@ def _get_media_duration(file_path: str) -> float | None:
         return None
 
 
-def _detect_language(model: Model, pcm: np.ndarray) -> str:
-    """Spoken language of 16 kHz audio, or "" (whisper.cpp's own auto-detect) on failure."""
+def _detect_language(model: Model, pcm: np.ndarray, min_prob: float = 0.0) -> str:
+    """Spoken language of 16 kHz audio, or "" (whisper.cpp's own auto-detect) on failure.
+
+    Also "" when the language scores below ``min_prob``.
+    """
     try:
-        (lang, _prob), _all_probs = model.auto_detect_language(pcm)
-        return lang
+        (lang, prob), _all_probs = model.auto_detect_language(pcm)
+        return lang if prob >= min_prob else ""
     except Exception:
         logger.warning("Language detection failed; leaving it to whisper.cpp", exc_info=True)
         return ""
@@ -71,6 +74,13 @@ def _detect_language(model: Model, pcm: np.ndarray) -> str:
 # Whisper's language ID needs a few seconds of speech: «Ок, го.» (1 s) scores p=0.70,
 # while every 2 s+ utterance of the RU/EN test clips scores 0.99+.
 _MIN_LANGUAGE_ID_SECONDS = 2.0
+
+# A region switches the language only when it scores at least this. On 2-3 s of Russian with
+# English jargon, large-v3 says en/pt/pl at p 0.23-0.44 (4 false cuts in a 76 min meeting);
+# real switches score 0.92+ (RU/EN test chunks at 12 dB SNR, a RU/EN lesson video).
+# ponytail: English read with a heavy Russian accent scores below it too (one test clip: 0.38)
+# and is decoded as Russian, which there still kept the English words.
+_MIN_SWITCH_PROB = 0.5
 
 # Screens a chunk's regions for a language switch before the main model identifies them one by
 # one: ~12 ms a region instead of ~0.3 s on large-v3. On 69 RU/EN test chunks it flagged every
@@ -119,17 +129,18 @@ def _language_windows(
     whisper.cpp decodes one language per ``transcribe()`` call, so in a RU, EN, RU chunk it
     skips or translates the English. When the chunk has two or more VAD regions long enough
     to identify, each gets its own language ID and the chunk is cut in the pause between
-    regions of different languages. Shorter regions are too unreliable to split on and join
-    the language before them. Otherwise the whole chunk is identified at once, which is
-    exactly the detection whisper.cpp would run itself.
+    regions of different languages. Shorter regions, and regions identified with less than
+    ``_MIN_SWITCH_PROB``, are too unreliable to split on and join the language before them.
+    Otherwise the whole chunk is identified at once, which is exactly the detection whisper.cpp
+    would run itself.
 
     A ``screen`` model hears those regions first: when it hears one language in all of them
     and the whole-chunk ID agrees, that is the chunk's language, so the main model's
     per-region passes are only paid where the language may switch. The main model still
     decides every window.
     """
-    def detect(start: float, end: float, by: Model = model) -> str:
-        return _detect_language(by, audio[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)])
+    def detect(start: float, end: float, by: Model = model, min_prob: float = 0.0) -> str:
+        return _detect_language(by, audio[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)], min_prob)
 
     regions = [(max(s, chunk_start), min(e, chunk_end))
                for s, e in raw_regions if s < chunk_end and e > chunk_start]
@@ -149,8 +160,11 @@ def _language_windows(
             if heard == {whole}:
                 return [(chunk_start, chunk_end, whole)]
 
-    langs = [detect(s, e) if ok else "" for (s, e), ok in zip(regions, identifiable)]
-    prev = next((lang for lang in langs if lang), "")  # leading short regions join the first one
+    langs = [detect(s, e, min_prob=_MIN_SWITCH_PROB) if ok else ""
+             for (s, e), ok in zip(regions, identifiable)]
+    if not any(langs):
+        return [(chunk_start, chunk_end, detect(chunk_start, chunk_end))]
+    prev =next((lang for lang in langs if lang), "")  # leading short regions join the first one
     for i, lang in enumerate(langs):
         prev = lang or prev
         langs[i] = prev
@@ -326,6 +340,28 @@ def _detect_speech_regions(
         speech_regions.append((region_start, region_end))
 
     return speech_regions
+
+
+def _split_at_pauses(
+    regions: list[tuple[float, float]], finer: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Cut each region at the pauses a stricter VAD (``finer``) hears inside it.
+
+    The outer edges stay: the stricter VAD trims 0.1-0.3 s off them, which would push 2 s
+    utterances below ``_MIN_LANGUAGE_ID_SECONDS``. For the same reason a pause is only cut
+    where both sides stay that long.
+    """
+    out = []
+    for s, e in regions:
+        inner = [(a, b) for a, b in finer if a < e and b > s]
+        start = s
+        for (_, pause_start), (pause_end, _) in zip(inner, inner[1:]):
+            if (pause_start - start >= _MIN_LANGUAGE_ID_SECONDS
+                    and e - pause_end >= _MIN_LANGUAGE_ID_SECONDS):
+                out.append((start, pause_start))
+                start = pause_end
+        out.append((start, e))
+    return out
 
 
 def _merge_speech_regions(
@@ -726,8 +762,13 @@ def transcribe_media(
         )
     else:
         try:
+            # Language switches are found on regions cut at the pauses of a stricter VAD: in a
+            # RU/EN lesson video (and under noise) level 2 bridges the 0.7-1.2 s pause between a
+            # Russian and an English sentence, and the merged region gets one language.
+            lid_regions = raw_regions if language else _split_at_pauses(
+                raw_regions, _detect_speech_regions(audio_pcm, aggressiveness=3))
             all_segments, detected_language = _transcribe_whisper_regions(
-                model_size, audio_pcm, speech_regions, raw_regions, language, diarize, _report,
+                model_size, audio_pcm, speech_regions, lid_regions, language, diarize, _report,
             )
         except MemoryError:
             # Never "recover" from memory exhaustion by loading an even larger model.

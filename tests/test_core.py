@@ -16,6 +16,7 @@ from transcribe.core import (
     _language_windows,
     _load_screen_model,
     _merge_speech_regions,
+    _split_at_pauses,
     retry_diarize,
     save_txt,
     save_txt_alongside,
@@ -112,6 +113,11 @@ class TestDetectLanguage:
         model = MagicMock()
         model.auto_detect_language.side_effect = RuntimeError("model error")
         assert _detect_language(model, np.zeros(16000, dtype=np.float32)) == ""
+
+    def test_below_min_prob_is_unidentified(self):
+        model = MagicMock()
+        model.auto_detect_language.return_value = (("pt", 0.34), {"pt": 0.34, "en": 0.23})
+        assert _detect_language(model, np.zeros(16000, dtype=np.float32), min_prob=0.5) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +223,42 @@ class TestLanguageWindows:
         model.auto_detect_language.side_effect = _lid("ru", "en", "ru")
         windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS, screen)
         assert windows == [(0.0, 9.25, "ru"), (9.25, 19.25, "en"), (19.25, 30.0, "ru")]
+
+    def test_low_confidence_region_does_not_switch(self):
+        """Russian jargon heard as Portuguese at p=0.34 joins the Russian around it."""
+        model = MagicMock()
+        model.auto_detect_language.side_effect = [
+            (("ru", 0.99), {}), (("pt", 0.34), {}), (("ru", 0.99), {}),
+        ]
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS)
+        assert windows == [(0.0, 30.0, "ru")]
+
+    def test_no_confident_region_identifies_the_whole_chunk(self):
+        model = MagicMock()
+        model.auto_detect_language.side_effect = [
+            (("en", 0.4), {}), (("pt", 0.3), {}), (("pl", 0.45), {}), (("ru", 0.9), {}),
+        ]
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS)
+        assert windows == [(0.0, 30.0, "ru")]
+        assert len(model.auto_detect_language.call_args.args[0]) == 30 * 16000
+
+
+# ---------------------------------------------------------------------------
+# _split_at_pauses
+# ---------------------------------------------------------------------------
+
+class TestSplitAtPauses:
+    def test_cuts_a_region_at_the_stricter_vads_pauses_keeping_its_edges(self):
+        # Level 2 bridged the pause (4.0-4.8) between two sentences
+        assert _split_at_pauses([(0.0, 9.0)], [(0.2, 4.0), (4.8, 8.7)]) == [(0.0, 4.0), (4.8, 9.0)]
+
+    def test_never_leaves_a_piece_too_short_to_identify(self):
+        # "That makes sense," (1.4 s) stays with the rest of its sentence
+        assert _split_at_pauses([(0.0, 6.0)], [(0.1, 1.4), (1.7, 5.9)]) == [(0.0, 6.0)]
+
+    def test_regions_without_inner_pauses_stay_whole(self):
+        regions = [(0.0, 3.0), (5.0, 9.0)]
+        assert _split_at_pauses(regions, [(0.1, 2.9), (5.2, 8.8)]) == regions
 
 
 # ---------------------------------------------------------------------------
@@ -1135,6 +1177,33 @@ class TestTranscribeVideoSegmentProcessing:
             (0.0, "ru"), (10.0, "en"), (16.0, "ru"),
         ]
         assert result["language"] == "ru"  # 24 s of Russian vs 6 s of English
+
+    def test_language_switch_is_found_where_level_2_vad_merged_two_sentences(self, tmp_path):
+        """Level 2 bridged the pause between a Russian and an English sentence; level 3 hears it,
+        so the chunk is still cut there. Chunking stays on level 2."""
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        calls = []
+        mock_model = MagicMock()
+        mock_model.auto_detect_language.side_effect = _lid("ru", "en")
+        mock_model.transcribe = lambda media, **kwargs: calls.append((len(media), kwargs["language"]))
+        vad = {2: [(0.5, 19.5)], 3: [(0.6, 9.5), (10.5, 19.4)]}
+
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=mock_model),
+            patch("transcribe.core._get_media_duration", return_value=20.0),
+            patch("transcribe.core._extract_audio_pcm",
+                  return_value=np.zeros(16000 * 20, dtype=np.float32)),
+            patch("transcribe.core._detect_speech_regions",
+                  side_effect=lambda audio, aggressiveness=2: vad[aggressiveness]),
+            patch("transcribe.core._merge_speech_regions", return_value=[(0.0, 20.0)]) as merge,
+        ):
+            transcribe_video(str(video), language=None)
+
+        assert merge.call_args.args[0] == vad[2]
+        assert calls == [(10 * 16000, "ru"), (10 * 16000, "en")]
 
     def test_screen_hearing_one_language_transcribes_the_chunk_whole(self, tmp_path):
         video = tmp_path / "video.mp4"
