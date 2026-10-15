@@ -11,8 +11,11 @@ torchaudio>=2.8.0,<3.0
 # Transitive (via pyannote.audio); floored at the fix for PYSEC-2026-3624 / CVE-2026-58659
 # (checkpoint-loading RCE) so existing environments upgrade too.
 lightning>=2.6.6,<3.0
-pywebview>=5.0,<6.0
-pyobjc-framework-Cocoa>=10.0,<12.0; sys_platform == "darwin"
+# lightning depends on this mirror package without a floor, so `pip install -r` alone
+# left existing environments on a vulnerable 2.6.1 (PYSEC-2026-3967).
+pytorch-lightning>=2.6.6,<3.0
+pywebview>=5.0,<7.0
+pyobjc-framework-Cocoa>=10.0,<13.0; sys_platform == "darwin"
 pytest>=9.0.3,<10.0
 numpy>=1.24.0,<3.0
 python-dotenv>=1.0.0,<2.0

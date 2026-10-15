@@ -57,7 +57,7 @@ All transcription logic lives in `core.py`. CLI and native app are thin wrappers
 - `pywhispercpp` — Python bindings for whisper.cpp (requires system ffmpeg)
 - `mlx-audio` — MLX speech-to-text (Qwen3-ASR fallback engine); Apple Silicon only, gated in `requirements.txt` by `platform_machine == "arm64"`. Pins `transformers>=5.5,<5.13` (mlx-lm 0.31.3 breaks on transformers 5.13+).
 - `webrtcvad-wheels` — WebRTC Voice Activity Detection (lightweight C extension, no PyTorch)
-- `pyannote.audio` 4.x (+ `torch`/`torchaudio` ≥2.8) — speaker diarization with the gated `pyannote/speaker-diarization-community-1` pipeline. 3.x cannot work on current torchaudio/huggingface_hub. pyannote 4's telemetry is on by default; `diarize.py` forces `PYANNOTE_METRICS_ENABLED=false`. `lightning` is floored at 2.6.6 (PYSEC-2026-3624).
+- `pyannote.audio` 4.x (+ `torch`/`torchaudio` ≥2.8) — speaker diarization with the gated `pyannote/speaker-diarization-community-1` pipeline. 3.x cannot work on current torchaudio/huggingface_hub. pyannote 4's telemetry is on by default; `diarize.py` forces `PYANNOTE_METRICS_ENABLED=false`. `lightning` and its `pytorch-lightning` mirror are floored at 2.6.6 (PYSEC-2026-3624, PYSEC-2026-3967).
 - `fastapi` + `uvicorn` — Backend web framework and ASGI server
 - `python-multipart` — File upload handling for FastAPI
 - `pywebview` — Native WKWebView window for the macOS app
