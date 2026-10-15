@@ -22,6 +22,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -52,6 +53,11 @@ ENGINE_CHOICES = ["whisper", "qwen"]
 
 # Maximum upload size per file: 2 GB
 MAX_UPLOAD_SIZE = 2 * 1024 * 1024 * 1024
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # stream uploads to disk instead of holding them in RAM
+
+# Host headers the server answers to. Anything else is a DNS-rebinding attempt: a remote
+# page whose hostname resolves to 127.0.0.1 would otherwise count as same-origin.
+ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 
 # Input validation limits
 MAX_NUM_SPEAKERS = 20
@@ -101,7 +107,7 @@ class Job:
     statuses: list[str] = field(default_factory=list)  # per-file
     errors: dict[int, str] = field(default_factory=dict)
     results: dict[int, dict] = field(default_factory=dict)
-    txt_paths: list[str] = field(default_factory=list)
+    txt_paths: dict[int, str] = field(default_factory=dict)  # file index → saved transcript
     progress_fraction: float = 0.0
     progress_message: str = ""
     current_file_index: int = 0
@@ -213,6 +219,44 @@ def _validate_save_alongside_path(user_path: str) -> Path:
     return resolved
 
 
+def _temp_txt_path(job: Job, index: int) -> Path:
+    """Temp transcript path for one file: inside the job's own directory so jobs never
+    overwrite each other, and suffixed when two inputs share a stem (a.mp3 + a.wav)."""
+    stem = job.files[index].stem
+    if sum(f.stem == stem for f in job.files) > 1:
+        stem = f"{stem}_{index + 1}"
+    return Path(_tmp_dir.name) / job.id / f"{stem}.txt"
+
+
+def _save_transcript(job: Job, index: int, result: dict) -> Path:
+    """Write one file's transcript — next to the original if requested, else to temp."""
+    original = job.original_paths[index]
+    if job.settings.get("save_alongside") and original:
+        try:
+            _validate_save_alongside_path(original)
+            return save_txt_alongside(result, original)
+        except (ValueError, OSError):
+            logger.warning("save_alongside path rejected, using temp dir")
+    return save_txt(result, _temp_txt_path(job, index))
+
+
+async def _save_upload(upload: UploadFile, dest: Path) -> None:
+    """Stream an upload to ``dest`` in chunks, enforcing MAX_UPLOAD_SIZE (HTTP 413)."""
+    size = 0
+    with dest.open("wb") as out:
+        while chunk := await upload.read(_UPLOAD_CHUNK_SIZE):
+            size += len(chunk)
+            if size > MAX_UPLOAD_SIZE:
+                break
+            out.write(chunk)
+    if size > MAX_UPLOAD_SIZE:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {MAX_UPLOAD_SIZE // (1024**3)} GB)",
+        )
+
+
 def _get_job(job_id: str) -> Job:
     job = _jobs.get(job_id)
     if job is None:
@@ -303,23 +347,7 @@ def _run_transcription(job: Job) -> None:
             if first_result_index is None:
                 first_result_index = i
 
-            # Save transcript
-            if job.settings.get("save_alongside") and job.original_paths[i]:
-                try:
-                    _validate_save_alongside_path(job.original_paths[i])
-                    txt_path = save_txt_alongside(result, job.original_paths[i])
-                except (ValueError, OSError):
-                    logger.warning("save_alongside path rejected, using temp dir")
-                    txt_path = save_txt(
-                        result,
-                        Path(_tmp_dir.name) / f"{fpath.stem}.txt",
-                    )
-            else:
-                txt_path = save_txt(
-                    result,
-                    Path(_tmp_dir.name) / f"{fpath.stem}.txt",
-                )
-            job.txt_paths.append(str(txt_path))
+            job.txt_paths[i] = str(_save_transcript(job, i, result))
 
         except Exception as exc:
             with job.lock:
@@ -374,28 +402,7 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
         )
         job.results[file_index] = result
         job.statuses[file_index] = "done"
-
-        # Re-save transcript
-        if job.settings.get("save_alongside") and job.original_paths[file_index]:
-            try:
-                _validate_save_alongside_path(job.original_paths[file_index])
-                txt_path = save_txt_alongside(result, job.original_paths[file_index])
-            except (ValueError, OSError):
-                logger.warning("save_alongside path rejected, using temp dir")
-                txt_path = save_txt(
-                    result,
-                    Path(_tmp_dir.name) / f"{job.files[file_index].stem}.txt",
-                )
-        else:
-            txt_path = save_txt(
-                result,
-                Path(_tmp_dir.name) / f"{job.files[file_index].stem}.txt",
-            )
-        # Update the corresponding txt_path
-        if file_index < len(job.txt_paths):
-            job.txt_paths[file_index] = str(txt_path)
-        else:
-            job.txt_paths.append(str(txt_path))
+        job.txt_paths[file_index] = str(_save_transcript(job, file_index, result))
 
         _enqueue(job, {
             "type": "complete",
@@ -452,6 +459,9 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST"],
         allow_credentials=False,
     )
+
+    # --- Host check (outermost) — defeats DNS rebinding, which CORS cannot see ---
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
     # Mount static files if the directory exists
     if STATIC_DIR.is_dir():
@@ -541,14 +551,6 @@ def create_app() -> FastAPI:
                         detail=f"Unsupported file type: {suffix}",
                     )
 
-                # Read with size limit
-                content = await upload.read()
-                if len(content) > MAX_UPLOAD_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File too large (max {MAX_UPLOAD_SIZE // (1024**3)} GB)",
-                    )
-
                 dest = job_dir / filename
                 counter = 1
                 while dest.exists():
@@ -559,7 +561,7 @@ def create_app() -> FastAPI:
                 if not dest.resolve().is_relative_to(job_dir.resolve()):
                     raise HTTPException(status_code=400, detail="Invalid filename")
 
-                dest.write_bytes(content)
+                await _save_upload(upload, dest)
 
                 job.files.append(dest)
                 job.filenames.append(filename)
@@ -709,7 +711,7 @@ def create_app() -> FastAPI:
 
         tmp_root = Path(_tmp_dir.name).resolve()
         valid_paths = []
-        for p in job.txt_paths:
+        for _, p in sorted(job.txt_paths.items()):
             pp = Path(p)
             if not pp.is_file() or pp.suffix != ".txt":
                 continue
@@ -735,11 +737,19 @@ def create_app() -> FastAPI:
                 media_type="text/plain",
             )
 
-        # Multiple files — return a zip
+        # Multiple files — return a zip. Transcripts saved alongside originals in different
+        # folders can share a name; suffix duplicates so extraction doesn't drop one.
         buf = io.BytesIO()
+        used_names: set[str] = set()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for p in valid_paths:
-                zf.write(p, Path(p).name)
+                pp = Path(p)
+                name, n = pp.name, 1
+                while name in used_names:
+                    name = f"{pp.stem}_{n}{pp.suffix}"
+                    n += 1
+                used_names.add(name)
+                zf.write(p, name)
         buf.seek(0)
 
         return StreamingResponse(
@@ -757,18 +767,21 @@ def create_app() -> FastAPI:
     async def retry_diarize_endpoint(job_id: str, body: RetryDiarizeRequest) -> JSONResponse:
         job = _get_job(job_id)
 
-        if job.status == "processing":
-            raise HTTPException(status_code=409, detail="Job already processing")
-
         file_index = body.file_index
         if file_index < 0 or file_index >= len(job.files):
             raise HTTPException(status_code=400, detail="Invalid file_index")
 
-        if file_index not in job.results:
-            raise HTTPException(
-                status_code=400,
-                detail="No transcription result for this file yet",
-            )
+        # Check-and-claim under the lock (as in start_transcription) so a double submit
+        # can't start two diarization workers on the same job.
+        with job.lock:
+            if job.status == "processing":
+                raise HTTPException(status_code=409, detail="Job already processing")
+            if file_index not in job.results:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No transcription result for this file yet",
+                )
+            job.status = "processing"
 
         # Reset progress state
         job.progress_fraction = 0.0
