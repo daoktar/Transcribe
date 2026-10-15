@@ -358,6 +358,10 @@ def _transcribe_whisper_regions(
         "language": language or "",
         # --- Anti-hallucination / anti-repetition parameters ---
         "no_context": True,
+        # no_context only resets between calls. Inside a chunk, each re-seeked 30 s window
+        # (max_tokens forces one roughly every 15 s of Russian) was still conditioned on the
+        # previous window's text, and after a language switch it skipped whole utterances.
+        "n_max_text_ctx": 0,
         "no_speech_thold": 0.3,
         "entropy_thold": 2.4,
         "max_tokens": 100,

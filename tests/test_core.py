@@ -785,6 +785,8 @@ class TestTranscribeVideoSegmentProcessing:
             transcribe_video(str(video), language=language)
 
         assert mock_model.transcribe.call_args.kwargs["language"] == expected
+        # Windows inside a chunk must not condition on each other (that dropped utterances).
+        assert mock_model.transcribe.call_args.kwargs["n_max_text_ctx"] == 0
 
     def test_no_speech_detected_returns_empty(self, tmp_path):
         """When VAD finds no speech, return empty result without transcribing."""
