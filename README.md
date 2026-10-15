@@ -81,7 +81,7 @@ Opens a native WKWebView window running the same web UI. Includes menu bar tray 
 
 ## Speaker Diarization
 
-Identifies different speakers using pyannote.audio. Requires a free [HuggingFace token](https://huggingface.co/settings/tokens) with read access — you must first accept the [model license](https://huggingface.co/pyannote/speaker-diarization-3.1).
+Identifies different speakers using pyannote.audio. Requires a free [HuggingFace token](https://huggingface.co/settings/tokens) with read access — you must first accept the [model's user conditions](https://huggingface.co/pyannote/speaker-diarization-community-1). pyannote's built-in usage telemetry is switched off by the app.
 
 ```
 [00:01] Speaker 1: Hello, how are you?

@@ -6,12 +6,23 @@ mapping speaker turns to segment timestamps via majority-vote overlap.
 """
 
 import hashlib
+import os
 from collections import Counter
 from collections.abc import Callable
 
 import numpy as np
 
+# pyannote.audio 4 ships OpenTelemetry usage metrics, on by default, posting to
+# otel.pyannote.ai. This app makes no network calls beyond model downloads, so force
+# them off — pyannote reads the variable when it is first imported (lazily, below).
+os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
+
 SAMPLE_RATE = 16000
+
+# pyannote 4's recommended open pipeline. One gated repo: it bundles the segmentation,
+# embedding and PLDA models (loading the legacy 3.1 pipeline on pyannote 4 would need
+# community-1's PLDA anyway, on top of the 3.1 and segmentation-3.0 licenses).
+PIPELINE_ID = "pyannote/speaker-diarization-community-1"
 
 _pipeline = None
 _pipeline_token_hash: str | None = None
@@ -32,13 +43,14 @@ def _load_pipeline(hf_token: str):
     token_hash = hashlib.sha256(hf_token.encode()).hexdigest()
     if _pipeline is None or _pipeline_token_hash != token_hash:
         try:
-            _pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                token=hf_token,
-            )
+            pipeline = Pipeline.from_pretrained(PIPELINE_ID, token=hf_token)
+            if pipeline is None:
+                # pyannote 4 returns None instead of raising for some download failures
+                raise LookupError(f"no pipeline returned for {PIPELINE_ID}")
             # Use Metal GPU on Apple Silicon for faster inference
             if torch.backends.mps.is_available():
-                _pipeline.to(torch.device("mps"))
+                pipeline.to(torch.device("mps"))
+            _pipeline = pipeline
         except Exception as exc:
             # Reset cache so a subsequent call with a new token retries
             _pipeline = None
@@ -47,9 +59,8 @@ def _load_pipeline(hf_token: str):
             err_msg = str(exc).replace(hf_token, "***")
             raise RuntimeError(
                 f"Failed to load pyannote pipeline: {err_msg}\n"
-                "Accept user conditions for BOTH required models:\n"
-                "  1. https://huggingface.co/pyannote/speaker-diarization-3.1\n"
-                "  2. https://huggingface.co/pyannote/segmentation-3.0"
+                "Accept the model's user conditions at:\n"
+                f"  https://huggingface.co/{PIPELINE_ID}"
             ) from None
         _pipeline_token_hash = token_hash
     return _pipeline
@@ -102,7 +113,7 @@ def diarize(
 
     output = pipeline(audio_dict, **kwargs)
 
-    # pyannote.audio v4+ returns DiarizeOutput; v3 returns Annotation directly
+    # pyannote.audio 4 returns a DiarizeOutput wrapping the Annotation
     annotation = getattr(output, "speaker_diarization", output)
 
     # --- Collect speaker turns ---

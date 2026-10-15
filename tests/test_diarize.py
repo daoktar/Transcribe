@@ -136,6 +136,36 @@ class TestLoadPipeline:
         assert mod._pipeline is not None
         assert mod._pipeline_token_hash is not None
 
+    def test_loads_community_pipeline_with_token_kwarg(self):
+        """pyannote 4 API: community-1 pipeline, token passed as ``token=``."""
+        import transcribe.diarize as mod
+
+        mod._load_pipeline("hf_abc")
+
+        _mock_pyannote.Pipeline.from_pretrained.assert_called_once_with(
+            "pyannote/speaker-diarization-community-1", token="hf_abc",
+        )
+
+    def test_none_from_pretrained_is_a_load_failure(self):
+        """A None pipeline must surface the accept-conditions error, not crash later."""
+        import transcribe.diarize as mod
+
+        _mock_pyannote.Pipeline.from_pretrained.return_value = None
+
+        with pytest.raises(RuntimeError, match="speaker-diarization-community-1"):
+            mod._load_pipeline("hf_abc")
+        assert mod._pipeline is None
+        assert mod._pipeline_token_hash is None
+
+
+def test_pyannote_telemetry_forced_off():
+    """pyannote 4 metrics default to on; importing diarize must switch them off."""
+    import os
+
+    import transcribe.diarize  # noqa: F401
+
+    assert os.environ["PYANNOTE_METRICS_ENABLED"] == "false"
+
 
 # ---------------------------------------------------------------------------
 # TestDiarize
