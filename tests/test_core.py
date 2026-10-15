@@ -13,6 +13,7 @@ from transcribe.core import (
     _extract_audio_pcm,
     _format_eta,
     _get_media_duration,
+    _language_windows,
     _merge_speech_regions,
     retry_diarize,
     save_txt,
@@ -97,17 +98,72 @@ class TestDetectLanguage:
     def test_success(self):
         model = MagicMock()
         model.auto_detect_language.return_value = (("en", 0.95), {"en": 0.95, "fr": 0.03})
-        lang, err = _detect_language(model, "test.wav")
-        assert lang == "en"
-        assert err is None
+        assert _detect_language(model, np.zeros(16000, dtype=np.float32)) == "en"
 
-    def test_failure_returns_unknown(self):
+    def test_failure_falls_back_to_whisper_auto_detect(self):
         model = MagicMock()
         model.auto_detect_language.side_effect = RuntimeError("model error")
-        lang, err = _detect_language(model, "test.wav")
-        assert lang == "unknown"
-        assert "RuntimeError" in err
-        assert "model error" in err
+        assert _detect_language(model, np.zeros(16000, dtype=np.float32)) == ""
+
+
+# ---------------------------------------------------------------------------
+# _language_windows
+# ---------------------------------------------------------------------------
+
+def _lid(*langs):
+    """auto_detect_language side effect returning *langs* in call order."""
+    return [((lang, 0.99), {lang: 0.99}) for lang in langs]
+
+
+class TestLanguageWindows:
+    AUDIO = np.zeros(16000 * 30, dtype=np.float32)
+
+    def test_cuts_chunk_in_the_pause_where_language_switches(self):
+        model = MagicMock()
+        model.auto_detect_language.side_effect = _lid("ru", "en", "ru")
+        regions = [
+            (0.0, 1.0),    # too short to identify: joins the first detected language
+            (1.2, 9.4),    # ru
+            (10.0, 19.4),  # en
+            (19.8, 20.8),  # "Ок, го." — too short, joins the en before it
+            (21.2, 29.0),  # ru
+        ]
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, regions)
+        assert windows == [(0.0, 9.7, "ru"), (9.7, 21.0, "en"), (21.0, 30.0, "ru")]
+        # One detection per long region, each on that region's audio only
+        assert [len(c.args[0]) for c in model.auto_detect_language.call_args_list] == [
+            int(9.4 * 16000) - int(1.2 * 16000),
+            int(19.4 * 16000) - int(10.0 * 16000),
+            int(29.0 * 16000) - int(21.2 * 16000),
+        ]
+
+    def test_single_language_chunk_stays_whole(self):
+        model = MagicMock()
+        model.auto_detect_language.side_effect = _lid("ru", "ru")
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, [(0.5, 12.0), (12.6, 29.5)])
+        assert windows == [(0.0, 30.0, "ru")]
+
+    def test_fewer_than_two_identifiable_regions_detects_the_whole_chunk(self):
+        model = MagicMock()
+        model.auto_detect_language.side_effect = _lid("ru")
+        windows = _language_windows(model, self.AUDIO, 0.0, 12.0, [(0.5, 9.0), (9.5, 10.5)])
+        assert windows == [(0.0, 12.0, "ru")]
+        assert len(model.auto_detect_language.call_args.args[0]) == 12 * 16000
+
+    def test_regions_are_clipped_to_the_chunk(self):
+        """A region straddling the chunk edge only counts with its part inside the chunk."""
+        model = MagicMock()
+        model.auto_detect_language.side_effect = _lid("ru")
+        # (28.0, 31.0) has only 1 s inside (0, 29): not identifiable, so one whole-chunk pass
+        windows = _language_windows(model, self.AUDIO, 0.0, 29.0, [(0.5, 20.0), (28.0, 31.0)])
+        assert windows == [(0.0, 29.0, "ru")]
+        model.auto_detect_language.assert_called_once()
+
+    def test_detection_failure_leaves_it_to_whisper(self):
+        model = MagicMock()
+        model.auto_detect_language.side_effect = RuntimeError("model error")
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, [(0.5, 12.0), (12.6, 29.5)])
+        assert windows == [(0.0, 30.0, "")]
 
 
 # ---------------------------------------------------------------------------
@@ -760,8 +816,8 @@ class TestTranscribeVideoSegmentProcessing:
     @pytest.mark.parametrize(
         ("language", "detect", "expected"),
         [
-            (None, {"return_value": (("ru", 0.99), {"ru": 0.99})}, ""),  # per-chunk auto-detect
-            (None, {"side_effect": RuntimeError("model error")}, ""),    # detection failed
+            (None, {"return_value": (("ru", 0.99), {"ru": 0.99})}, "ru"),  # detected per chunk
+            (None, {"side_effect": RuntimeError("model error")}, ""),      # whisper's own auto
             ("ru", None, "ru"),
         ],
     )
@@ -854,6 +910,40 @@ class TestTranscribeVideoSegmentProcessing:
         # Chunk 2 segment: 10.0 + 0.0 = 10.0, 10.0 + 2.0 = 12.0
         assert result["segments"][1] == {"start": 10.0, "end": 12.0, "text": "World."}
         assert result["text"] == "Hello. World."
+
+    def test_mixed_language_chunk_is_transcribed_per_language(self, tmp_path):
+        """RU, EN, RU in one chunk: one call per language, or whisper drops the English."""
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        calls = []
+
+        def fake_transcribe(media, new_segment_callback=None, **kwargs):
+            calls.append((len(media), kwargs["language"]))
+            new_segment_callback(SimpleNamespace(t0=0, t1=100, text=kwargs["language"]))
+
+        mock_model = MagicMock()
+        mock_model.auto_detect_language.side_effect = _lid("ru", "en", "ru")
+        mock_model.transcribe = fake_transcribe
+
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=mock_model),
+            patch("transcribe.core._get_media_duration", return_value=30.0),
+            patch("transcribe.core._extract_audio_pcm",
+                  return_value=np.zeros(16000 * 30, dtype=np.float32)),
+            patch("transcribe.core._detect_speech_regions",
+                  return_value=[(0.5, 9.5), (10.5, 15.5), (16.5, 29.5)]),
+            patch("transcribe.core._merge_speech_regions", return_value=[(0.0, 30.0)]),
+        ):
+            result = transcribe_video(str(video), language=None)
+
+        # Cut in the middle of each pause: (0, 10) ru, (10, 16) en, (16, 30) ru
+        assert calls == [(10 * 16000, "ru"), (6 * 16000, "en"), (14 * 16000, "ru")]
+        assert [(s["start"], s["text"]) for s in result["segments"]] == [
+            (0.0, "ru"), (10.0, "en"), (16.0, "ru"),
+        ]
+        assert result["language"] == "ru"  # 24 s of Russian vs 6 s of English
 
 
 # ---------------------------------------------------------------------------
