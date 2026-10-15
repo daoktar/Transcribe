@@ -3,9 +3,14 @@ fastapi>=0.115.0,<1.0
 uvicorn[standard]>=0.34.0,<1.0
 python-multipart>=0.0.31,<1.0
 webrtcvad-wheels>=2.0.10,<3.0
-pyannote.audio>=3.1.0,<4.0
-torch>=2.0.0,<3.0
-torchaudio>=2.0.0,<3.0
+# pyannote 3.x cannot import on torchaudio>=2.9 (AudioMetaData removed) and passes
+# use_auth_token, which huggingface_hub>=1.0 rejects — diarization needs 4.x.
+pyannote.audio>=4.0.7,<5.0
+torch>=2.8.0,<3.0
+torchaudio>=2.8.0,<3.0
+# Transitive (via pyannote.audio); floored at the fix for PYSEC-2026-3624 / CVE-2026-58659
+# (checkpoint-loading RCE) so existing environments upgrade too.
+lightning>=2.6.6,<3.0
 pywebview>=5.0,<6.0
 pyobjc-framework-Cocoa>=10.0,<12.0; sys_platform == "darwin"
 pytest>=9.0.3,<10.0

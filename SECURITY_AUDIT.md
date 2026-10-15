@@ -28,6 +28,7 @@ The app must make NO internet connections except model downloads (whisper.cpp) a
   grep -rn '0\.0\.0\.0' transcribe/
   grep -rn 'host=' transcribe/web.py transcribe/app.py
   ```
+- [ ] **pyannote telemetry** — `transcribe/diarize.py` sets `PYANNOTE_METRICS_ENABLED=false` before pyannote is imported (pyannote.audio 4 defaults it on)
 - [ ] **Dependencies** — check no dependency phones home or collects telemetry
   ```bash
   pip-audit -r requirements.txt
@@ -119,6 +120,7 @@ curl -sI http://127.0.0.1:7860/ | grep -iE 'x-content|x-frame|content-security'
 - [ ] CORS middleware restricts origins to `127.0.0.1` only
 - [ ] Only `GET` and `POST` methods allowed
 - [ ] Credentials not allowed (`allow_credentials=False`)
+- [ ] Host header restricted to `127.0.0.1`/`localhost` (`TrustedHostMiddleware`) — CORS does not stop DNS rebinding
 
 ### Test
 ```bash
@@ -127,6 +129,9 @@ curl -sI -H "Origin: http://evil.com" http://127.0.0.1:7860/api/config | grep -i
 
 # Should be allowed
 curl -sI -H "Origin: http://127.0.0.1:7860" http://127.0.0.1:7860/api/config | grep -i 'access-control'
+
+# DNS rebinding — foreign Host must get 400
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: attacker.example' http://127.0.0.1:7860/api/config
 ```
 
 ---
@@ -228,6 +233,7 @@ gitleaks detect --source .
 | Date | Auditor | Findings | Status |
 |------|---------|----------|--------|
 | 2026-03-26 | Claude Code | Initial comprehensive audit — 17 issues found and fixed (PR #13) | Resolved |
+| 2026-10-15 | Claude Code | Diarization broken on fresh installs (pyannote 3.x vs torchaudio/huggingface_hub) → pyannote 4 with telemetry off; lightning PYSEC-2026-3624 fixed upstream (2.6.6); DNS-rebinding Host check; transcript path collisions and upload buffering in `web.py` | Resolved (bundle verification pending) |
 | | | | |
 
 ---
