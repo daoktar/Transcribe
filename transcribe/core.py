@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import webrtcvad
 from pywhispercpp.model import Model
+from pywhispercpp.utils import download_model
 
 from transcribe import qwen_engine
 from transcribe.paths import get_ffmpeg_path, get_ffprobe_path
@@ -68,6 +69,26 @@ def _detect_language(model: Model, pcm: np.ndarray) -> str:
 # while every 2 s+ utterance of the RU/EN test clips scores 0.99+.
 _MIN_LANGUAGE_ID_SECONDS = 2.0
 
+# Screens a chunk's regions for a language switch before the main model identifies them one by
+# one: ~12 ms a region instead of ~0.3 s on large-v3. On 69 RU/EN test chunks it flagged every
+# chunk large-v3 cuts. base is worse: it hears 6 s of Russian as Ukrainian (p=0.95).
+_SCREEN_MODEL = "tiny"
+
+
+def _load_screen_model() -> Model | None:
+    """whisper tiny for ``_language_windows``, or None: the main model then identifies every region."""
+    try:
+        path = Path(download_model(_SCREEN_MODEL))  # 78 MB on first use; raises when offline
+        with path.open("rb") as f:
+            # download_model saves an HTTP error page as the model, and whisper.cpp segfaults on it
+            if f.read(4) != b"lmgg":
+                raise ValueError(f"{path} is not a ggml model")
+        return Model(str(path))
+    except Exception:
+        logger.warning("Language screen model unavailable; identifying every region with the "
+                       "main model", exc_info=True)
+        return None
+
 
 def _language_windows(
     model: Model,
@@ -75,6 +96,7 @@ def _language_windows(
     chunk_start: float,
     chunk_end: float,
     raw_regions: list[tuple[float, float]],
+    screen: Model | None = None,
 ) -> list[tuple[float, float, str]]:
     """Cut a chunk where the spoken language switches: ``[(start, end, language), ...]``.
 
@@ -84,9 +106,14 @@ def _language_windows(
     regions of different languages. Shorter regions are too unreliable to split on and join
     the language before them. Otherwise the whole chunk is identified at once, which is
     exactly the detection whisper.cpp would run itself.
+
+    A ``screen`` model hears those regions first: when it hears one language in all of them
+    and the whole-chunk ID agrees, that is the chunk's language, so the main model's
+    per-region passes are only paid where the language may switch. The main model still
+    decides every window.
     """
-    def detect(start: float, end: float) -> str:
-        return _detect_language(model, audio[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)])
+    def detect(start: float, end: float, by: Model = model) -> str:
+        return _detect_language(by, audio[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)])
 
     regions = [(max(s, chunk_start), min(e, chunk_end))
                for s, e in raw_regions if s < chunk_end and e > chunk_start]
@@ -94,9 +121,18 @@ def _language_windows(
     if sum(identifiable) < 2:
         return [(chunk_start, chunk_end, detect(chunk_start, chunk_end))]
 
-    # ponytail: one encoder pass per region (~0.3 s on large-v3), even in monolingual chunks:
-    # +54% whisper time on dense Russian. Upgrade path: a small LID-only model, or a gate on
-    # the chunk-level p of the second language (0.004-0.006 on mixed chunks, ~0 on pure ones).
+    # ponytail: tiny hears noisy Russian as uk/bg/pt (3 of 14 pure-RU chunks at 12 dB SNR), and
+    # those chunks still pay one main-model pass per region. A gate on the chunk-level p of the
+    # second language was no better: its scale moves 10-100x between clean and noisy audio.
+    if screen is not None:
+        heard = {detect(s, e, screen) for (s, e), ok in zip(regions, identifiable) if ok}
+        if len(heard) == 1 and "" not in heard:  # "" = the screen failed
+            # Alone, the whole-chunk ID leans Russian whenever any is spoken (14 of 18 English
+            # test chunks with one Russian utterance), so it stands only if the screen agrees.
+            whole = detect(chunk_start, chunk_end)
+            if heard == {whole}:
+                return [(chunk_start, chunk_end, whole)]
+
     langs = [detect(s, e) if ok else "" for (s, e), ok in zip(regions, identifiable)]
     prev = next((lang for lang in langs if lang), "")  # leading short regions join the first one
     for i, lang in enumerate(langs):
@@ -370,7 +406,8 @@ def _transcribe_whisper_regions(
 
     Loads the model, then transcribes each region, streaming per-segment progress. Without a
     ``language``, each region is first cut where the spoken language switches
-    (``_language_windows``) and the reported language is the one spoken longest.
+    (``_language_windows``, screened by whisper tiny) and the reported language is the one
+    spoken longest.
     Returns ``(segments, detected_language)``.
     """
     # --- Load model (Metal GPU acceleration is automatic on Apple Silicon) ---
@@ -378,6 +415,7 @@ def _transcribe_whisper_regions(
     t0 = time.monotonic()
     model = Model(model_size, print_realtime=False, print_progress=False)
     report(_TRANSCRIBE_START_FRAC, f"Model loaded in {_format_eta(time.monotonic() - t0)}.")
+    screen = _load_screen_model() if not language and model_size != _SCREEN_MODEL else None
     report(_TRANSCRIBE_START_FRAC, f"Language: {language or 'auto-detect'}. Transcribing...")
 
     transcribe_start = time.monotonic()
@@ -404,7 +442,7 @@ def _transcribe_whisper_regions(
     for chunk_idx, (chunk_start, chunk_end) in enumerate(speech_regions):
         windows = (
             [(chunk_start, chunk_end, language)] if language
-            else _language_windows(model, audio_pcm, chunk_start, chunk_end, raw_regions)
+            else _language_windows(model, audio_pcm, chunk_start, chunk_end, raw_regions, screen)
         )
         chunk_segments: list[dict] = []
 

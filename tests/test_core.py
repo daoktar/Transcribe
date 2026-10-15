@@ -14,12 +14,20 @@ from transcribe.core import (
     _format_eta,
     _get_media_duration,
     _language_windows,
+    _load_screen_model,
     _merge_speech_regions,
     retry_diarize,
     save_txt,
     save_txt_alongside,
     transcribe_media as transcribe_video,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_screen_model():
+    """No test loads (or downloads) the real whisper tiny screen; the main mock hears every region."""
+    with patch("transcribe.core._load_screen_model", return_value=None):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +172,87 @@ class TestLanguageWindows:
         model.auto_detect_language.side_effect = RuntimeError("model error")
         windows = _language_windows(model, self.AUDIO, 0.0, 30.0, [(0.5, 12.0), (12.6, 29.5)])
         assert windows == [(0.0, 30.0, "")]
+
+    REGIONS = [(0.5, 9.0), (9.5, 19.0), (19.5, 29.5)]
+
+    def test_screen_hearing_one_language_identifies_the_chunk_whole(self):
+        model, screen = MagicMock(), MagicMock()
+        screen.auto_detect_language.side_effect = _lid("ru", "ru", "ru")
+        model.auto_detect_language.side_effect = _lid("ru")
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS, screen)
+        assert windows == [(0.0, 30.0, "ru")]
+        # The main model's only pass is the whole chunk, the detection whisper.cpp runs itself
+        assert len(model.auto_detect_language.call_args.args[0]) == 30 * 16000
+        model.auto_detect_language.assert_called_once()
+
+    def test_whole_chunk_id_stands_only_where_the_screen_agrees(self):
+        """English chunk ending in Russian that VAD merged into the last region: the whole-chunk
+        ID says ru, and alone it would translate the English. The regions decide instead."""
+        model, screen = MagicMock(), MagicMock()
+        screen.auto_detect_language.side_effect = _lid("en", "en", "en")
+        model.auto_detect_language.side_effect = _lid("ru", "en", "en", "en")
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS, screen)
+        assert windows == [(0.0, 30.0, "en")]
+        assert model.auto_detect_language.call_count == 4  # whole chunk, then each region
+
+    def test_whole_chunk_id_failure_falls_back_to_the_regions(self):
+        model, screen = MagicMock(), MagicMock()
+        screen.auto_detect_language.side_effect = _lid("ru", "ru", "ru")
+        model.auto_detect_language.side_effect = [RuntimeError("model error"), *_lid("ru", "ru", "ru")]
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS, screen)
+        assert windows == [(0.0, 30.0, "ru")]
+
+    def test_main_model_decides_where_the_screen_hears_a_switch(self):
+        """tiny mishears Russian as Bulgarian: that costs the per-region passes, never a window."""
+        model, screen = MagicMock(), MagicMock()
+        screen.auto_detect_language.side_effect = _lid("ru", "bg", "ru")
+        model.auto_detect_language.side_effect = _lid("ru", "ru", "ru")
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS, screen)
+        assert windows == [(0.0, 30.0, "ru")]
+        assert model.auto_detect_language.call_count == 3
+
+    def test_screen_failure_counts_as_a_switch(self):
+        model, screen = MagicMock(), MagicMock()
+        screen.auto_detect_language.side_effect = RuntimeError("model error")
+        model.auto_detect_language.side_effect = _lid("ru", "en", "ru")
+        windows = _language_windows(model, self.AUDIO, 0.0, 30.0, self.REGIONS, screen)
+        assert windows == [(0.0, 9.25, "ru"), (9.25, 19.25, "en"), (19.25, 30.0, "ru")]
+
+
+# ---------------------------------------------------------------------------
+# _load_screen_model
+# ---------------------------------------------------------------------------
+
+class TestLoadScreenModel:
+    def test_loads_the_downloaded_ggml_file(self, tmp_path):
+        path = tmp_path / "ggml-tiny.bin"
+        path.write_bytes(b"lmgg" + bytes(16))
+        with (
+            patch("transcribe.core.download_model", return_value=str(path)) as download,
+            patch("transcribe.core.Model") as model_cls,
+        ):
+            assert _load_screen_model() is model_cls.return_value
+        download.assert_called_once_with("tiny")
+        model_cls.assert_called_once_with(str(path))
+
+    def test_offline_leaves_every_region_to_the_main_model(self):
+        with (
+            patch("transcribe.core.download_model", side_effect=ConnectionError("offline")),
+            patch("transcribe.core.Model") as model_cls,
+        ):
+            assert _load_screen_model() is None
+        model_cls.assert_not_called()
+
+    def test_never_loads_a_file_that_is_not_a_ggml_model(self, tmp_path):
+        """download_model saves an HTTP error page as the model; whisper.cpp segfaults on it."""
+        path = tmp_path / "ggml-tiny.bin"
+        path.write_bytes(b"<html>429 Too Many Requests</html>")
+        with (
+            patch("transcribe.core.download_model", return_value=str(path)),
+            patch("transcribe.core.Model") as model_cls,
+        ):
+            assert _load_screen_model() is None
+        model_cls.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1033,58 @@ class TestTranscribeVideoSegmentProcessing:
             (0.0, "ru"), (10.0, "en"), (16.0, "ru"),
         ]
         assert result["language"] == "ru"  # 24 s of Russian vs 6 s of English
+
+    def test_screen_hearing_one_language_transcribes_the_chunk_whole(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        calls = []
+        mock_model = MagicMock()
+        mock_model.auto_detect_language.side_effect = _lid("ru")
+        mock_model.transcribe = lambda media, **kwargs: calls.append((len(media), kwargs["language"]))
+        screen = MagicMock()
+        screen.auto_detect_language.side_effect = _lid("ru", "ru", "ru")
+
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=mock_model),
+            patch("transcribe.core._load_screen_model", return_value=screen),
+            patch("transcribe.core._get_media_duration", return_value=30.0),
+            patch("transcribe.core._extract_audio_pcm",
+                  return_value=np.zeros(16000 * 30, dtype=np.float32)),
+            patch("transcribe.core._detect_speech_regions",
+                  return_value=[(0.5, 9.5), (10.5, 15.5), (16.5, 29.5)]),
+            patch("transcribe.core._merge_speech_regions", return_value=[(0.0, 30.0)]),
+        ):
+            transcribe_video(str(video), language=None)
+
+        assert calls == [(30 * 16000, "ru")]
+        assert screen.auto_detect_language.call_count == 3
+
+    @pytest.mark.parametrize(
+        ("language", "model_size", "loads_screen"),
+        [(None, "large-v3", True), ("ru", "large-v3", False), (None, "tiny", False)],
+    )
+    def test_screen_only_when_detecting_with_a_bigger_model(
+        self, tmp_path, language, model_size, loads_screen,
+    ):
+        video = tmp_path / "video.mp4"
+        video.touch()
+
+        mock_model = MagicMock()
+        mock_model.auto_detect_language.return_value = (("ru", 0.99), {"ru": 0.99})
+        p1, p2, p3 = _vad_patches(10.0)
+
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=mock_model),
+            patch("transcribe.core._load_screen_model", return_value=None) as load_screen,
+            patch("transcribe.core._get_media_duration", return_value=10.0),
+            p1, p2, p3,
+        ):
+            transcribe_video(str(video), model_size=model_size, language=language)
+
+        assert load_screen.called == loads_screen
 
 
 # ---------------------------------------------------------------------------
