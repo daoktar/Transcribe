@@ -233,7 +233,7 @@ gitleaks detect --source .
 | Date | Auditor | Findings | Status |
 |------|---------|----------|--------|
 | 2026-03-26 | Claude Code | Initial comprehensive audit — 17 issues found and fixed (PR #13) | Resolved |
-| 2026-10-15 | Claude Code | Diarization broken on fresh installs (pyannote 3.x vs torchaudio/huggingface_hub) → pyannote 4 with telemetry off; lightning PYSEC-2026-3624 fixed upstream (2.6.6); DNS-rebinding Host check; transcript path collisions and upload buffering in `web.py` | Resolved (bundle verification pending) |
+| 2026-10-15 | Claude Code | Diarization broken on fresh installs (pyannote 3.x vs torchaudio/huggingface_hub) → pyannote 4 with telemetry off; lightning PYSEC-2026-3624 fixed upstream (2.6.6), plus its unfloored `pytorch-lightning` mirror (PYSEC-2026-3967, same 2.6.6 fix); DNS-rebinding Host check; transcript path collisions and upload buffering in `web.py` | Resolved (bundle verification pending) |
 | | | | |
 
 ---
