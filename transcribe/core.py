@@ -1,8 +1,10 @@
 import collections
 import gc
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
 import time
 import traceback
 from collections.abc import Callable
@@ -10,7 +12,9 @@ from pathlib import Path
 
 import numpy as np
 import webrtcvad
+from pywhispercpp.constants import MODELS_DIR
 from pywhispercpp.model import Model
+from pywhispercpp.utils import download_model
 
 from transcribe import qwen_engine
 from transcribe.paths import get_ffmpeg_path, get_ffprobe_path
@@ -54,16 +58,111 @@ def _get_media_duration(file_path: str) -> float | None:
         return None
 
 
-def _detect_language(model: Model, media_path: str) -> tuple[str, str | None]:
-    """Detect the spoken language of a media file.
-
-    Returns (language_code, error_message). error_message is None on success.
-    """
+def _detect_language(model: Model, pcm: np.ndarray) -> str:
+    """Spoken language of 16 kHz audio, or "" (whisper.cpp's own auto-detect) on failure."""
     try:
-        (lang, _prob), _all_probs = model.auto_detect_language(str(media_path))
-        return lang, None
-    except Exception as exc:
-        return "unknown", f"Language detection failed: {type(exc).__name__}: {exc}"
+        (lang, _prob), _all_probs = model.auto_detect_language(pcm)
+        return lang
+    except Exception:
+        logger.warning("Language detection failed; leaving it to whisper.cpp", exc_info=True)
+        return ""
+
+
+# Whisper's language ID needs a few seconds of speech: «Ок, го.» (1 s) scores p=0.70,
+# while every 2 s+ utterance of the RU/EN test clips scores 0.99+.
+_MIN_LANGUAGE_ID_SECONDS = 2.0
+
+# Screens a chunk's regions for a language switch before the main model identifies them one by
+# one: ~12 ms a region instead of ~0.3 s on large-v3. On 69 RU/EN test chunks it flagged every
+# chunk large-v3 cuts. base is worse: it hears 6 s of Russian as Ukrainian (p=0.95).
+_SCREEN_MODEL = "tiny"
+# ponytail: exact size of whisper.cpp's ggml-tiny.bin (sha1 bd577a11...). If upstream ever
+# republishes it, every auto-language run downloads and rejects it (screen off) until updated.
+_SCREEN_MODEL_BYTES = 77_691_713
+
+
+def _load_screen_model() -> Model | None:
+    """whisper tiny for ``_language_windows``, or None: the main model then identifies every region."""
+    path = Path(MODELS_DIR) / f"ggml-{_SCREEN_MODEL}.bin"
+    try:
+        # download_model writes in place and never checks the HTTP status, so a download cut short
+        # (Ctrl-C, quitting the app) or a saved error page would sit at the model path. whisper.cpp
+        # "loads" either and segfaults on first use, which no except can catch. So download beside
+        # it and move only a complete file into place, atomically: a job still writing the path in
+        # place (--model tiny) then opens the complete file, and nothing is ever deleted under it.
+        # ponytail: a download killed outright (SIGKILL) leaves a stray tmp* dir in the models dir.
+        if not path.is_file() or path.stat().st_size != _SCREEN_MODEL_BYTES:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
+                part = Path(download_model(_SCREEN_MODEL, download_dir=tmp))  # 78 MB; raises offline
+                size = part.stat().st_size
+                if size != _SCREEN_MODEL_BYTES:
+                    raise ValueError(f"downloaded {part.name} is {size} bytes, not {_SCREEN_MODEL_BYTES}")
+                os.replace(part, path)
+        return Model(str(path))
+    except Exception:
+        logger.warning("Language screen model unavailable; identifying every region with the "
+                       "main model", exc_info=True)
+        return None
+
+
+def _language_windows(
+    model: Model,
+    audio: np.ndarray,
+    chunk_start: float,
+    chunk_end: float,
+    raw_regions: list[tuple[float, float]],
+    screen: Model | None = None,
+) -> list[tuple[float, float, str]]:
+    """Cut a chunk where the spoken language switches: ``[(start, end, language), ...]``.
+
+    whisper.cpp decodes one language per ``transcribe()`` call, so in a RU, EN, RU chunk it
+    skips or translates the English. When the chunk has two or more VAD regions long enough
+    to identify, each gets its own language ID and the chunk is cut in the pause between
+    regions of different languages. Shorter regions are too unreliable to split on and join
+    the language before them. Otherwise the whole chunk is identified at once, which is
+    exactly the detection whisper.cpp would run itself.
+
+    A ``screen`` model hears those regions first: when it hears one language in all of them
+    and the whole-chunk ID agrees, that is the chunk's language, so the main model's
+    per-region passes are only paid where the language may switch. The main model still
+    decides every window.
+    """
+    def detect(start: float, end: float, by: Model = model) -> str:
+        return _detect_language(by, audio[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)])
+
+    regions = [(max(s, chunk_start), min(e, chunk_end))
+               for s, e in raw_regions if s < chunk_end and e > chunk_start]
+    identifiable = [e - s >= _MIN_LANGUAGE_ID_SECONDS for s, e in regions]
+    if sum(identifiable) < 2:
+        return [(chunk_start, chunk_end, detect(chunk_start, chunk_end))]
+
+    # ponytail: tiny hears noisy Russian as uk/bg/pt (3 of 14 pure-RU chunks at 12 dB SNR), and
+    # those chunks still pay one main-model pass per region. A gate on the chunk-level p of the
+    # second language was no better: its scale moves 10-100x between clean and noisy audio.
+    if screen is not None:
+        heard = {detect(s, e, screen) for (s, e), ok in zip(regions, identifiable) if ok}
+        if len(heard) == 1 and "" not in heard:  # "" = the screen failed
+            # Alone, the whole-chunk ID leans Russian whenever any is spoken (14 of 18 English
+            # test chunks with one Russian utterance), so it stands only if the screen agrees.
+            whole = detect(chunk_start, chunk_end)
+            if heard == {whole}:
+                return [(chunk_start, chunk_end, whole)]
+
+    langs = [detect(s, e) if ok else "" for (s, e), ok in zip(regions, identifiable)]
+    prev = next((lang for lang in langs if lang), "")  # leading short regions join the first one
+    for i, lang in enumerate(langs):
+        prev = lang or prev
+        langs[i] = prev
+
+    windows, start = [], chunk_start
+    for i in range(1, len(regions)):
+        if langs[i] != langs[i - 1]:
+            cut = (regions[i - 1][1] + regions[i][0]) / 2  # middle of the pause
+            windows.append((start, cut, langs[i - 1]))
+            start = cut
+    windows.append((start, chunk_end, langs[-1]))
+    return windows
 
 
 def _deduplicate_segments(segments: list[dict], max_repeats: int = 2) -> list[dict]:
@@ -331,122 +430,125 @@ _TRANSCRIBE_START_FRAC = 0.12
 
 def _transcribe_whisper_regions(
     model_size: str,
-    media_path: str,
     audio_pcm: np.ndarray,
     speech_regions: list[tuple[float, float]],
+    raw_regions: list[tuple[float, float]],
     language: str | None,
     diarize: bool,
     report: Callable[[float, str], None],
 ) -> tuple[list[dict], str]:
     """Transcribe VAD speech regions with whisper.cpp (the default engine).
 
-    Loads the model, detects the language if needed, then transcribes each region,
-    streaming per-segment progress. Returns ``(segments, detected_language)``.
+    Loads the model, then transcribes each region, streaming per-segment progress. Without a
+    ``language``, each region is first cut where the spoken language switches
+    (``_language_windows``, screened by whisper tiny) and the reported language is the one
+    spoken longest.
+    Returns ``(segments, detected_language)``.
     """
     # --- Load model (Metal GPU acceleration is automatic on Apple Silicon) ---
     report(_TRANSCRIBE_START_FRAC, f"Loading model '{model_size}'...")
     t0 = time.monotonic()
     model = Model(model_size, print_realtime=False, print_progress=False)
     report(_TRANSCRIBE_START_FRAC, f"Model loaded in {_format_eta(time.monotonic() - t0)}.")
-
-    # --- Detect language if not specified (on original file) ---
-    if language is None:
-        report(_TRANSCRIBE_START_FRAC, "Detecting language...")
-        t0 = time.monotonic()
-        detected_language, lang_error = _detect_language(model, media_path)
-        detect_time = time.monotonic() - t0
-        if lang_error:
-            report(_TRANSCRIBE_START_FRAC,
-                   f"Language: unknown (detection failed, {_format_eta(detect_time)}). Transcribing...")
-        else:
-            report(_TRANSCRIBE_START_FRAC,
-                   f"Language: {detected_language} (detected in {_format_eta(detect_time)}). Transcribing...")
-    else:
-        detected_language = language
-        report(_TRANSCRIBE_START_FRAC, f"Language: {language}. Transcribing...")
+    screen = _load_screen_model() if not language and model_size != _SCREEN_MODEL else None
+    report(_TRANSCRIBE_START_FRAC, f"Language: {language or 'auto-detect'}. Transcribing...")
 
     transcribe_start = time.monotonic()
     all_segments: list[dict] = []
     total_speech_duration = sum(end - start for start, end in speech_regions)
     cumulative_speech = 0.0
+    language_seconds: collections.Counter[str] = collections.Counter()
 
     transcribe_kwargs = {
         # --- Anti-hallucination / anti-repetition parameters ---
         "no_context": True,
+        # no_context only resets between calls. Inside a chunk, each re-seeked 30 s window
+        # (max_tokens forces one roughly every 15 s of Russian) was still conditioned on the
+        # previous window's text, and after a language switch it skipped whole utterances.
+        "n_max_text_ctx": 0,
         "no_speech_thold": 0.3,
         "entropy_thold": 2.4,
         "max_tokens": 100,
         "suppress_blank": True,
     }
-    if language is not None:
-        transcribe_kwargs["language"] = language
 
     transcribe_range = 0.73 if diarize else 0.88
 
     for chunk_idx, (chunk_start, chunk_end) in enumerate(speech_regions):
-        start_sample = int(chunk_start * SAMPLE_RATE)
-        end_sample = int(chunk_end * SAMPLE_RATE)
-        chunk_audio = audio_pcm[start_sample:end_sample]
-
-        chunk_segments: list[dict] = []
-        chunk_duration = chunk_end - chunk_start
-
-        def _on_new_segment(
-            segment,
-            _offset=chunk_start,
-            _chunk_dur=chunk_duration,
-            _chunk_idx=chunk_idx,
-        ):
-            nonlocal cumulative_speech
-            try:
-                # pywhispercpp timestamps are in centiseconds (10ms units)
-                seg_start = segment.t0 / 100.0 + _offset
-                seg_end = segment.t1 / 100.0 + _offset
-                seg_text = segment.text.strip()
-
-                if not seg_text or seg_end <= seg_start:
-                    return
-
-                chunk_segments.append({
-                    "start": round(seg_start, 3),
-                    "end": round(seg_end, 3),
-                    "text": seg_text,
-                })
-
-                elapsed = time.monotonic() - transcribe_start
-                if total_speech_duration > 0:
-                    chunk_progress = min(
-                        (segment.t1 / 100.0) / _chunk_dur, 1.0
-                    ) if _chunk_dur > 0 else 1.0
-                    current_speech = cumulative_speech + _chunk_dur * chunk_progress
-                    fraction = min(current_speech / total_speech_duration, 0.99)
-                    scaled = _TRANSCRIBE_START_FRAC + fraction * transcribe_range
-                    if elapsed > 0.5 and fraction > 0.01:
-                        eta_seconds = elapsed / fraction * (1.0 - fraction)
-                        report(
-                            scaled,
-                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}"
-                            f"... {fraction:.0%} — ~{_format_eta(eta_seconds)} remaining",
-                        )
-                    else:
-                        report(
-                            scaled,
-                            f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}...",
-                        )
-            except Exception:
-                # Never let a progress reporting error abort the transcription
-                pass
-
-        model.transcribe(
-            chunk_audio,
-            new_segment_callback=_on_new_segment,
-            **transcribe_kwargs,
+        windows = (
+            [(chunk_start, chunk_end, language)] if language
+            else _language_windows(model, audio_pcm, chunk_start, chunk_end, raw_regions, screen)
         )
+        chunk_segments: list[dict] = []
+
+        for win_start, win_end, win_language in windows:
+            win_audio = audio_pcm[int(win_start * SAMPLE_RATE):int(win_end * SAMPLE_RATE)]
+            win_duration = win_end - win_start
+
+            def _on_new_segment(
+                segment,
+                _offset=win_start,
+                _win_dur=win_duration,
+                _chunk_idx=chunk_idx,
+            ):
+                nonlocal cumulative_speech
+                try:
+                    # pywhispercpp timestamps are in centiseconds (10ms units)
+                    seg_start = segment.t0 / 100.0 + _offset
+                    seg_end = segment.t1 / 100.0 + _offset
+                    seg_text = segment.text.strip()
+
+                    if not seg_text or seg_end <= seg_start:
+                        return
+
+                    chunk_segments.append({
+                        "start": round(seg_start, 3),
+                        "end": round(seg_end, 3),
+                        "text": seg_text,
+                    })
+
+                    elapsed = time.monotonic() - transcribe_start
+                    if total_speech_duration > 0:
+                        win_progress = min(
+                            (segment.t1 / 100.0) / _win_dur, 1.0
+                        ) if _win_dur > 0 else 1.0
+                        current_speech = cumulative_speech + _win_dur * win_progress
+                        fraction = min(current_speech / total_speech_duration, 0.99)
+                        scaled = _TRANSCRIBE_START_FRAC + fraction * transcribe_range
+                        if elapsed > 0.5 and fraction > 0.01:
+                            eta_seconds = elapsed / fraction * (1.0 - fraction)
+                            report(
+                                scaled,
+                                f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}"
+                                f"... {fraction:.0%} — ~{_format_eta(eta_seconds)} remaining",
+                            )
+                        else:
+                            report(
+                                scaled,
+                                f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}...",
+                            )
+                except Exception:
+                    # Never let a progress reporting error abort the transcription
+                    pass
+
+            model.transcribe(
+                win_audio,
+                new_segment_callback=_on_new_segment,
+                # Always pass a language: whisper.cpp's default is "en", which translates other
+                # speech. "" is its own auto-detect, the fallback when detection failed ("auto"
+                # works too, but pywhispercpp logs "unknown language" for it on every call).
+                language=win_language,
+                **transcribe_kwargs,
+            )
+            language_seconds[win_language] += win_duration
+            cumulative_speech += win_duration
 
         all_segments.extend(chunk_segments)
-        cumulative_speech += chunk_duration
 
-    return all_segments, detected_language
+    if not language:
+        del language_seconds[""]
+        language = max(language_seconds, key=language_seconds.get, default="unknown")
+    return all_segments, language
 
 
 def _transcribe_qwen_regions(
@@ -625,7 +727,7 @@ def transcribe_media(
     else:
         try:
             all_segments, detected_language = _transcribe_whisper_regions(
-                model_size, str(media_path), audio_pcm, speech_regions, language, diarize, _report,
+                model_size, audio_pcm, speech_regions, raw_regions, language, diarize, _report,
             )
         except MemoryError:
             # Never "recover" from memory exhaustion by loading an even larger model.
