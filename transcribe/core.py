@@ -89,6 +89,20 @@ _SCREEN_MODEL = "tiny"
 # ponytail: exact size of whisper.cpp's ggml-tiny.bin (sha1 bd577a11...). If upstream ever
 # republishes it, every auto-language run downloads and rejects it (screen off) until updated.
 _SCREEN_MODEL_BYTES = 77_691_713
+_SCREEN_DOWNLOAD_PREFIX = "ggml-tiny-download-"
+
+
+def _remove_abandoned_downloads(models_dir: Path) -> None:
+    """Temp dirs of screen downloads killed outright (SIGKILL, quitting the app mid-download).
+
+    Only those nothing has written to for an hour, so a slow but live download is never touched.
+    """
+    for tmp in models_dir.glob(f"{_SCREEN_DOWNLOAD_PREFIX}*"):
+        try:
+            if time.time() - max(p.stat().st_mtime for p in [tmp, *tmp.iterdir()]) > 3600:
+                shutil.rmtree(tmp)
+        except OSError:
+            pass  # gone meanwhile (its download finished), or not ours to delete
 
 
 def _load_screen_model() -> Model | None:
@@ -98,18 +112,21 @@ def _load_screen_model() -> Model | None:
         # download_model writes in place and never checks the HTTP status, so a download cut short
         # (Ctrl-C, quitting the app) or a saved error page would sit at the model path. whisper.cpp
         # "loads" either and segfaults on first use, which no except can catch. So download beside
-        # it and move only a complete file into place, atomically: a job still writing the path in
-        # place (--model tiny) then opens the complete file, and nothing is ever deleted under it.
-        # ponytail: a download killed outright (SIGKILL) leaves a stray tmp* dir in the models dir.
-        if not path.is_file() or path.stat().st_size != _SCREEN_MODEL_BYTES:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
-                part = Path(download_model(_SCREEN_MODEL, download_dir=tmp))  # 78 MB; raises offline
-                size = part.stat().st_size
-                if size != _SCREEN_MODEL_BYTES:
-                    raise ValueError(f"downloaded {part.name} is {size} bytes, not {_SCREEN_MODEL_BYTES}")
-                os.replace(part, path)
-        return Model(str(path))
+        # it, load the private copy, and only then move it into place, atomically. Opening the
+        # shared path after our download would race a --model tiny job whose in-place download
+        # started before ours finished: its open(path, "wb") truncates the file under our load.
+        _remove_abandoned_downloads(path.parent)
+        if path.is_file() and path.stat().st_size == _SCREEN_MODEL_BYTES:
+            return Model(str(path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=_SCREEN_DOWNLOAD_PREFIX, dir=path.parent) as tmp:
+            part = Path(download_model(_SCREEN_MODEL, download_dir=tmp))  # 78 MB; raises offline
+            size = part.stat().st_size
+            if size != _SCREEN_MODEL_BYTES:
+                raise ValueError(f"downloaded {part.name} is {size} bytes, not {_SCREEN_MODEL_BYTES}")
+            model = Model(str(part))  # reads the whole file now; the rename below can't touch it
+            os.replace(part, path)
+        return model
     except Exception:
         logger.warning("Language screen model unavailable; identifying every region with the "
                        "main model", exc_info=True)
