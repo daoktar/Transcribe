@@ -1,4 +1,6 @@
+import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -255,16 +257,38 @@ class TestLoadScreenModel:
         model_cls.assert_called_once_with(str(models_dir / "ggml-tiny.bin"))
 
     def test_downloads_beside_the_model_path_and_moves_it_in_whole(self, models_dir):
-        dirs = []
+        dirs, loads = [], []
+        path = models_dir / "ggml-tiny.bin"
         with (
             patch("transcribe.core.download_model", side_effect=_download_writing(COMPLETE_MODEL, dirs)),
-            patch("transcribe.core.Model") as model_cls,
+            patch("transcribe.core.Model", side_effect=lambda p: loads.append((p, path.exists())) or "model"),
         ):
-            assert _load_screen_model() is model_cls.return_value
+            assert _load_screen_model() == "model"
         assert dirs[0].parent == models_dir  # same filesystem, so the move is atomic
-        assert list(models_dir.iterdir()) == [models_dir / "ggml-tiny.bin"]  # temp dir gone
-        assert (models_dir / "ggml-tiny.bin").read_bytes() == COMPLETE_MODEL
-        model_cls.assert_called_once_with(str(models_dir / "ggml-tiny.bin"))
+        assert dirs[0].name.startswith("ggml-tiny-download-")  # so a killed one is found and removed
+        assert list(models_dir.iterdir()) == [path]  # temp dir gone
+        assert path.read_bytes() == COMPLETE_MODEL
+        # Loaded from the private copy before it is moved: a --model tiny job may truncate the
+        # shared path at any moment (its in-place download opens it with "wb").
+        assert loads == [(str(dirs[0] / "ggml-tiny.bin"), False)]
+
+    def test_removes_only_downloads_abandoned_for_an_hour(self, models_dir):
+        (models_dir / "ggml-tiny.bin").write_bytes(COMPLETE_MODEL)
+        dirs = {}
+        for name in ("ggml-tiny-download-killed", "ggml-tiny-download-live", "tmp-not-ours"):
+            (models_dir / name).mkdir()
+            (models_dir / name / "ggml-tiny.bin").write_bytes(COMPLETE_MODEL[:12])
+            dirs[name] = models_dir / name
+        hours_ago = time.time() - 2 * 3600
+        for d in (dirs["ggml-tiny-download-killed"], dirs["tmp-not-ours"]):
+            os.utime(d / "ggml-tiny.bin", (hours_ago, hours_ago))
+            os.utime(d, (hours_ago, hours_ago))
+        os.utime(dirs["ggml-tiny-download-live"], (hours_ago, hours_ago))  # its file is still being written
+        with patch("transcribe.core.Model"):
+            _load_screen_model()
+        assert sorted(p.name for p in models_dir.iterdir()) == [
+            "ggml-tiny-download-live", "ggml-tiny.bin", "tmp-not-ours",
+        ]
 
     def test_replaces_a_download_cut_short(self, models_dir):
         """A truncated file keeps the ggml magic; whisper.cpp "loads" it and segfaults on use."""
