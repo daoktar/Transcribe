@@ -3,7 +3,7 @@
 
 import os
 import shutil
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 # Bundle version — kept in sync with scripts/build_macos.sh via the VERSION env var.
 _VERSION = os.environ.get("VERSION", "1.5.0")
@@ -49,6 +49,15 @@ if mlx_hiddenimports:
         "mlx_audio.stt.models.qwen3_asr",
         "mlx_audio.stt.models.qwen3_forced_aligner",
     ]
+
+# transformers reads these versions via importlib.metadata at import time
+# (e.g. audio_utils -> version("torchcodec")); PyInstaller copies no metadata by default.
+for _meta_pkg in ("torchcodec", "torchaudio", "torch", "transformers", "tqdm", "tokenizers",
+                  "huggingface_hub", "safetensors", "numpy", "packaging", "regex", "pyyaml"):
+    try:
+        mlx_datas += copy_metadata(_meta_pkg)
+    except Exception as _meta_err:  # noqa: BLE001 — build-time best effort
+        print(f"[spec] metadata for '{_meta_pkg}' not copied ({_meta_err})")
 
 # ---------------------------------------------------------------------------
 # Locate bundled ffmpeg/ffprobe (Homebrew or env override)
@@ -109,23 +118,17 @@ a = Analysis(
         # ---------------------------------------------------------------
         "torch.cuda",
         "torch.distributed",
-        "torch.testing",
+        # NOT torch.testing: the transformers/torch stack Qwen3-ASR loads imports it at runtime
         "torch.utils.tensorboard",
         "torch.utils.benchmark",
         "torch.onnx",
         "torch.jit",
         "caffe2",
         # ---------------------------------------------------------------
-        # Pyannote transitive deps not needed at runtime (~163MB savings)
-        # Only pyannote.audio is used; pyannote.metrics/database pull in
-        # scipy, sklearn, pandas, matplotlib — none used by our code.
+        # pyannote.audio 4 needs pyannote.metrics/database, scipy, sklearn and pandas at
+        # runtime (the community-1 pipeline fails to load without them), so only the
+        # plotting/ONNX extras stay excluded.
         # ---------------------------------------------------------------
-        "pyannote.metrics",
-        "pyannote.database",
-        "scipy",
-        "sklearn",
-        "scikit-learn",
-        "pandas",
         "matplotlib",
         "PIL",
         "Pillow",
@@ -138,7 +141,7 @@ a = Analysis(
         # ---------------------------------------------------------------
         "gradio",
         "gradio_client",
-        "sympy",
+        # NOT sympy: torch imports it when transformers loads (Qwen3-ASR path)
         "IPython",
         "notebook",
         "jupyterlab",
@@ -147,11 +150,10 @@ a = Analysis(
         # ---------------------------------------------------------------
         "pytest",
         "_pytest",
-        "unittest",
         "doctest",
-        "setuptools",
+        # NOT setuptools / distutils: scipy pulls distutils in, and excluding it clashes
+        # with PyInstaller's distutils alias hook ("already imported as ExcludedModule")
         "pip",
-        "distutils",
         "ensurepip",
         # ---------------------------------------------------------------
         # Unused stdlib
@@ -166,14 +168,13 @@ a = Analysis(
         "poplib",
         "smtplib",
         "nntplib",
-        "pydoc",
         "pydoc_data",
+        # NOT unittest / pydoc / numpy.testing / numpy.f2py: torch.testing (imported by the Qwen3-ASR
+        # transformers path) needs them at runtime
         # ---------------------------------------------------------------
         # Unused numpy subpackages
         # ---------------------------------------------------------------
-        "numpy.testing",
         "numpy.tests",
-        "numpy.f2py",
         "numpy.distutils",
     ],
     noarchive=False,

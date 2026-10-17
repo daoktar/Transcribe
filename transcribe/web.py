@@ -350,6 +350,9 @@ def _run_transcription(job: Job) -> None:
             job.txt_paths[i] = str(_save_transcript(job, i, result))
 
         except Exception as exc:
+            # The UI only gets the sanitized message; keep the full chain in the log
+            # (e.g. a module missing from the packaged app hides behind a lazy-import error).
+            logger.exception("Transcription failed for file %d", i)
             with job.lock:
                 job.statuses[i] = "error"
                 job.errors[i] = _sanitize_error(str(exc))
@@ -412,6 +415,7 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
         })
 
     except Exception as exc:
+        logger.exception("Diarization retry failed for file %d", file_index)
         sanitized = _sanitize_error(str(exc))
         with job.lock:
             job.statuses[file_index] = "error"
