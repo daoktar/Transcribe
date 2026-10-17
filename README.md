@@ -194,9 +194,9 @@ brew install create-dmg   # optional, for .dmg creation
 bash scripts/build_macos.sh
 ```
 
-The build excludes unused pyannote transitive dependencies (scipy, sklearn, pandas, matplotlib, onnxruntime) and torch subpackages (CUDA, distributed, JIT, ONNX) to minimize bundle size. A post-build cleanup step removes test data, metadata, and type stubs.
+The build excludes unused extras (matplotlib, PIL, onnxruntime, gRPC) and torch subpackages (CUDA, distributed, JIT, ONNX) to minimize bundle size; scipy, sklearn and pandas stay because pyannote.audio 4 needs them, and package metadata (`*.dist-info`) stays because transformers checks dependency versions at import. A post-build cleanup step removes test data and type stubs.
 
-The spec also collects the MLX stack (`mlx`, `mlx_audio`, `mlx_lm`) plus the dynamically-imported `mlx_audio.stt.models.qwen3_asr` / `qwen3_forced_aligner` modules so the Qwen3-ASR engine and fallback work in the packaged app (they are invisible to PyInstaller's static analysis otherwise). After any dependency change, rebuild and launch the `.app` once with `engine=qwen` **and** with a forced whisper failure to confirm the fallback path — a green `python -m transcribe.app` run does not exercise the bundle.
+The spec also collects the MLX stack (`mlx`, `mlx_audio`, `mlx_lm`) plus the dynamically-imported `mlx_audio.stt.models.qwen3_asr` / `qwen3_forced_aligner` modules so the Qwen3-ASR engine and fallback work in the packaged app (they are invisible to PyInstaller's static analysis otherwise). After any dependency change, rebuild and run one transcription through the built `.app` with the default engine (qwen), with **diarization on**, and with `engine=whisper` — a green `python -m transcribe.app` or pytest run does not exercise the bundle (the 1.5.0 build only worked after this caught missing modules).
 
 To override the bundled ffmpeg: `FFMPEG_BIN=/path/to/ffmpeg FFPROBE_BIN=/path/to/ffprobe bash scripts/build_macos.sh`
 
