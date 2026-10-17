@@ -74,6 +74,11 @@ def is_available() -> bool:
         return False
 
 
+def default_engine() -> str:
+    """Engine used when the caller does not pick one: Qwen3-ASR where MLX runs, else whisper."""
+    return "qwen" if is_available() else "whisper"
+
+
 def is_model_cached(model_path: str = DEFAULT_QWEN_MODEL) -> bool:
     """Return True if the model can load from the local HF cache.
 

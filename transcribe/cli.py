@@ -4,6 +4,7 @@ import sys
 import time
 from pathlib import Path
 
+from transcribe import qwen_engine
 from transcribe.core import save_txt, transcribe_media
 
 
@@ -24,11 +25,11 @@ def main():
     )
     parser.add_argument(
         "--engine",
-        default="whisper",
+        default=None,
         choices=["whisper", "qwen"],
-        help="Transcription engine: 'whisper' (default, whisper.cpp) or 'qwen' "
-             "(Qwen3-ASR-1.7B via MLX, Apple Silicon). Qwen is also used automatically "
-             "as a fallback if the whisper engine fails.",
+        help="Transcription engine: 'qwen' (default on Apple Silicon: Qwen3-ASR-1.7B via MLX) "
+             "or 'whisper' (whisper.cpp; the default where MLX is unavailable). Qwen is also "
+             "used automatically as a fallback if the whisper engine fails.",
     )
     parser.add_argument(
         "--language",
@@ -53,6 +54,7 @@ def main():
         help="Force a specific number of speakers (default: auto-detect)",
     )
     args = parser.parse_args()
+    args.engine = args.engine or qwen_engine.default_engine()
 
     # Token is read from environment only — never from CLI args (visible in
     # process listings and shell history).
