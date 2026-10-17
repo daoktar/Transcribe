@@ -189,3 +189,20 @@ class TestSaveUpload:
                 asyncio.run(web._save_upload(upload, dest))
         assert excinfo.value.status_code == 413
         assert not dest.exists()
+
+
+class TestDefaultEngine:
+    @pytest.mark.parametrize("available, expected", [(True, "qwen"), (False, "whisper")])
+    def test_config_reports_default_engine(self, available, expected):
+        import json
+        with patch("transcribe.qwen_engine.is_available", return_value=available):
+            status, _, body = _request(web.create_app(), "/api/config")
+        assert status == 200
+        assert json.loads(body)["default_engine"] == expected
+
+    @pytest.mark.parametrize("engine, expected", [(None, "qwen"), ("bogus", "qwen"), ("whisper", "whisper")])
+    def test_request_engine_resolves_to_default(self, engine, expected):
+        with patch("transcribe.qwen_engine.is_available", return_value=True):
+            body = web.TranscribeRequest(**({} if engine is None else {"engine": engine}))
+            resolved = body.engine if body.engine in web.ENGINE_CHOICES else web.qwen_engine.default_engine()
+        assert resolved == expected

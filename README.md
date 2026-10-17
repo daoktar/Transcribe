@@ -1,6 +1,6 @@
 # Media Transcriber
 
-Local video & audio transcription powered by [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Runs entirely on your machine — no cloud APIs, no data leaves your device.
+Local video & audio transcription powered by [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) and [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Runs entirely on your machine — no cloud APIs, no data leaves your device.
 
 ## Features
 
@@ -9,12 +9,41 @@ Local video & audio transcription powered by [whisper.cpp](https://github.com/gg
 - **Speaker diarization** — identify and label speakers via pyannote.audio (optional, requires HuggingFace token)
 - **Multiple interfaces** — CLI, standalone web UI, and native macOS app (dark navy theme with Upload/Process/Review tabs) with menu bar tray
 - **5 model sizes** — tiny, base, small, medium, large-v3
-- **Qwen3-ASR fallback engine** — optional Qwen3-ASR-1.7B (via MLX, Apple Silicon) with a
-  domain context prompt; stronger on Russian and Russian-English code-switching, and used
-  automatically if the whisper engine fails
+- **Two engines** — Qwen3-ASR-1.7B (default on Apple Silicon, via MLX) with a domain context
+  prompt, and whisper.cpp as the alternative (and the default where MLX is unavailable)
 - **Auto language detection** — or set manually with ISO 639-1 codes
 - **Standalone macOS app** — PyInstaller packaging with .dmg distribution
 - **Apple Silicon acceleration** — automatic Metal GPU via whisper.cpp (and MLX for Qwen3-ASR)
+
+## Engines
+
+**Qwen3-ASR-1.7B is the default engine** on Apple Silicon (CLI, web UI and the macOS app).
+**whisper.cpp large-v3 is the alternative**: pick it with `--engine whisper` or the **ENGINE**
+dropdown. Where MLX is unavailable (Intel Macs, Linux) whisper is the default, and if whisper
+fails the app falls back to Qwen automatically.
+
+<details>
+<summary>Model comparison on real recordings — 2026-10-17</summary>
+
+Local A/B on ~110 min of our own audio (two Russian work meetings, Russian/English street
+interviews and two language lessons), all engines on the same VAD chunks with `--language ru`.
+There was no human reference transcript, so the numbers are proxies plus a manual read of the
+passages where the engines disagreed most.
+
+| | Qwen3-ASR 1.7B | whisper large-v3 | whisper large-v3-turbo + prompt | Breeze-ASR-25 |
+|---|---|---|---|---|
+| Decoder loops (chunks) | **0** | **0** | 3 | ~200 |
+| Speed (RTF, M4 Max) | 0.10 | 0.08 | **0.03** | 0.12–0.14 |
+| English speech kept in English | mostly | no (translated) | yes | yes |
+| Main problem | some chunks lose punctuation; occasionally translates English | translates English into Russian | drops whole chunks, invents “subtitles by …” captions | loops, glues sentences |
+
+- **Qwen3-ASR** gave the most complete text with no loops or glued sentences, so it became the default.
+- **whisper large-v3-turbo** is 3–4× faster but dropped a 30-second chunk and looped on a meeting.
+- **Breeze-ASR-25** (Whisper fine-tune for English IT terms) is unusable for Russian.
+- **Diarization:** NVIDIA Nemotron-3-Diarization matched pyannote on small calls (same 3 speakers)
+  and was ~30× faster, but it caps at 8 speakers (pyannote found 13 on a large demo). pyannote stays.
+
+</details>
 
 ## Quick Start
 
@@ -35,19 +64,30 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Or use the bundled scripts (also shipped in each release as `MediaTranscriber-<version>-cli-web.zip`):
+
+```bash
+scripts/setup.sh                      # create .venv and install requirements
+scripts/web.sh                        # web UI at http://127.0.0.1:7860
+scripts/transcribe.sh meeting.mp4 --language ru --speakers   # CLI, same flags as below
+```
+
 ## Usage
 
 ### CLI
 
 ```bash
-# Default (large-v3 model, auto language)
+# Default (Qwen3-ASR on Apple Silicon, auto language)
 python -m transcribe.cli video.mp4
 
-# Faster model, fixed language
-python -m transcribe.cli video.mp4 --model base --language en
+# whisper.cpp instead (large-v3 by default)
+python -m transcribe.cli video.mp4 --engine whisper
 
-# Qwen3-ASR-1.7B engine (Apple Silicon; better for Russian / RU-EN code-switching)
-python -m transcribe.cli meeting.mp4 --engine qwen --language ru
+# Faster whisper model, fixed language
+python -m transcribe.cli video.mp4 --engine whisper --model base --language en
+
+# Russian meeting with speakers (what we use day to day)
+python -m transcribe.cli meeting.mp4 --language ru --speakers
 
 # Custom output directory
 python -m transcribe.cli video.mp4 --output-dir ./outputs
@@ -108,12 +148,13 @@ Token security: never stored persistently (only SHA-256 hash cached for model re
 1. ffmpeg extracts 16 kHz mono audio
 2. WebRTC VAD detects speech regions, merges into ~30s chunks
 3. The selected engine transcribes only speech chunks:
-   - **whisper** (default) — whisper.cpp with anti-hallucination params
-   - **qwen** — Qwen3-ASR-1.7B via MLX with a domain context prompt
+   - **qwen** (default on Apple Silicon) — Qwen3-ASR-1.7B via MLX with a domain context prompt
+   - **whisper** — whisper.cpp with anti-hallucination params; without `--language` it identifies
+     the language per region and splits chunks at RU/EN switches
 4. Post-processing deduplicates repeated segments
 5. Optional: pyannote maps speakers to segments via majority-vote overlap
 
-## Qwen3-ASR Fallback Engine
+## Qwen3-ASR Engine
 
 [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) (Apache-2.0) runs locally on
 Apple Silicon via [MLX](https://github.com/ml-explore/mlx) — no PyTorch, no cloud. It is
@@ -121,8 +162,8 @@ stronger than whisper.cpp on Russian and, crucially, on **Russian-English code-s
 it accepts a free-text *context prompt* that biases recognition toward your domain vocabulary
 and keeps English technical terms in Latin script instead of transliterating them.
 
-- Select it in the web/native UI (**ASR ENGINE** dropdown), with `--engine qwen` (CLI), or
-  `engine="qwen"` (`transcribe_media`).
+- It is the **default engine** in the CLI, web UI and macOS app wherever MLX is available
+  (`transcribe_media` itself still defaults to `engine="whisper"` for API compatibility).
 - It is also used **automatically as a fallback** when the whisper engine fails
   (disable with `allow_qwen_fallback=False`).
 - The context prompt lives in an editable text file,
@@ -153,9 +194,9 @@ brew install create-dmg   # optional, for .dmg creation
 bash scripts/build_macos.sh
 ```
 
-The build excludes unused pyannote transitive dependencies (scipy, sklearn, pandas, matplotlib, onnxruntime) and torch subpackages (CUDA, distributed, JIT, ONNX) to minimize bundle size. A post-build cleanup step removes test data, metadata, and type stubs.
+The build excludes unused extras (matplotlib, PIL, onnxruntime, gRPC) and torch subpackages (CUDA, distributed, JIT, ONNX) to minimize bundle size; scipy, sklearn and pandas stay because pyannote.audio 4 needs them, and package metadata (`*.dist-info`) stays because transformers checks dependency versions at import. A post-build cleanup step removes test data and type stubs.
 
-The spec also collects the MLX stack (`mlx`, `mlx_audio`, `mlx_lm`) plus the dynamically-imported `mlx_audio.stt.models.qwen3_asr` / `qwen3_forced_aligner` modules so the Qwen3-ASR engine and fallback work in the packaged app (they are invisible to PyInstaller's static analysis otherwise). After any dependency change, rebuild and launch the `.app` once with `engine=qwen` **and** with a forced whisper failure to confirm the fallback path — a green `python -m transcribe.app` run does not exercise the bundle.
+The spec also collects the MLX stack (`mlx`, `mlx_audio`, `mlx_lm`) plus the dynamically-imported `mlx_audio.stt.models.qwen3_asr` / `qwen3_forced_aligner` modules so the Qwen3-ASR engine and fallback work in the packaged app (they are invisible to PyInstaller's static analysis otherwise). After any dependency change, rebuild and run one transcription through the built `.app` with the default engine (qwen), with **diarization on**, and with `engine=whisper` — a green `python -m transcribe.app` or pytest run does not exercise the bundle (the 1.5.0 build only worked after this caught missing modules).
 
 To override the bundled ffmpeg: `FFMPEG_BIN=/path/to/ffmpeg FFPROBE_BIN=/path/to/ffprobe bash scripts/build_macos.sh`
 

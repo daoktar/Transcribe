@@ -175,3 +175,26 @@ class TestCliArgParsing:
 
         captured = capsys.readouterr()
         assert "file not found" in captured.err.lower()
+
+
+class TestDefaultEngine:
+    @pytest.mark.parametrize("available, expected", [(True, "qwen"), (False, "whisper")])
+    def test_engine_defaults_to_qwen_where_mlx_runs(self, tmp_path, available, expected):
+        video = tmp_path / "video.mp4"
+        video.touch()
+        fake = {"text": "x", "segments": [{"start": 0.0, "end": 1.0, "text": "x"}], "language": "ru"}
+        with patch("sys.argv", ["cli", str(video)]), \
+             patch("transcribe.qwen_engine.is_available", return_value=available), \
+             patch("transcribe.cli.transcribe_media", return_value=fake) as tm:
+            main()
+        assert tm.call_args.kwargs["engine"] == expected
+
+    def test_explicit_engine_wins(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.touch()
+        fake = {"text": "x", "segments": [{"start": 0.0, "end": 1.0, "text": "x"}], "language": "ru"}
+        with patch("sys.argv", ["cli", str(video), "--engine", "whisper"]), \
+             patch("transcribe.qwen_engine.is_available", return_value=True), \
+             patch("transcribe.cli.transcribe_media", return_value=fake) as tm:
+            main()
+        assert tm.call_args.kwargs["engine"] == "whisper"

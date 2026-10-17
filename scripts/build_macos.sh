@@ -16,7 +16,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${VERSION:-1.4.1}"  # ponytail: env-overridable so a release bump is one env var, not a source edit
+VERSION="${VERSION:-1.5.0}"  # ponytail: env-overridable so a release bump is one env var, not a source edit
 APP_NAME="Media Transcriber"
 DMG_NAME="MediaTranscriber-${VERSION}-arm64"
 
@@ -91,19 +91,19 @@ BEFORE_SIZE=$(du -sm "dist/$APP_NAME.app" | cut -f1)
 # Remove test directories
 find "$APP_CONTENTS" -type d \( -name "tests" -o -name "test" -o -name "__pycache__" \) -exec rm -rf {} + 2>/dev/null || true
 
-# Remove package metadata
-find "$APP_CONTENTS" -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+# Keep *.dist-info: transformers checks its dependencies' versions via importlib.metadata
+# at import time, so deleting the metadata breaks the Qwen3-ASR engine in the bundle.
 
 # Remove type stubs and documentation
 find "$APP_CONTENTS" \( -name "*.pyi" -o -name "*.pyx" \) -delete 2>/dev/null || true
 
 # Remove leftover torch test data and benchmarks
-find "$APP_CONTENTS" -path "*/torch/testing/*" -exec rm -rf {} + 2>/dev/null || true
+# keep torch/testing: imported at runtime by the Qwen3-ASR (transformers) path
 find "$APP_CONTENTS" -path "*/torch/utils/benchmark/*" -exec rm -rf {} + 2>/dev/null || true
 find "$APP_CONTENTS" -path "*/caffe2/*" -exec rm -rf {} + 2>/dev/null || true
 
-# Remove any scipy/sklearn/pandas that survived exclude (transitive imports)
-for pkg in scipy sklearn pandas matplotlib PIL grpc onnxruntime hf_xet; do
+# Remove plotting/ONNX/gRPC extras that survived exclude (scipy/sklearn/pandas stay: pyannote 4 needs them)
+for pkg in matplotlib PIL grpc onnxruntime hf_xet; do
     find "$APP_CONTENTS" -type d -name "$pkg" -exec rm -rf {} + 2>/dev/null || true
 done
 

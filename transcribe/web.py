@@ -153,7 +153,7 @@ def _check_rate_limit(client_ip: str) -> None:
 
 class TranscribeRequest(BaseModel):
     model: str = "large-v3"
-    engine: str = "whisper"
+    engine: str | None = None  # None -> qwen_engine.default_engine()
     language: str | None = None
     diarize: bool = False
     hf_token: str | None = None
@@ -170,8 +170,8 @@ class TranscribeRequest(BaseModel):
 
     @field_validator("engine")
     @classmethod
-    def _validate_engine(cls, v: str) -> str:
-        return v if v in ENGINE_CHOICES else "whisper"
+    def _validate_engine(cls, v: str | None) -> str:
+        return v if v in ENGINE_CHOICES else qwen_engine.default_engine()
 
 
 class RetryDiarizeRequest(BaseModel):
@@ -334,7 +334,7 @@ def _run_transcription(job: Job) -> None:
             result = transcribe_media(
                 media_path=str(fpath),
                 model_size=job.settings.get("model", "large-v3"),
-                engine=job.settings.get("engine", "whisper"),
+                engine=job.settings.get("engine") or qwen_engine.default_engine(),
                 language=job.settings.get("language"),
                 progress_callback=_progress_cb,
                 diarize=job.settings.get("diarize", False),
@@ -350,6 +350,9 @@ def _run_transcription(job: Job) -> None:
             job.txt_paths[i] = str(_save_transcript(job, i, result))
 
         except Exception as exc:
+            # The UI only gets the sanitized message; keep the full chain in the log
+            # (e.g. a module missing from the packaged app hides behind a lazy-import error).
+            logger.exception("Transcription failed for file %d", i)
             with job.lock:
                 job.statuses[i] = "error"
                 job.errors[i] = _sanitize_error(str(exc))
@@ -412,6 +415,7 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
         })
 
     except Exception as exc:
+        logger.exception("Diarization retry failed for file %d", file_index)
         sanitized = _sanitize_error(str(exc))
         with job.lock:
             job.statuses[file_index] = "error"
@@ -487,6 +491,7 @@ def create_app() -> FastAPI:
             "model_choices": MODEL_CHOICES,
             "engine_choices": ENGINE_CHOICES,
             "qwen_available": qwen_engine.is_available(),
+            "default_engine": qwen_engine.default_engine(),
             "hf_token_set": bool(_get_env_hf_token()),
         })
 
@@ -608,7 +613,7 @@ def create_app() -> FastAPI:
             # Store settings — don't persist the raw HF token
             job.settings = {
                 "model": body.model if body.model in MODEL_CHOICES else "large-v3",
-                "engine": body.engine if body.engine in ENGINE_CHOICES else "whisper",
+                "engine": body.engine if body.engine in ENGINE_CHOICES else qwen_engine.default_engine(),
                 "language": language,
                 "diarize": body.diarize,
                 "num_speakers": body.num_speakers,

@@ -66,7 +66,8 @@ function applyConfig() {
   engine.textContent = '';
   for (const e of c.engine_choices) {
     const label = e === 'qwen' ? 'qwen3-asr' : 'whisper.cpp';
-    const opt = new Option(label, e, e === 'whisper', e === 'whisper');
+    const def = c.default_engine || 'whisper';
+    const opt = new Option(label, e, e === def, e === def);
     if (e === 'qwen' && !c.qwen_available) {
       opt.disabled = true;
       opt.text += ' — unavailable';
