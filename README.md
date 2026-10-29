@@ -9,17 +9,20 @@ Local video & audio transcription powered by [Qwen3-ASR](https://huggingface.co/
 - **Speaker diarization** — identify and label speakers via pyannote.audio (optional, requires HuggingFace token)
 - **Multiple interfaces** — CLI, standalone web UI, and native macOS app (dark navy theme with Upload/Process/Review tabs) with menu bar tray
 - **5 model sizes** — tiny, base, small, medium, large-v3
-- **Two engines** — Qwen3-ASR-1.7B (default on Apple Silicon, via MLX) with a domain context
-  prompt, and whisper.cpp as the alternative (and the default where MLX is unavailable)
+- **Two engines** — Qwen3-ASR-1.7B (default on Apple Silicon via MLX and on NVIDIA GPUs via CUDA)
+  with a domain context prompt, and whisper.cpp as the alternative (and the default elsewhere)
 - **Auto language detection** — or set manually with ISO 639-1 codes
 - **Standalone macOS app** — PyInstaller packaging with .dmg distribution
 - **Apple Silicon acceleration** — automatic Metal GPU via whisper.cpp (and MLX for Qwen3-ASR)
+- **NVIDIA GPU acceleration (Linux)** — `scripts/setup.sh` builds whisper.cpp with CUDA and
+  installs the CUDA backend of Qwen3-ASR; fits 4 GB cards (see [NVIDIA GPU](#nvidia-gpu-linux))
 
 ## Engines
 
-**Qwen3-ASR-1.7B is the default engine** on Apple Silicon (CLI, web UI and the macOS app).
+**Qwen3-ASR-1.7B is the default engine** on Apple Silicon and on Linux with an NVIDIA GPU set
+up by `scripts/setup.sh` (CLI, web UI and the macOS app).
 **whisper.cpp large-v3 is the alternative**: pick it with `--engine whisper` or the **ENGINE**
-dropdown. Where MLX is unavailable (Intel Macs, Linux) whisper is the default, and if whisper
+dropdown. Where neither MLX nor CUDA is available (Intel Macs, Linux without a GPU) whisper is the default, and if whisper
 fails the app falls back to Qwen automatically.
 
 <details>
@@ -148,7 +151,8 @@ Token security: never stored persistently (only SHA-256 hash cached for model re
 1. ffmpeg extracts 16 kHz mono audio
 2. WebRTC VAD detects speech regions, merges into ~30s chunks
 3. The selected engine transcribes only speech chunks:
-   - **qwen** (default on Apple Silicon) — Qwen3-ASR-1.7B via MLX with a domain context prompt
+   - **qwen** (default on Apple Silicon and NVIDIA GPUs) — Qwen3-ASR-1.7B via MLX or CUDA with a
+     domain context prompt
    - **whisper** — whisper.cpp with anti-hallucination params; without `--language` it identifies
      the language per region and splits chunks at RU/EN switches
 4. Post-processing deduplicates repeated segments
@@ -157,12 +161,13 @@ Token security: never stored persistently (only SHA-256 hash cached for model re
 ## Qwen3-ASR Engine
 
 [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) (Apache-2.0) runs locally on
-Apple Silicon via [MLX](https://github.com/ml-explore/mlx) — no PyTorch, no cloud. It is
+Apple Silicon via [MLX](https://github.com/ml-explore/mlx) (no PyTorch) or on an NVIDIA GPU via
+PyTorch/CUDA and the official [`qwen-asr`](https://pypi.org/project/qwen-asr/) package — no cloud. It is
 stronger than whisper.cpp on Russian and, crucially, on **Russian-English code-switching**:
 it accepts a free-text *context prompt* that biases recognition toward your domain vocabulary
 and keeps English technical terms in Latin script instead of transliterating them.
 
-- It is the **default engine** in the CLI, web UI and macOS app wherever MLX is available
+- It is the **default engine** in the CLI, web UI and macOS app wherever MLX or CUDA is available
   (`transcribe_media` itself still defaults to `engine="whisper"` for API compatibility).
 - It is also used **automatically as a fallback** when the whisper engine fails
   (disable with `allow_qwen_fallback=False`).
@@ -180,8 +185,42 @@ and keeps English technical terms in Latin script instead of transliterating the
 - Weights (`mlx-community/Qwen3-ASR-1.7B-bf16`, ~3.4 GB; aligner ~1.8 GB) download from Hugging
   Face on first use. bf16 is recommended: lower quantizations noticeably degrade Russian accuracy.
 
-Requires Apple Silicon; the MLX dependencies install automatically on `arm64` macOS via
-`requirements.txt`. On other platforms the app runs whisper-only.
+Requires Apple Silicon or an NVIDIA GPU. The MLX dependencies install automatically on `arm64`
+macOS via `requirements.txt`; the CUDA ones come from `scripts/setup.sh` (below). On other
+platforms the app runs whisper-only.
+
+## NVIDIA GPU (Linux)
+
+`scripts/setup.sh` detects an NVIDIA GPU (`nvidia-smi`) and then also:
+
+1. installs the cu126 build of PyTorch **before** `requirements.txt` — the default wheel targets
+   the newest CUDA and does not run on older drivers such as Debian 13's 550 (CUDA 12.4);
+   pick another build with `TORCH_CUDA` (e.g. `cu128`) and a mirror with `TORCH_INDEX_URL`;
+2. installs [`requirements-cuda.txt`](requirements-cuda.txt): `qwen-asr` and `bitsandbytes`;
+3. rebuilds pywhispercpp from source with CUDA (`scripts/build_whisper_cuda.sh`, ~15 min).
+
+It needs the CUDA compiler: `sudo apt install nvidia-cuda-toolkit`. A GPU newer than that
+compiler (RTX 50xx needs nvcc 12.8+, Debian 13 ships 12.4) is reported before the build starts,
+with the `CUDA_ARCH` override to fall back on. `TRANSCRIBE_CPU_ONLY=1`
+skips the GPU path.
+
+Small cards are handled automatically. On an 11-minute English video on a 4 GB RTX 3050 Laptop:
+
+| | Loaded as | VRAM | Time |
+|---|---|---|---|
+| whisper large-v3, CPU (i7-11370H) | f16 | — | 48 min |
+| whisper large-v3, CUDA | `large-v3-q5_0` (cards smaller than 6 GB) | 1.1 GB model | 55 s |
+| Qwen3-ASR-1.7B, CUDA | text decoder in 4-bit NF4 (cards up to 8 GB) | 2.5 GB, 3.3 GB with aligner | 94 s |
+
+The full bf16 Qwen checkpoint (4.7 GB, ~6.5 GB with the aligner) and f16 large-v3 (3.1 GB) do
+not fit in 4 GB; bf16 is used from 10 GB cards (9.5 GiB reported) up. 8-bit Qwen fits too but runs ~8×
+slower than NF4. Force a mode with `TRANSCRIBE_QWEN_CUDA_QUANT=nf4|bf16`.
+
+On CUDA one stage uses the GPU at a time — a transcription or a speaker diarization (the web UI
+runs jobs in parallel, and a small card holds one engine's models): parallel jobs take turns
+stage by stage, and Qwen's cached models are dropped from VRAM before whisper or diarization
+loads. Forcing a language Qwen does not support (it knows 30) makes it
+auto-detect instead.
 
 ## Building the macOS App
 
@@ -207,7 +246,7 @@ All processing is local. No external API keys required for transcription. Media 
 ## Architecture
 
 - **`transcribe/core.py`** — Transcription pipeline (WebRTC VAD + engine dispatch + optional pyannote diarization)
-- **`transcribe/qwen_engine.py`** — Qwen3-ASR-1.7B fallback engine + ForcedAligner (MLX, Apple Silicon)
+- **`transcribe/qwen_engine.py`** — Qwen3-ASR-1.7B engine + ForcedAligner (MLX on Apple Silicon, CUDA on NVIDIA)
 - **`transcribe/qwen_prompt.py`** — Loads the Qwen context prompt from `qwen_context_prompt.txt`
 - **`transcribe/qwen_context_prompt.txt`** — Editable domain context prompt (vocabulary/names)
 - **`transcribe/cli.py`** — CLI entry point

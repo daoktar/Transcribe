@@ -16,6 +16,7 @@ import time
 import uuid
 import zipfile
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -153,7 +154,7 @@ def _check_rate_limit(client_ip: str) -> None:
 
 class TranscribeRequest(BaseModel):
     model: str = "large-v3"
-    engine: str | None = None  # None -> qwen_engine.default_engine()
+    engine: str | None = None  # None -> the default engine, resolved in start_transcription
     language: str | None = None
     diarize: bool = False
     hf_token: str | None = None
@@ -170,8 +171,10 @@ class TranscribeRequest(BaseModel):
 
     @field_validator("engine")
     @classmethod
-    def _validate_engine(cls, v: str | None) -> str:
-        return v if v in ENGINE_CHOICES else qwen_engine.default_engine()
+    def _validate_engine(cls, v: str | None) -> str | None:
+        # Unknown -> None, the default. Not resolved here: validation runs on the event loop,
+        # and the first default_engine() call can import torch/qwen_asr for seconds.
+        return v if v in ENGINE_CHOICES else None
 
 
 class RetryDiarizeRequest(BaseModel):
@@ -437,7 +440,19 @@ def _run_retry_diarize(job: Job, file_index: int, hf_token: str, num_speakers: i
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
-    app = FastAPI(title="Transcribe", docs_url="/docs")
+    @asynccontextmanager
+    async def lifespan(app_: FastAPI):
+        # backend() imports torch/qwen_asr or mlx (seconds) on its first call. Start that call in
+        # a background thread so it is usually cached before the first request — without
+        # awaiting it: uvicorn binds the port only after startup, and the macOS app gives the
+        # server 30 s to start listening. Handlers call it off the event loop either way.
+        warmup = threading.Thread(target=qwen_engine.backend, name="qwen-backend-probe",
+                                  daemon=True)
+        warmup.start()
+        app_.state.backend_warmup = warmup
+        yield
+
+    app = FastAPI(title="Transcribe", docs_url="/docs", lifespan=lifespan)
 
     # --- Security headers (one middleware for every response) ---
     @app.middleware("http")
@@ -485,7 +500,9 @@ def create_app() -> FastAPI:
     # GET /api/config
     # ------------------------------------------------------------------
     @app.get("/api/config")
-    async def get_config() -> JSONResponse:
+    def get_config() -> JSONResponse:
+        # Plain def, run in a worker thread: is_available() is cached by the lifespan warm-up,
+        # which may still be running when the page loads (or absent without lifespan events).
         return JSONResponse({
             "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
             "model_choices": MODEL_CHOICES,
@@ -586,6 +603,9 @@ def create_app() -> FastAPI:
     @app.post("/api/transcribe/{job_id}")
     async def start_transcription(job_id: str, body: TranscribeRequest) -> JSONResponse:
         job = _get_job(job_id)
+        # In a thread: cached by the lifespan warm-up, unless a request beats it to the probe.
+        qwen_available = await asyncio.to_thread(qwen_engine.is_available)
+        engine = body.engine or ("qwen" if qwen_available else "whisper")
 
         with job.lock:
             if job.status == "processing":
@@ -599,12 +619,13 @@ def create_app() -> FastAPI:
                     detail=f"Invalid language code: {language}",
                 )
 
-            # Reject the Qwen engine early when MLX isn't available (non-Apple-Silicon),
+            # Reject the Qwen engine early when neither MLX nor CUDA is available,
             # rather than failing later at transcription time with a cryptic import error.
-            if body.engine == "qwen" and not qwen_engine.is_available():
+            if engine == "qwen" and not qwen_available:
                 raise HTTPException(
                     status_code=400,
-                    detail="Qwen engine is unavailable on this server (requires Apple Silicon + MLX).",
+                    detail="Qwen engine is unavailable on this server "
+                           "(requires Apple Silicon + MLX, or an NVIDIA GPU + qwen-asr).",
                 )
 
             # Resolve HF token: UI > env var (kept separate from settings)
@@ -613,7 +634,7 @@ def create_app() -> FastAPI:
             # Store settings — don't persist the raw HF token
             job.settings = {
                 "model": body.model if body.model in MODEL_CHOICES else "large-v3",
-                "engine": body.engine if body.engine in ENGINE_CHOICES else qwen_engine.default_engine(),
+                "engine": engine,
                 "language": language,
                 "diarize": body.diarize,
                 "num_speakers": body.num_speakers,

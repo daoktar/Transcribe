@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+from transcribe.core import _whisper_model_for_device as _real_whisper_model_for_device
 from transcribe.core import (
     _deduplicate_segments,
     _detect_language,
@@ -1486,3 +1487,168 @@ class TestEngineDispatch:
         with patch("transcribe.diarize.diarize", return_value=(labeled, 1)):
             self._run_qwen(tmp_path, mock_qwen, language="ru", diarize=True, hf_token="tok")
         assert mock_qwen.call_args.kwargs["align"] is True
+
+
+# ---------------------------------------------------------------------------
+# whisper.cpp model choice on CUDA GPUs
+# ---------------------------------------------------------------------------
+
+
+class TestWhisperModelForDevice:
+    """conftest stubs ``core._whisper_model_for_device``; this tests the import-time original."""
+
+    def _run(self, model_size, *, system_info="CUDA : ARCHS = 860", total_gb=3.6):
+        pwcpp = SimpleNamespace(whisper_print_system_info=lambda: system_info)
+        with patch.dict("sys.modules", {"_pywhispercpp": pwcpp}), \
+             patch("transcribe.gpu.cuda_total_gb", return_value=total_gb):
+            return _real_whisper_model_for_device(model_size)
+
+    def test_small_cuda_gpu_gets_q5(self):
+        assert self._run("large-v3") == "large-v3-q5_0"
+
+    def test_6gb_card_keeps_f16(self):
+        # A "6 GB" card reports a little under 6 GiB; f16 large-v3 fits there.
+        assert self._run("large-v3", total_gb=5.8) == "large-v3"
+
+    def test_big_cuda_gpu_keeps_f16(self):
+        assert self._run("large-v3", total_gb=11.6) == "large-v3"
+
+    def test_cpu_or_metal_build_keeps_model(self):
+        assert self._run("large-v3", system_info="METAL = 1 | CPU : NEON = 1") == "large-v3"
+
+    def test_torch_without_gpu_keeps_model(self):
+        assert self._run("large-v3", total_gb=None) == "large-v3"
+
+    def test_smaller_models_untouched(self):
+        assert self._run("medium") == "medium"
+
+
+class TestWhisperOnSmallGpu:
+    def _transcribe(self, tmp_path, models_dir):
+        video = tmp_path / "video.mp4"
+        video.touch()
+        messages = []
+        p1, p2, p3 = _vad_patches(10.0)
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=MagicMock()) as model_cls,
+            patch("transcribe.core._get_media_duration", return_value=10.0),
+            patch("transcribe.core._whisper_model_for_device", return_value="large-v3-q5_0"),
+            patch("transcribe.core.MODELS_DIR", str(models_dir)),
+            patch("transcribe.core.qwen_engine.release_gpu_models") as release,
+            p1, p2, p3,
+        ):
+            transcribe_video(str(video), language="en",
+                             progress_callback=lambda _f, msg: messages.append(msg))
+        return model_cls, release, messages
+
+    def test_releases_qwen_and_announces_download(self, tmp_path):
+        model_cls, release, messages = self._transcribe(tmp_path, tmp_path)
+        release.assert_called_once()
+        assert model_cls.call_args.args[0] == "large-v3-q5_0"
+        assert any("Downloading whisper model 'large-v3-q5_0'" in m for m in messages)
+
+    def test_cached_quantized_model_just_loads(self, tmp_path):
+        (tmp_path / "ggml-large-v3-q5_0.bin").write_bytes(b"x")
+        _, _, messages = self._transcribe(tmp_path, tmp_path)
+        assert not any("Downloading" in m for m in messages)
+        assert any("Loading model 'large-v3-q5_0'" in m for m in messages)
+
+
+class TestDropSegmentCallback:
+    def test_clears_callback_after_transcription(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.touch()
+        model = MagicMock()
+        p1, p2, p3 = _vad_patches(10.0)
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=model),
+            patch("transcribe.core._get_media_duration", return_value=10.0),
+            patch("transcribe.core._drop_segment_callback") as drop,
+            p1, p2, p3,
+        ):
+            transcribe_video(str(video), language="en")
+        drop.assert_called_once_with(model)
+
+    def test_clears_callback_when_transcription_fails(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.touch()
+        model = MagicMock()
+        model.transcribe.side_effect = RuntimeError("boom")
+        p1, p2, p3 = _vad_patches(10.0)
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", return_value=model),
+            patch("transcribe.core._get_media_duration", return_value=10.0),
+            patch("transcribe.core._drop_segment_callback") as drop,
+            patch("transcribe.core.qwen_engine.is_available", return_value=False),
+            p1, p2, p3,
+            pytest.raises(RuntimeError),
+        ):
+            transcribe_video(str(video), language="en")
+        drop.assert_called_once_with(model)
+
+    def test_resets_the_cpp_callback(self):
+        from transcribe.core import _drop_segment_callback
+
+        pw = MagicMock()
+        model = SimpleNamespace(_params="params")
+        with patch.dict("sys.modules", {"_pywhispercpp": pw}):
+            _drop_segment_callback(model)
+        pw.assign_new_segment_callback.assert_called_once_with("params", None)
+
+
+class TestQwenRejectsMlxIdOnCuda:
+    def test_raises_before_announcing_a_download(self):
+        from transcribe.core import _transcribe_qwen_regions
+
+        messages = []
+        with patch("transcribe.core.qwen_engine.backend", return_value="cuda"), \
+             pytest.raises(ValueError, match="MLX checkpoint"):
+            _transcribe_qwen_regions(
+                np.zeros(16000, dtype=np.float32), [(0.0, 1.0)], None, "ctx",
+                "mlx-community/Qwen3-ASR-1.7B-8bit", False, False,
+                lambda _f, msg: messages.append(msg),
+            )
+        assert not any("Downloading" in m for m in messages)
+
+
+class TestFailedWhisperFreesModelUnderLock:
+    def test_model_is_freed_before_the_exception_leaves(self, tmp_path):
+        import weakref
+
+        video = tmp_path / "video.mp4"
+        video.touch()
+        refs = []
+
+        class FailingModel:
+            def __init__(self, *_a, **_k):
+                refs.append(weakref.ref(self))
+                self._params = None
+
+            def transcribe(self, *_a, **_k):
+                raise RuntimeError("cuda alloc failed")
+
+        p1, p2, p3 = _vad_patches(10.0)
+        with (
+            patch("transcribe.core.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("transcribe.core.Model", side_effect=FailingModel),
+            patch("transcribe.core._get_media_duration", return_value=10.0),
+            patch("transcribe.core.qwen_engine.is_available", return_value=False),
+            p1, p2, p3,
+            pytest.raises(RuntimeError) as excinfo,
+        ):
+            transcribe_video(str(video), language="en")
+        # The exception (and its traceback) is still alive here, yet the model is gone.
+        assert excinfo.value is not None
+        assert refs and refs[0]() is None
+
+
+def test_drop_segment_callback_ignores_a_model_without_params():
+    from transcribe.core import _drop_segment_callback
+
+    pw = MagicMock()
+    with patch.dict("sys.modules", {"_pywhispercpp": pw}):
+        _drop_segment_callback(SimpleNamespace(_params=None))
+    pw.assign_new_segment_callback.assert_not_called()

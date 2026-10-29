@@ -7,8 +7,20 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
 from transcribe import qwen_engine
+
+# conftest stubs both backend probes to False; these tests exercise the real ones.
+_real_cuda_available = qwen_engine._cuda_available
+_real_mlx_available = qwen_engine._mlx_available
+
+
+@pytest.fixture
+def real_backend_probes():
+    with patch("transcribe.qwen_engine._cuda_available", _real_cuda_available), \
+         patch("transcribe.qwen_engine._mlx_available", _real_mlx_available):
+        yield
 
 
 def _out(text, language):
@@ -145,7 +157,8 @@ class TestModelCache:
     def test_load_qwen_model_caches(self):
         qwen_engine._MODEL_CACHE.clear()
         sentinel = object()
-        with patch("transcribe.qwen_engine._load_mlx_model", return_value=sentinel) as loader:
+        with patch("transcribe.qwen_engine.backend", return_value="mlx"), \
+             patch("transcribe.qwen_engine._load_mlx_model", return_value=sentinel) as loader:
             first = qwen_engine.load_qwen_model("fake/repo")
             second = qwen_engine.load_qwen_model("fake/repo")
         assert first is sentinel and second is sentinel
@@ -153,6 +166,7 @@ class TestModelCache:
         qwen_engine._MODEL_CACHE.clear()
 
 
+@pytest.mark.usefixtures("real_backend_probes")
 def test_is_available_returns_bool():
     with patch("transcribe.qwen_engine.importlib.import_module", return_value=object()) as loader:
         assert qwen_engine.is_available() is True
@@ -160,6 +174,7 @@ def test_is_available_returns_bool():
     assert loader.call_args_list[1].args == ("mlx_audio.stt.utils",)
 
 
+@pytest.mark.usefixtures("real_backend_probes")
 def test_is_available_handles_import_failure():
     with patch("transcribe.qwen_engine.importlib.import_module", side_effect=ImportError):
         assert qwen_engine.is_available() is False
@@ -245,7 +260,7 @@ class TestTranscribeRegionsWithAlignment:
             items=[_item("Привет", 0.0, 0.5), _item("Как", 1.0, 1.2), _item("дела", 1.2, 1.6)]
         )
 
-        def fake_load(path):
+        def fake_load(path, **_kind):
             return aligner if "ForcedAligner" in path else asr
 
         with patch("transcribe.qwen_engine.load_qwen_model", side_effect=fake_load):
@@ -372,3 +387,232 @@ class TestPromptEchoRetry:
             )
         assert model.generate.call_count == 1
         assert len(segs) == 1
+
+
+def _fake_import(available: set[str]):
+    """import_module stand-in: only the named modules import."""
+    def importer(name):
+        if name not in available:
+            raise ImportError(name)
+        return object()
+    return importer
+
+
+class TestBackend:
+    """The GPU itself comes from gpu.cuda_total_gb (conftest: None), the packages from imports."""
+
+    @pytest.fixture(autouse=True)
+    def _real_probes(self, real_backend_probes):
+        yield
+
+    def _backend(self, modules, gpu_gb=3.6):
+        # cuda_total_gb first: the import_module patch is global (importlib is shared), and
+        # mock.patch resolves its targets through it.
+        with patch("transcribe.gpu.cuda_total_gb", return_value=gpu_gb), \
+             patch("transcribe.qwen_engine.importlib.import_module",
+                   side_effect=_fake_import(modules)):
+            return qwen_engine.backend(), qwen_engine.default_engine()
+
+    def test_mlx_wins_when_both_import(self):
+        assert self._backend({"mlx.core", "mlx_audio.stt.utils", "qwen_asr"})[0] == "mlx"
+
+    def test_cuda_without_mlx(self):
+        assert self._backend({"qwen_asr"}) == ("cuda", "qwen")
+
+    def test_no_gpu_is_unavailable(self):
+        assert self._backend({"qwen_asr"}, gpu_gb=None) == (None, "whisper")
+
+    def test_gpu_without_qwen_asr_is_unavailable(self):
+        assert self._backend(set())[0] is None
+
+
+class TestResolveModelPath:
+    def test_cuda_maps_default_mlx_ids(self):
+        with patch("transcribe.qwen_engine.backend", return_value="cuda"):
+            assert qwen_engine.resolve_model_path(qwen_engine.DEFAULT_QWEN_MODEL) == "Qwen/Qwen3-ASR-1.7B"
+            assert (qwen_engine.resolve_model_path(qwen_engine.DEFAULT_ALIGNER_MODEL)
+                    == "Qwen/Qwen3-ForcedAligner-0.6B")
+            assert qwen_engine.resolve_model_path("me/custom") == "me/custom"
+
+    def test_mlx_keeps_ids(self):
+        with patch("transcribe.qwen_engine.backend", return_value="mlx"):
+            assert qwen_engine.resolve_model_path(qwen_engine.DEFAULT_QWEN_MODEL) == qwen_engine.DEFAULT_QWEN_MODEL
+
+
+class TestShardedCache:
+    def _cache(self, tmp_path, files):
+        index = tmp_path / "model.safetensors.index.json"
+        index.write_text('{"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors"}}')
+        paths = {"model.safetensors.index.json": str(index)} | {f: f"/tmp/{f}" for f in files}
+        return lambda _repo, filename: paths.get(filename)
+
+    def test_all_shards_cached(self, tmp_path):
+        lookup = self._cache(tmp_path, ["config.json", "model-1.safetensors", "model-2.safetensors"])
+        with patch("transcribe.qwen_engine.backend", return_value="cuda"), \
+             patch("huggingface_hub.try_to_load_from_cache", side_effect=lookup):
+            assert qwen_engine.is_model_cached() is True
+
+    def test_missing_shard_is_uncached(self, tmp_path):
+        lookup = self._cache(tmp_path, ["config.json", "model-1.safetensors"])
+        with patch("transcribe.qwen_engine.backend", return_value="cuda"), \
+             patch("huggingface_hub.try_to_load_from_cache", side_effect=lookup):
+            assert qwen_engine.is_model_cached() is False
+
+
+class TestCudaAdapters:
+    def test_asr_maps_language_code_and_prompt(self):
+        inner = MagicMock()
+        inner.transcribe.return_value = [SimpleNamespace(text="Привет", language="Russian,English")]
+        chunk = np.zeros(1600, dtype=np.float32)
+        out = qwen_engine._CudaASR(inner).generate(chunk, language="ru", system_prompt="ctx")
+        kwargs = inner.transcribe.call_args.kwargs
+        assert kwargs["language"] == "Russian" and kwargs["context"] == "ctx"
+        assert kwargs["audio"][1] == qwen_engine.SAMPLE_RATE
+        assert out.text == "Привет" and out.language == ["Russian", "English"]
+
+    def test_asr_auto_language_and_no_prompt(self):
+        inner = MagicMock()
+        inner.transcribe.return_value = [SimpleNamespace(text="", language="")]
+        out = qwen_engine._CudaASR(inner).generate(np.zeros(10, dtype=np.float32))
+        assert inner.transcribe.call_args.kwargs["language"] is None
+        assert inner.transcribe.call_args.kwargs["context"] == ""
+        assert out.language == [""]
+
+    def test_aligner_returns_first_result(self):
+        inner = MagicMock()
+        inner.align.return_value = ["first"]
+        res = qwen_engine._CudaAligner(inner).generate(np.zeros(10, dtype=np.float32), "hi", language="English")
+        assert res == "first"
+        assert inner.align.call_args.kwargs["language"] == "English"
+
+    def test_load_on_cuda_resolves_path_and_kind(self):
+        qwen_engine._MODEL_CACHE.clear()
+        with patch("transcribe.qwen_engine.backend", return_value="cuda"), \
+             patch("transcribe.qwen_engine._load_cuda_model", return_value="aligner") as loader:
+            qwen_engine.load_qwen_model(qwen_engine.DEFAULT_ALIGNER_MODEL, aligner=True)
+        loader.assert_called_once_with("Qwen/Qwen3-ForcedAligner-0.6B", True)
+        qwen_engine._MODEL_CACHE.clear()
+
+
+class TestCudaQuantization:
+    def _quant(self, total_gb):
+        with patch("transcribe.gpu.cuda_total_gb", return_value=total_gb):
+            return qwen_engine._cuda_quantization()
+
+    def test_small_gpu_gets_nf4(self, monkeypatch):
+        monkeypatch.delenv("TRANSCRIBE_QWEN_CUDA_QUANT", raising=False)
+        assert self._quant(3.6) == "nf4"  # RTX 3050 Laptop "4 GB"
+
+    def test_8gb_card_gets_nf4(self, monkeypatch):
+        # bf16 ASR + aligner (~6.5 GB) leaves too little of the 7.6-8.0 GiB it reports.
+        monkeypatch.delenv("TRANSCRIBE_QWEN_CUDA_QUANT", raising=False)
+        assert self._quant(7.99) == "nf4"
+
+    def test_10gb_card_gets_bf16(self, monkeypatch):
+        monkeypatch.delenv("TRANSCRIBE_QWEN_CUDA_QUANT", raising=False)
+        assert self._quant(9.8) == "bf16"  # RTX 3080 "10 GB"
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("TRANSCRIBE_QWEN_CUDA_QUANT", "BF16")
+        assert self._quant(3.6) == "bf16"
+
+
+class TestSupportedLanguage:
+    def test_supported_code_kept(self):
+        assert qwen_engine._supported_language("ru") == "ru"
+
+    def test_name_becomes_code(self):
+        assert qwen_engine._supported_language("Russian") == "ru"
+
+    def test_alias(self):
+        assert qwen_engine._supported_language("tl") == "fil"
+
+    def test_unsupported_falls_back_to_auto(self, caplog):
+        assert qwen_engine._supported_language("uk") is None
+        assert "does not support language 'uk'" in caplog.text
+
+    def test_none(self):
+        assert qwen_engine._supported_language(None) is None
+
+    def test_unsupported_language_is_not_forced_on_the_model(self):
+        audio = np.zeros(16000 * 5, dtype=np.float32)
+        model = MagicMock()
+        model.generate.return_value = _out("Привіт", ["Russian"])
+        with patch("transcribe.qwen_engine.load_qwen_model", return_value=model):
+            segs, lang = qwen_engine.transcribe_regions(audio, [(0.0, 5.0)], language="uk")
+        assert model.generate.call_args.kwargs["language"] is None
+        assert lang == "ru"  # detected, not the unsupported forced code
+        assert segs[0]["text"] == "Привіт"
+
+    def test_aligner_map_derives_from_names(self):
+        assert qwen_engine._CODE_TO_ALIGNER_LANG["ru"] == "Russian"
+        assert set(qwen_engine._CODE_TO_ALIGNER_LANG) == set(qwen_engine._ALIGNER_CODES)
+
+
+class TestCudaModelPath:
+    def test_other_mlx_checkpoint_is_rejected_on_cuda(self):
+        with patch("transcribe.qwen_engine.backend", return_value="cuda"), \
+             pytest.raises(ValueError, match="MLX checkpoint"):
+            qwen_engine.resolve_model_path("mlx-community/Qwen3-ASR-1.7B-8bit")
+
+    def test_rejected_checkpoint_reports_uncached(self):
+        with patch("transcribe.qwen_engine.backend", return_value="cuda"), \
+             patch("huggingface_hub.try_to_load_from_cache", return_value="/tmp/x"):
+            assert qwen_engine.is_model_cached("mlx-community/Qwen3-ASR-1.7B-8bit") is False
+
+    def test_backend_is_probed_once(self):
+        with patch("transcribe.qwen_engine._mlx_available", return_value=False) as mlx, \
+             patch("transcribe.qwen_engine._cuda_available", return_value=True):
+            assert qwen_engine.backend() == "cuda"
+            assert qwen_engine.backend() == "cuda"
+        mlx.assert_called_once()
+
+
+class TestReleaseGpuModels:
+    def test_drops_only_cuda_models_and_empties_cache(self):
+        qwen_engine._MODEL_CACHE.clear()
+        mlx_model = object()
+        qwen_engine._MODEL_CACHE.update({
+            "a": qwen_engine._CudaASR(MagicMock()),
+            "b": qwen_engine._CudaAligner(MagicMock()),
+            "m": mlx_model,
+        })
+        torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": torch}), \
+             patch("transcribe.gpu.cuda_total_gb", return_value=3.6):
+            qwen_engine.release_gpu_models()
+        assert qwen_engine._MODEL_CACHE == {"m": mlx_model}
+        torch.cuda.empty_cache.assert_called_once()
+        qwen_engine._MODEL_CACHE.clear()
+
+    def test_nothing_cached_never_imports_torch(self):
+        qwen_engine._MODEL_CACHE.clear()
+        with patch.dict("sys.modules", {"torch": None}):  # import would raise
+            qwen_engine.release_gpu_models()
+
+
+class TestRequestedLanguageReported:
+    def test_alias_reports_the_code_the_caller_gave(self):
+        audio = np.zeros(16000 * 5, dtype=np.float32)
+        model = MagicMock()
+        model.generate.return_value = _out("Kumusta", ["Filipino"])
+        with patch("transcribe.qwen_engine.load_qwen_model", return_value=model):
+            _, lang = qwen_engine.transcribe_regions(audio, [(0.0, 5.0)], language="tl")
+        assert model.generate.call_args.kwargs["language"] == "fil"
+        assert lang == "tl"
+
+
+class TestReleaseEmptiesTorchCache:
+    def test_empties_cache_without_cached_models_when_torch_is_loaded(self):
+        qwen_engine._MODEL_CACHE.clear()
+        torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": torch}), \
+             patch("transcribe.gpu.cuda_total_gb", return_value=3.6):
+            qwen_engine.release_gpu_models()
+        torch.cuda.empty_cache.assert_called_once()
+
+    def test_skips_without_cuda(self):
+        torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": torch}):
+            qwen_engine.release_gpu_models()  # conftest: cuda_total_gb() is None
+        torch.cuda.empty_cache.assert_not_called()

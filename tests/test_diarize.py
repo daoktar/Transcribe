@@ -186,6 +186,18 @@ class TestDiarize:
         mock_load.assert_not_called()
 
     @patch("transcribe.diarize._load_pipeline")
+    def test_releases_qwen_gpu_models_before_loading(self, mock_load):
+        from transcribe.diarize import diarize
+
+        order = []
+        mock_load.side_effect = lambda _tok: order.append("load") or MagicMock(
+            return_value=_make_annotation([(0.0, 2.0, "SPEAKER_00")]))
+        with patch("transcribe.qwen_engine.release_gpu_models",
+                   side_effect=lambda: order.append("release")):
+            diarize(self._make_audio(), [{"start": 0.0, "end": 1.0, "text": "Hi."}], "tok")
+        assert order == ["release", "load"]
+
+    @patch("transcribe.diarize._load_pipeline")
     def test_two_speakers_assigned(self, mock_load):
         """Segments should be labeled by overlapping speaker turns."""
         from transcribe.diarize import diarize
