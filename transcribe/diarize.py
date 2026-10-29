@@ -47,9 +47,11 @@ def _load_pipeline(hf_token: str):
             if pipeline is None:
                 # pyannote 4 returns None instead of raising for some download failures
                 raise LookupError(f"no pipeline returned for {PIPELINE_ID}")
-            # Use Metal GPU on Apple Silicon for faster inference
+            # Use the GPU when there is one: Metal on Apple Silicon, CUDA on NVIDIA
             if torch.backends.mps.is_available():
                 pipeline.to(torch.device("mps"))
+            elif torch.cuda.is_available():
+                pipeline.to(torch.device("cuda"))
             _pipeline = pipeline
         except Exception as exc:
             # Reset cache so a subsequent call with a new token retries

@@ -86,6 +86,35 @@ _MIN_SWITCH_PROB = 0.5
 # one: ~12 ms a region instead of ~0.3 s on large-v3. On 69 RU/EN test chunks it flagged every
 # chunk large-v3 cuts. base is worse: it hears 6 s of Russian as Ukrainian (p=0.95).
 _SCREEN_MODEL = "tiny"
+
+# whisper.cpp built with CUDA keeps the whole f16 model in VRAM: large-v3 is 3.1 GB, and on a
+# 4 GB RTX 3050 the compute buffers (and the tiny screen model) then fail to allocate. Cards
+# under this size get the q5_0 quantization of the same weights (1.1 GB) instead.
+_WHISPER_FULL_MIN_VRAM_GB = 6.0
+_WHISPER_QUANTIZED = {"large-v3": "large-v3-q5_0"}
+
+
+def _whisper_model_for_device(model_size: str) -> str:
+    """Return the whisper.cpp model to load for ``model_size`` on this machine's GPU."""
+    if model_size not in _WHISPER_QUANTIZED:
+        return model_size
+    try:
+        import _pywhispercpp
+
+        if "CUDA" not in _pywhispercpp.whisper_print_system_info():
+            return model_size  # CPU or Metal build: unified/host memory, no VRAM limit
+        import torch
+
+        if not torch.cuda.is_available():
+            return model_size
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+    except Exception:
+        return model_size
+    if total_gb >= _WHISPER_FULL_MIN_VRAM_GB:
+        return model_size
+    logger.info("GPU has %.1f GB of VRAM: loading %s instead of %s",
+                total_gb, _WHISPER_QUANTIZED[model_size], model_size)
+    return _WHISPER_QUANTIZED[model_size]
 # ponytail: exact size of whisper.cpp's ggml-tiny.bin (sha1 bd577a11...). If upstream ever
 # republishes it, every auto-language run downloads and rejects it (screen off) until updated.
 _SCREEN_MODEL_BYTES = 77_691_713
@@ -498,10 +527,11 @@ def _transcribe_whisper_regions(
     spoken longest.
     Returns ``(segments, detected_language)``.
     """
-    # --- Load model (Metal GPU acceleration is automatic on Apple Silicon) ---
-    report(_TRANSCRIBE_START_FRAC, f"Loading model '{model_size}'...")
+    # --- Load model (GPU acceleration is automatic: Metal on Apple Silicon, CUDA if built) ---
+    load_size = _whisper_model_for_device(model_size)
+    report(_TRANSCRIBE_START_FRAC, f"Loading model '{load_size}'...")
     t0 = time.monotonic()
-    model = Model(model_size, print_realtime=False, print_progress=False)
+    model = Model(load_size, print_realtime=False, print_progress=False)
     report(_TRANSCRIBE_START_FRAC, f"Model loaded in {_format_eta(time.monotonic() - t0)}.")
     screen = _load_screen_model() if not language and model_size != _SCREEN_MODEL else None
     report(_TRANSCRIBE_START_FRAC, f"Language: {language or 'auto-detect'}. Transcribing...")

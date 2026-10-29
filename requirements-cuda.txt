@@ -1,0 +1,10 @@
+# Linux + NVIDIA GPU extras, installed by scripts/setup.sh after requirements.txt
+# (the CUDA builds of torch and whisper.cpp are set up by the script itself).
+
+# --- Qwen3-ASR CUDA backend (PyTorch; the MLX backend is Apple Silicon only) ---
+qwen-asr>=0.0.6,<0.1
+# 4-bit NF4 loading for GPUs under 8 GB of VRAM (see qwen_engine._cuda_quantization).
+bitsandbytes>=0.45,<1.0
+
+# Rewrites the RUNPATH of the source-built pywhispercpp libraries (scripts/build_whisper_cuda.sh).
+patchelf>=0.17,<1.0

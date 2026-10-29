@@ -599,12 +599,13 @@ def create_app() -> FastAPI:
                     detail=f"Invalid language code: {language}",
                 )
 
-            # Reject the Qwen engine early when MLX isn't available (non-Apple-Silicon),
+            # Reject the Qwen engine early when neither MLX nor CUDA is available,
             # rather than failing later at transcription time with a cryptic import error.
             if body.engine == "qwen" and not qwen_engine.is_available():
                 raise HTTPException(
                     status_code=400,
-                    detail="Qwen engine is unavailable on this server (requires Apple Silicon + MLX).",
+                    detail="Qwen engine is unavailable on this server "
+                           "(requires Apple Silicon + MLX, or an NVIDIA GPU + qwen-asr).",
                 )
 
             # Resolve HF token: UI > env var (kept separate from settings)

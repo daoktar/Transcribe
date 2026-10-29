@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 
 
@@ -22,3 +24,10 @@ def empty_result():
         "segments": [],
         "language": "unknown",
     }
+
+
+@pytest.fixture(autouse=True)
+def _no_gpu_model_swap():
+    """Keep whisper model names as given: the real check imports torch and probes the GPU."""
+    with patch("transcribe.core._whisper_model_for_device", side_effect=lambda size: size):
+        yield

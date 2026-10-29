@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+from transcribe.core import _whisper_model_for_device as _real_whisper_model_for_device
 from transcribe.core import (
     _deduplicate_segments,
     _detect_language,
@@ -1486,3 +1487,36 @@ class TestEngineDispatch:
         with patch("transcribe.diarize.diarize", return_value=(labeled, 1)):
             self._run_qwen(tmp_path, mock_qwen, language="ru", diarize=True, hf_token="tok")
         assert mock_qwen.call_args.kwargs["align"] is True
+
+
+# ---------------------------------------------------------------------------
+# whisper.cpp model choice on CUDA GPUs
+# ---------------------------------------------------------------------------
+
+
+class TestWhisperModelForDevice:
+    """conftest stubs ``core._whisper_model_for_device``; this tests the import-time original."""
+
+    def _run(self, model_size, *, system_info="CUDA : ARCHS = 860", cuda=True, total_gb=4.0):
+        props = SimpleNamespace(total_memory=int(total_gb * 2**30))
+        torch = SimpleNamespace(cuda=SimpleNamespace(
+            is_available=lambda: cuda, get_device_properties=lambda _i: props,
+        ))
+        pwcpp = SimpleNamespace(whisper_print_system_info=lambda: system_info)
+        with patch.dict("sys.modules", {"torch": torch, "_pywhispercpp": pwcpp}):
+            return _real_whisper_model_for_device(model_size)
+
+    def test_small_cuda_gpu_gets_q5(self):
+        assert self._run("large-v3") == "large-v3-q5_0"
+
+    def test_big_cuda_gpu_keeps_f16(self):
+        assert self._run("large-v3", total_gb=12) == "large-v3"
+
+    def test_cpu_or_metal_build_keeps_model(self):
+        assert self._run("large-v3", system_info="METAL = 1 | CPU : NEON = 1") == "large-v3"
+
+    def test_torch_without_gpu_keeps_model(self):
+        assert self._run("large-v3", cuda=False) == "large-v3"
+
+    def test_smaller_models_untouched(self):
+        assert self._run("medium") == "medium"

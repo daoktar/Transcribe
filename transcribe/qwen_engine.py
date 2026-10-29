@@ -1,20 +1,26 @@
-"""Qwen3-ASR (MLX) transcription engine — the fallback for the whisper.cpp path.
+"""Qwen3-ASR transcription engine — the fallback for the whisper.cpp path.
 
-Runs Alibaba's open-weight **Qwen3-ASR-1.7B** on Apple Silicon via MLX (no PyTorch/CUDA).
+Runs Alibaba's open-weight **Qwen3-ASR-1.7B** on one of two backends: Apple Silicon via MLX
+(``mlx-audio``, no PyTorch), or an NVIDIA GPU via PyTorch/CUDA (the official ``qwen-asr``
+package).
 It plugs into the same VAD-chunk pipeline as the default whisper engine: each detected
 speech region is transcribed independently and emitted as a timestamped segment, with a
 domain *context prompt* biasing vocabulary and — unlike Whisper — keeping English tech
 terms in Latin script instead of transliterating them into Cyrillic.
 
-MLX is an optional, Apple-Silicon-only dependency. Every mlx import is lazy so the rest of
-the app (and non-macOS installs) keep working without it — call :func:`is_available` first.
+Both stacks are optional dependencies. Every mlx/torch/qwen_asr import is lazy so the rest
+of the app keeps working without them — call :func:`is_available` first. The backends take
+different weights: :func:`resolve_model_path` maps the default MLX repo ids to the original
+``Qwen/...`` checkpoints on CUDA.
 """
 from __future__ import annotations
 
 import importlib
 import logging
+import json
 import os
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -27,6 +33,12 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 DEFAULT_QWEN_MODEL = "mlx-community/Qwen3-ASR-1.7B-bf16"
 DEFAULT_ALIGNER_MODEL = "mlx-community/Qwen3-ForcedAligner-0.6B-bf16"
 SAMPLE_RATE = 16000
+
+# The CUDA backend runs the original PyTorch checkpoints, not the MLX conversions.
+_CUDA_MODEL_IDS = {
+    DEFAULT_QWEN_MODEL: "Qwen/Qwen3-ASR-1.7B",
+    DEFAULT_ALIGNER_MODEL: "Qwen/Qwen3-ForcedAligner-0.6B",
+}
 
 # Loaded models are cached per repo id — loading costs several seconds and ~1.8-3.4 GB.
 _MODEL_CACHE: dict[str, object] = {}
@@ -50,6 +62,8 @@ _LANG_NAME_TO_CODE = {
     "persian": "fa", "greek": "el", "hungarian": "hu", "macedonian": "mk",
     "romanian": "ro",
 }
+# qwen-asr only accepts the full names ("Russian"); the MLX backend takes codes as they are.
+_CODE_TO_LANG_NAME = {code: name.capitalize() for name, code in _LANG_NAME_TO_CODE.items()}
 
 
 def _normalize_language(value: str | None) -> str:
@@ -60,8 +74,7 @@ def _normalize_language(value: str | None) -> str:
     return _LANG_NAME_TO_CODE.get(key, key)
 
 
-def is_available() -> bool:
-    """Return True if the MLX stack needed for Qwen3-ASR is importable on this machine."""
+def _mlx_available() -> bool:
     try:
         importlib.import_module("mlx.core")
         importlib.import_module("mlx_audio.stt.utils")
@@ -70,13 +83,47 @@ def is_available() -> bool:
     except Exception as exc:
         # Not fatal — the app runs whisper-only — but log so a *broken* MLX install
         # (as opposed to simply absent / non-Apple-Silicon) is diagnosable.
-        logger.debug("Qwen3-ASR unavailable: %s: %s", type(exc).__name__, exc)
+        logger.debug("Qwen3-ASR MLX backend unavailable: %s: %s", type(exc).__name__, exc)
         return False
 
 
+def _cuda_available() -> bool:
+    try:
+        torch = importlib.import_module("torch")
+        if not torch.cuda.is_available():
+            return False
+        importlib.import_module("qwen_asr")
+
+        return True
+    except Exception as exc:
+        logger.debug("Qwen3-ASR CUDA backend unavailable: %s: %s", type(exc).__name__, exc)
+        return False
+
+
+def backend() -> str | None:
+    """Return ``"mlx"`` or ``"cuda"`` — the Qwen3-ASR backend this machine runs — or None."""
+    if _mlx_available():
+        return "mlx"
+    if _cuda_available():
+        return "cuda"
+    return None
+
+
+def is_available() -> bool:
+    """Return True if a Qwen3-ASR backend (MLX or CUDA) is importable on this machine."""
+    return backend() is not None
+
+
 def default_engine() -> str:
-    """Engine used when the caller does not pick one: Qwen3-ASR where MLX runs, else whisper."""
+    """Engine used when the caller does not pick one: Qwen3-ASR where it runs, else whisper."""
     return "qwen" if is_available() else "whisper"
+
+
+def resolve_model_path(model_path: str) -> str:
+    """Map a default MLX repo id to the PyTorch checkpoint when running on CUDA."""
+    if backend() == "cuda":
+        return _CUDA_MODEL_IDS.get(model_path, model_path)
+    return model_path
 
 
 def is_model_cached(model_path: str = DEFAULT_QWEN_MODEL) -> bool:
@@ -85,16 +132,28 @@ def is_model_cached(model_path: str = DEFAULT_QWEN_MODEL) -> bool:
     Used to gate the automatic whisper→Qwen fallback so an unattended job never kicks
     off a multi-GB download. Requires both config.json and the unsharded weight file —
     checking config.json alone is insufficient since it can remain after an interrupted
-    download. Sharded custom models (no single model.safetensors) are treated
-    conservatively and report uncached.
+    download. A sharded checkpoint (``Qwen/Qwen3-ASR-1.7B`` on CUDA) counts as cached only
+    when its index and every shard it lists are.
     """
     try:
         from huggingface_hub import try_to_load_from_cache
 
-        return all(
-            isinstance(try_to_load_from_cache(model_path, filename), str)
-            for filename in ("config.json", "model.safetensors")
-        )
+        model_path = resolve_model_path(model_path)
+
+        def cached(filename: str) -> str | None:
+            path = try_to_load_from_cache(model_path, filename)
+            return path if isinstance(path, str) else None
+
+        if not cached("config.json"):
+            return False
+        if cached("model.safetensors"):
+            return True
+        index = cached("model.safetensors.index.json")
+        if not index:
+            return False
+        with open(index, encoding="utf-8") as fh:
+            shards = set(json.load(fh)["weight_map"].values())
+        return bool(shards) and all(cached(shard) for shard in shards)
     except Exception:
         return False
 
@@ -106,11 +165,87 @@ def _load_mlx_model(model_path: str):
     return load_model(model_path)
 
 
-def load_qwen_model(model_path: str = DEFAULT_QWEN_MODEL):
-    """Load (and cache) a Qwen3-ASR MLX model. Downloads weights from HF on first use."""
+class _CudaASR:
+    """Give a ``qwen_asr.Qwen3ASRModel`` the ``generate()`` interface of the MLX model."""
+
+    def __init__(self, model):
+        self._model = model
+
+    def generate(self, audio, *, language=None, system_prompt=None, temperature=0.0):
+        # qwen-asr decodes greedily already; temperature is accepted for MLX parity.
+        name = _CODE_TO_LANG_NAME.get(language, language) if language else None
+        result = self._model.transcribe(
+            audio=(audio, SAMPLE_RATE), context=system_prompt or "", language=name,
+        )[0]
+        # It merges per-chunk languages into "Russian,English"; MLX returns a list.
+        return SimpleNamespace(text=result.text, language=(result.language or "").split(","))
+
+
+class _CudaAligner:
+    """Give a ``qwen_asr.Qwen3ForcedAligner`` the ``generate()`` interface of the MLX one."""
+
+    def __init__(self, aligner):
+        self._aligner = aligner
+
+    def generate(self, audio, text, *, language):
+        return self._aligner.align(audio=(audio, SAMPLE_RATE), text=text, language=language)[0]
+
+
+# Qwen3-ASR-1.7B in bf16 takes ~4.7 GB of VRAM before activations, plus ~1.8 GB for the
+# aligner. Smaller cards load the text decoder in 4-bit NF4 (bitsandbytes) instead: measured
+# on an RTX 3050 4 GB, 2.5 GB peak and ~0.2 RTF with the same text. 8-bit fits too but runs
+# ~8x slower than NF4. The audio encoder and lm_head stay bf16.
+_CUDA_BF16_MIN_VRAM_GB = 8.0
+_NF4_SKIP_MODULES = ["audio_tower", "lm_head"]
+
+
+def _cuda_quantization() -> str:
+    """Return ``"nf4"`` or ``"bf16"`` for loading on CUDA.
+
+    ``$TRANSCRIBE_QWEN_CUDA_QUANT`` (``nf4`` / ``bf16``) overrides the choice made from the
+    GPU's memory.
+    """
+    forced = os.environ.get("TRANSCRIBE_QWEN_CUDA_QUANT", "").strip().lower()
+    if forced in ("nf4", "bf16"):
+        return forced
+    import torch
+
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+    return "nf4" if total_gb < _CUDA_BF16_MIN_VRAM_GB else "bf16"
+
+
+def _load_cuda_model(model_path: str, aligner: bool):
+    """Load one model onto the GPU via qwen-asr, keeping the import local."""
+    import torch
+    from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner
+
+    kwargs = {"dtype": torch.bfloat16, "device_map": "cuda:0"}
+    if _cuda_quantization() == "nf4":
+        from transformers import BitsAndBytesConfig
+
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_skip_modules=_NF4_SKIP_MODULES,
+        )
+    if aligner:
+        return _CudaAligner(Qwen3ForcedAligner.from_pretrained(model_path, **kwargs))
+    # One region per call, so batching would only cost memory.
+    return _CudaASR(Qwen3ASRModel.from_pretrained(model_path, max_inference_batch_size=1, **kwargs))
+
+
+def load_qwen_model(model_path: str = DEFAULT_QWEN_MODEL, *, aligner: bool = False):
+    """Load (and cache) a Qwen3-ASR model on the available backend.
+
+    Downloads weights from HF on first use. ``aligner`` marks a ForcedAligner checkpoint:
+    MLX loads either kind with one call, qwen-asr needs a different wrapper.
+    """
+    on_cuda = backend() == "cuda"
+    model_path = resolve_model_path(model_path) if on_cuda else model_path
     cached = _MODEL_CACHE.get(model_path)
     if cached is None:
-        cached = _load_mlx_model(model_path)
+        cached = _load_cuda_model(model_path, aligner) if on_cuda else _load_mlx_model(model_path)
         _MODEL_CACHE[model_path] = cached
     return cached
 
@@ -326,10 +461,10 @@ def transcribe_regions(
         speech_regions: ``(start_s, end_s)`` tuples from the VAD stage.
         language: Language code to force, or None to auto-detect.
         system_prompt: Domain context prompt (hotwords / instructions).
-        model_path: HF repo id of the MLX Qwen3-ASR model.
+        model_path: HF repo id of the Qwen3-ASR model (MLX id; mapped on CUDA).
         sample_rate: Sample rate of ``audio_pcm`` (Hz).
         align: If True, force-align each region into phrase-level segments.
-        aligner_model: HF repo id of the MLX Qwen3-ForcedAligner model.
+        aligner_model: HF repo id of the Qwen3-ForcedAligner model (MLX id; mapped on CUDA).
         progress_callback: Optional ``(done_regions, total_regions) -> None`` reporter.
 
     Returns:
@@ -337,7 +472,7 @@ def transcribe_regions(
         ``{"start": float, "end": float, "text": str}``.
     """
     model = load_qwen_model(model_path)
-    aligner = load_qwen_model(aligner_model) if align else None
+    aligner = load_qwen_model(aligner_model, aligner=True) if align else None
 
     segments: list[dict] = []
     lang_counts: dict[str, int] = {}

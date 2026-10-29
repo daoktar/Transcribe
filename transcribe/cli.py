@@ -27,9 +27,10 @@ def main():
         "--engine",
         default=None,
         choices=["whisper", "qwen"],
-        help="Transcription engine: 'qwen' (default on Apple Silicon: Qwen3-ASR-1.7B via MLX) "
-             "or 'whisper' (whisper.cpp; the default where MLX is unavailable). Qwen is also "
-             "used automatically as a fallback if the whisper engine fails.",
+        help="Transcription engine: 'qwen' (Qwen3-ASR-1.7B; the default where it runs: MLX on "
+             "Apple Silicon or CUDA on an NVIDIA GPU) or 'whisper' (whisper.cpp; the default "
+             "elsewhere). Qwen is also used automatically as a fallback if the whisper engine "
+             "fails.",
     )
     parser.add_argument(
         "--language",
