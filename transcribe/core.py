@@ -16,7 +16,7 @@ from pywhispercpp.constants import MODELS_DIR
 from pywhispercpp.model import Model
 from pywhispercpp.utils import download_model
 
-from transcribe import qwen_engine
+from transcribe import gpu, qwen_engine
 from transcribe.paths import get_ffmpeg_path, get_ffprobe_path
 
 logger = logging.getLogger(__name__)
@@ -88,9 +88,10 @@ _MIN_SWITCH_PROB = 0.5
 _SCREEN_MODEL = "tiny"
 
 # whisper.cpp built with CUDA keeps the whole f16 model in VRAM: large-v3 is 3.1 GB, and on a
-# 4 GB RTX 3050 the compute buffers (and the tiny screen model) then fail to allocate. Cards
-# under this size get the q5_0 quantization of the same weights (1.1 GB) instead.
-_WHISPER_FULL_MIN_VRAM_GB = 6.0
+# 4 GB RTX 3050 (3.6 GiB reported) the compute buffers and the tiny screen model then fail to
+# allocate. Cards below this get the q5_0 quantization of the same weights (1.1 GB) instead;
+# the margin keeps a "6 GB" card, which reports a little under 6 GiB, on f16.
+_WHISPER_FULL_MIN_VRAM_GB = 5.5
 _WHISPER_QUANTIZED = {"large-v3": "large-v3-q5_0"}
 
 
@@ -103,14 +104,10 @@ def _whisper_model_for_device(model_size: str) -> str:
 
         if "CUDA" not in _pywhispercpp.whisper_print_system_info():
             return model_size  # CPU or Metal build: unified/host memory, no VRAM limit
-        import torch
-
-        if not torch.cuda.is_available():
-            return model_size
-        total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
     except Exception:
         return model_size
-    if total_gb >= _WHISPER_FULL_MIN_VRAM_GB:
+    total_gb = gpu.cuda_total_gb()
+    if total_gb is None or total_gb >= _WHISPER_FULL_MIN_VRAM_GB:
         return model_size
     logger.info("GPU has %.1f GB of VRAM: loading %s instead of %s",
                 total_gb, _WHISPER_QUANTIZED[model_size], model_size)
@@ -510,6 +507,27 @@ SUPPORTED_EXTENSIONS = {
 _TRANSCRIBE_START_FRAC = 0.12
 
 
+# Engines and diarization run under the process-wide GPU lock (see transcribe.gpu).
+def _drop_segment_callback(model: Model) -> None:
+    """Break pywhispercpp's Model ↔ params reference cycle so the model can be freed.
+
+    ``Model.transcribe(new_segment_callback=...)`` stores a bound method of the model in its
+    C++ params. The cycle runs through C++, where the garbage collector cannot see it, so every
+    model used with a callback stayed loaded for the life of the process — on CUDA 1.5 GB of
+    VRAM per job (pywhispercpp 1.5.1), enough to make the next job on a 4 GB card fail.
+    """
+    params = getattr(model, "_params", None)
+    if params is None:
+        return  # the C++ binding dereferences it: None would segfault, not raise
+    try:
+        import _pywhispercpp
+
+        _pywhispercpp.assign_new_segment_callback(params, None)
+    except Exception:
+        logger.debug("Could not clear the whisper segment callback", exc_info=True)
+
+
+@gpu.exclusive_call
 def _transcribe_whisper_regions(
     model_size: str,
     audio_pcm: np.ndarray,
@@ -528,112 +546,125 @@ def _transcribe_whisper_regions(
     Returns ``(segments, detected_language)``.
     """
     # --- Load model (GPU acceleration is automatic: Metal on Apple Silicon, CUDA if built) ---
+    # Qwen models cached by an earlier job would otherwise keep the VRAM whisper needs.
+    qwen_engine.release_gpu_models()
     load_size = _whisper_model_for_device(model_size)
-    report(_TRANSCRIBE_START_FRAC, f"Loading model '{load_size}'...")
+    if load_size != model_size and not (Path(MODELS_DIR) / f"ggml-{load_size}.bin").exists():
+        # pywhispercpp downloads it inside Model() without a progress callback.
+        report(_TRANSCRIBE_START_FRAC,
+               f"Downloading whisper model '{load_size}' for this GPU (first run only)...")
+    else:
+        report(_TRANSCRIBE_START_FRAC, f"Loading model '{load_size}'...")
     t0 = time.monotonic()
     model = Model(load_size, print_realtime=False, print_progress=False)
-    report(_TRANSCRIBE_START_FRAC, f"Model loaded in {_format_eta(time.monotonic() - t0)}.")
-    screen = _load_screen_model() if not language and model_size != _SCREEN_MODEL else None
-    report(_TRANSCRIBE_START_FRAC, f"Language: {language or 'auto-detect'}. Transcribing...")
+    try:
+        report(_TRANSCRIBE_START_FRAC, f"Model loaded in {_format_eta(time.monotonic() - t0)}.")
+        screen = _load_screen_model() if not language and model_size != _SCREEN_MODEL else None
+        report(_TRANSCRIBE_START_FRAC, f"Language: {language or 'auto-detect'}. Transcribing...")
 
-    transcribe_start = time.monotonic()
-    all_segments: list[dict] = []
-    total_speech_duration = sum(end - start for start, end in speech_regions)
-    cumulative_speech = 0.0
-    language_seconds: collections.Counter[str] = collections.Counter()
+        transcribe_start = time.monotonic()
+        all_segments: list[dict] = []
+        total_speech_duration = sum(end - start for start, end in speech_regions)
+        cumulative_speech = 0.0
+        language_seconds: collections.Counter[str] = collections.Counter()
 
-    transcribe_kwargs = {
-        # --- Anti-hallucination / anti-repetition parameters ---
-        "no_context": True,
-        # no_context only resets between calls. Inside a chunk, each re-seeked 30 s window
-        # (max_tokens forces one roughly every 15 s of Russian) was still conditioned on the
-        # previous window's text, and after a language switch it skipped whole utterances.
-        "n_max_text_ctx": 0,
-        "no_speech_thold": 0.3,
-        "entropy_thold": 2.4,
-        "max_tokens": 100,
-        "suppress_blank": True,
-    }
+        transcribe_kwargs = {
+            # --- Anti-hallucination / anti-repetition parameters ---
+            "no_context": True,
+            # no_context only resets between calls. Inside a chunk, each re-seeked 30 s window
+            # (max_tokens forces one roughly every 15 s of Russian) was still conditioned on the
+            # previous window's text, and after a language switch it skipped whole utterances.
+            "n_max_text_ctx": 0,
+            "no_speech_thold": 0.3,
+            "entropy_thold": 2.4,
+            "max_tokens": 100,
+            "suppress_blank": True,
+        }
 
-    transcribe_range = 0.73 if diarize else 0.88
+        transcribe_range = 0.73 if diarize else 0.88
 
-    for chunk_idx, (chunk_start, chunk_end) in enumerate(speech_regions):
-        windows = (
-            [(chunk_start, chunk_end, language)] if language
-            else _language_windows(model, audio_pcm, chunk_start, chunk_end, raw_regions, screen)
-        )
-        chunk_segments: list[dict] = []
-
-        for win_start, win_end, win_language in windows:
-            win_audio = audio_pcm[int(win_start * SAMPLE_RATE):int(win_end * SAMPLE_RATE)]
-            win_duration = win_end - win_start
-
-            def _on_new_segment(
-                segment,
-                _offset=win_start,
-                _win_dur=win_duration,
-                _chunk_idx=chunk_idx,
-            ):
-                nonlocal cumulative_speech
-                try:
-                    # pywhispercpp timestamps are in centiseconds (10ms units)
-                    seg_start = segment.t0 / 100.0 + _offset
-                    seg_end = segment.t1 / 100.0 + _offset
-                    seg_text = segment.text.strip()
-
-                    if not seg_text or seg_end <= seg_start:
-                        return
-
-                    chunk_segments.append({
-                        "start": round(seg_start, 3),
-                        "end": round(seg_end, 3),
-                        "text": seg_text,
-                    })
-
-                    elapsed = time.monotonic() - transcribe_start
-                    if total_speech_duration > 0:
-                        win_progress = min(
-                            (segment.t1 / 100.0) / _win_dur, 1.0
-                        ) if _win_dur > 0 else 1.0
-                        current_speech = cumulative_speech + _win_dur * win_progress
-                        fraction = min(current_speech / total_speech_duration, 0.99)
-                        scaled = _TRANSCRIBE_START_FRAC + fraction * transcribe_range
-                        if elapsed > 0.5 and fraction > 0.01:
-                            eta_seconds = elapsed / fraction * (1.0 - fraction)
-                            report(
-                                scaled,
-                                f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}"
-                                f"... {fraction:.0%} — ~{_format_eta(eta_seconds)} remaining",
-                            )
-                        else:
-                            report(
-                                scaled,
-                                f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}...",
-                            )
-                except Exception:
-                    # Never let a progress reporting error abort the transcription
-                    pass
-
-            model.transcribe(
-                win_audio,
-                new_segment_callback=_on_new_segment,
-                # Always pass a language: whisper.cpp's default is "en", which translates other
-                # speech. "" is its own auto-detect, the fallback when detection failed ("auto"
-                # works too, but pywhispercpp logs "unknown language" for it on every call).
-                language=win_language,
-                **transcribe_kwargs,
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(speech_regions):
+            windows = (
+                [(chunk_start, chunk_end, language)] if language
+                else _language_windows(model, audio_pcm, chunk_start, chunk_end, raw_regions, screen)
             )
-            language_seconds[win_language] += win_duration
-            cumulative_speech += win_duration
+            chunk_segments: list[dict] = []
 
-        all_segments.extend(chunk_segments)
+            for win_start, win_end, win_language in windows:
+                win_audio = audio_pcm[int(win_start * SAMPLE_RATE):int(win_end * SAMPLE_RATE)]
+                win_duration = win_end - win_start
 
-    if not language:
-        del language_seconds[""]
-        language = max(language_seconds, key=language_seconds.get, default="unknown")
-    return all_segments, language
+                def _on_new_segment(
+                    segment,
+                    _offset=win_start,
+                    _win_dur=win_duration,
+                    _chunk_idx=chunk_idx,
+                ):
+                    nonlocal cumulative_speech
+                    try:
+                        # pywhispercpp timestamps are in centiseconds (10ms units)
+                        seg_start = segment.t0 / 100.0 + _offset
+                        seg_end = segment.t1 / 100.0 + _offset
+                        seg_text = segment.text.strip()
+
+                        if not seg_text or seg_end <= seg_start:
+                            return
+
+                        chunk_segments.append({
+                            "start": round(seg_start, 3),
+                            "end": round(seg_end, 3),
+                            "text": seg_text,
+                        })
+
+                        elapsed = time.monotonic() - transcribe_start
+                        if total_speech_duration > 0:
+                            win_progress = min(
+                                (segment.t1 / 100.0) / _win_dur, 1.0
+                            ) if _win_dur > 0 else 1.0
+                            current_speech = cumulative_speech + _win_dur * win_progress
+                            fraction = min(current_speech / total_speech_duration, 0.99)
+                            scaled = _TRANSCRIBE_START_FRAC + fraction * transcribe_range
+                            if elapsed > 0.5 and fraction > 0.01:
+                                eta_seconds = elapsed / fraction * (1.0 - fraction)
+                                report(
+                                    scaled,
+                                    f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}"
+                                    f"... {fraction:.0%} — ~{_format_eta(eta_seconds)} remaining",
+                                )
+                            else:
+                                report(
+                                    scaled,
+                                    f"Transcribing chunk {_chunk_idx + 1}/{len(speech_regions)}...",
+                                )
+                    except Exception:
+                        # Never let a progress reporting error abort the transcription
+                        pass
+
+                model.transcribe(
+                    win_audio,
+                    new_segment_callback=_on_new_segment,
+                    # Always pass a language: whisper.cpp's default is "en", which translates other
+                    # speech. "" is its own auto-detect, the fallback when detection failed ("auto"
+                    # works too, but pywhispercpp logs "unknown language" for it on every call).
+                    language=win_language,
+                    **transcribe_kwargs,
+                )
+                language_seconds[win_language] += win_duration
+                cumulative_speech += win_duration
+
+            all_segments.extend(chunk_segments)
+
+        if not language:
+            del language_seconds[""]
+            language = max(language_seconds, key=language_seconds.get, default="unknown")
+        return all_segments, language
+    finally:
+        # On failure gpu.exclusive_call then clears the traceback's frames, freeing the model
+        # before the GPU lock passes on; the callback cycle would keep it alive even so.
+        _drop_segment_callback(model)
 
 
+@gpu.exclusive_call
 def _transcribe_qwen_regions(
     audio_pcm: np.ndarray,
     speech_regions: list[tuple[float, float]],
@@ -644,7 +675,7 @@ def _transcribe_qwen_regions(
     align: bool,
     report: Callable[[float, str], None],
 ) -> tuple[list[dict], str]:
-    """Transcribe VAD speech regions with the Qwen3-ASR MLX engine (fallback).
+    """Transcribe VAD speech regions with the Qwen3-ASR engine (MLX or CUDA).
 
     Uses the distilled domain context prompt by default. When ``align`` is True, each
     region is force-aligned into phrase-level segments (finer timestamps for diarization/
@@ -670,6 +701,8 @@ def _transcribe_qwen_regions(
         else:
             report(scaled, f"Transcribing chunk {done}/{total} with Qwen3-ASR{align_suffix}...")
 
+    # Raises for an MLX checkpoint on CUDA before announcing a download that never happens.
+    qwen_engine.resolve_model_path(qwen_model)
     # A first-run download is multi-GB and slow — say so, so a stalled bar is explainable.
     if not qwen_engine.is_model_cached(qwen_model):
         report(_TRANSCRIBE_START_FRAC, "Downloading Qwen3-ASR weights (~3.4 GB, first run only)...")
@@ -708,7 +741,7 @@ def transcribe_media(
     those regions to avoid hallucination on silence/music/noise sections.
 
     Two engines are available. The default ``"whisper"`` runs whisper.cpp via
-    pywhispercpp (Metal-accelerated). ``"qwen"`` runs Qwen3-ASR-1.7B via MLX and is
+    pywhispercpp (Metal/CUDA-accelerated). ``"qwen"`` runs Qwen3-ASR-1.7B via MLX or CUDA and is
     also used automatically as a fallback when the whisper engine fails (unless
     ``allow_qwen_fallback`` is False). The VAD, deduplication and diarization stages
     are shared by both engines.
@@ -726,12 +759,13 @@ def transcribe_media(
         engine: Transcription engine, ``"whisper"`` (default) or ``"qwen"``.
         qwen_context: Domain context prompt for Qwen3-ASR. Defaults to the distilled
             prompt in :mod:`transcribe.qwen_prompt` when the Qwen engine is used.
-        qwen_model: HF repo id of the MLX Qwen3-ASR model to use for the Qwen engine.
+        qwen_model: HF repo id of the Qwen3-ASR model for the Qwen engine (an MLX id; the
+            defaults map to PyTorch checkpoints on CUDA, other ``mlx-community/`` ids raise).
         qwen_align: For the Qwen engine, force-align each region into phrase-level segments
             (finer timestamps for diarization/subtitles). None (default) auto-enables this
             only when ``diarize`` is True; True/False overrides.
         allow_qwen_fallback: If True, fall back to Qwen3-ASR when the whisper engine
-            raises (and MLX is available). Set False to surface whisper errors.
+            raises (and a Qwen backend is available). Set False to surface whisper errors.
 
     Returns:
         Dict with keys: text, segments, language.

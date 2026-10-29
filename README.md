@@ -195,11 +195,13 @@ platforms the app runs whisper-only.
 
 1. installs the cu126 build of PyTorch **before** `requirements.txt` — the default wheel targets
    the newest CUDA and does not run on older drivers such as Debian 13's 550 (CUDA 12.4);
-   override with `TORCH_INDEX_URL`;
+   pick another build with `TORCH_CUDA` (e.g. `cu128`) and a mirror with `TORCH_INDEX_URL`;
 2. installs [`requirements-cuda.txt`](requirements-cuda.txt): `qwen-asr` and `bitsandbytes`;
 3. rebuilds pywhispercpp from source with CUDA (`scripts/build_whisper_cuda.sh`, ~15 min).
 
-It needs the CUDA compiler: `sudo apt install nvidia-cuda-toolkit`. `TRANSCRIBE_CPU_ONLY=1`
+It needs the CUDA compiler: `sudo apt install nvidia-cuda-toolkit`. A GPU newer than that
+compiler (RTX 50xx needs nvcc 12.8+, Debian 13 ships 12.4) is reported before the build starts,
+with the `CUDA_ARCH` override to fall back on. `TRANSCRIBE_CPU_ONLY=1`
 skips the GPU path.
 
 Small cards are handled automatically. On an 11-minute English video on a 4 GB RTX 3050 Laptop:
@@ -207,11 +209,18 @@ Small cards are handled automatically. On an 11-minute English video on a 4 GB R
 | | Loaded as | VRAM | Time |
 |---|---|---|---|
 | whisper large-v3, CPU (i7-11370H) | f16 | — | 48 min |
-| whisper large-v3, CUDA | `large-v3-q5_0` (GPUs under 6 GB) | 1.1 GB model | 55 s |
-| Qwen3-ASR-1.7B, CUDA | text decoder in 4-bit NF4 (GPUs under 8 GB) | 2.5 GB, 3.3 GB with aligner | 94 s |
+| whisper large-v3, CUDA | `large-v3-q5_0` (cards smaller than 6 GB) | 1.1 GB model | 55 s |
+| Qwen3-ASR-1.7B, CUDA | text decoder in 4-bit NF4 (cards up to 8 GB) | 2.5 GB, 3.3 GB with aligner | 94 s |
 
-The full bf16 Qwen checkpoint (4.7 GB) and f16 large-v3 (3.1 GB) do not fit in 4 GB. 8-bit Qwen
-fits too but runs ~8× slower than NF4. Force a mode with `TRANSCRIBE_QWEN_CUDA_QUANT=nf4|bf16`.
+The full bf16 Qwen checkpoint (4.7 GB, ~6.5 GB with the aligner) and f16 large-v3 (3.1 GB) do
+not fit in 4 GB; bf16 is used from 10 GB cards (9.5 GiB reported) up. 8-bit Qwen fits too but runs ~8×
+slower than NF4. Force a mode with `TRANSCRIBE_QWEN_CUDA_QUANT=nf4|bf16`.
+
+On CUDA one stage uses the GPU at a time — a transcription or a speaker diarization (the web UI
+runs jobs in parallel, and a small card holds one engine's models): parallel jobs take turns
+stage by stage, and Qwen's cached models are dropped from VRAM before whisper or diarization
+loads. Forcing a language Qwen does not support (it knows 30) makes it
+auto-detect instead.
 
 ## Building the macOS App
 

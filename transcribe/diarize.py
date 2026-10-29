@@ -12,6 +12,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+from transcribe import gpu, qwen_engine
+
 # pyannote.audio 4 ships OpenTelemetry usage metrics, on by default, posting to
 # otel.pyannote.ai. This app makes no network calls beyond model downloads, so force
 # them off — pyannote reads the variable when it is first imported (lazily, below).
@@ -68,6 +70,7 @@ def _load_pipeline(hf_token: str):
     return _pipeline
 
 
+@gpu.exclusive_call
 def diarize(
     audio: np.ndarray,
     segments: list[dict],
@@ -101,6 +104,9 @@ def diarize(
         return [], 0
 
     # --- Load model ---
+    # Qwen (with its aligner, since diarizing turns alignment on) peaks at 3.3 GB: on a 4 GB
+    # card pyannote would run out of memory beside it, so drop it first.
+    qwen_engine.release_gpu_models()
     _report(0.0, "Loading speaker diarization model...")
     pipeline = _load_pipeline(hf_token)
 

@@ -15,14 +15,18 @@ different weights: :func:`resolve_model_path` maps the default MLX repo ids to t
 """
 from __future__ import annotations
 
+import functools
 import importlib
-import logging
 import json
+import logging
 import os
+import sys
 from collections.abc import Callable
 from types import SimpleNamespace
 
 import numpy as np
+
+from transcribe import gpu
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +47,6 @@ _CUDA_MODEL_IDS = {
 # Loaded models are cached per repo id — loading costs several seconds and ~1.8-3.4 GB.
 _MODEL_CACHE: dict[str, object] = {}
 
-# The forced aligner takes a language *name* and supports only these 11 languages.
-_CODE_TO_ALIGNER_LANG = {
-    "zh": "Chinese", "yue": "Cantonese", "en": "English", "de": "German",
-    "es": "Spanish", "fr": "French", "it": "Italian", "pt": "Portuguese",
-    "ru": "Russian", "ko": "Korean", "ja": "Japanese",
-}
-
 # Qwen3-ASR reports languages as full names (e.g. "Russian"); map the documented 30
 # languages to ISO codes so the result matches whisper's ("ru", "en", ...).
 _LANG_NAME_TO_CODE = {
@@ -64,6 +61,12 @@ _LANG_NAME_TO_CODE = {
 }
 # qwen-asr only accepts the full names ("Russian"); the MLX backend takes codes as they are.
 _CODE_TO_LANG_NAME = {code: name.capitalize() for name, code in _LANG_NAME_TO_CODE.items()}
+# Codes the UI offers under another name than Qwen's (whisper says "tl" for Tagalog/Filipino).
+_LANG_CODE_ALIASES = {"tl": "fil"}
+
+# The forced aligner takes a language *name* and supports only these 11 languages.
+_ALIGNER_CODES = ("zh", "yue", "en", "de", "es", "fr", "it", "pt", "ru", "ko", "ja")
+_CODE_TO_ALIGNER_LANG = {code: _CODE_TO_LANG_NAME[code] for code in _ALIGNER_CODES}
 
 
 def _normalize_language(value: str | None) -> str:
@@ -72,6 +75,22 @@ def _normalize_language(value: str | None) -> str:
         return "unknown"
     key = value.strip().lower()
     return _LANG_NAME_TO_CODE.get(key, key)
+
+
+def _supported_language(language: str | None) -> str | None:
+    """Return ``language`` as a code Qwen3-ASR supports, or None to auto-detect.
+
+    The UI offers whisper's ~100 languages, Qwen knows 30: forcing one it lacks makes
+    qwen-asr raise ``ValueError: Unsupported language`` and would fail the whole job.
+    """
+    if not language:
+        return None
+    code = _normalize_language(language)
+    code = _LANG_CODE_ALIASES.get(code, code)
+    if code in _CODE_TO_LANG_NAME:
+        return code
+    logger.warning("Qwen3-ASR does not support language %r; auto-detecting instead", language)
+    return None
 
 
 def _mlx_available() -> bool:
@@ -88,10 +107,10 @@ def _mlx_available() -> bool:
 
 
 def _cuda_available() -> bool:
+    # The same probe as the GPU lock and the VRAM thresholds, so they never disagree.
+    if gpu.cuda_total_gb() is None:
+        return False
     try:
-        torch = importlib.import_module("torch")
-        if not torch.cuda.is_available():
-            return False
         importlib.import_module("qwen_asr")
 
         return True
@@ -100,8 +119,12 @@ def _cuda_available() -> bool:
         return False
 
 
+@functools.cache
 def backend() -> str | None:
-    """Return ``"mlx"`` or ``"cuda"`` — the Qwen3-ASR backend this machine runs — or None."""
+    """Return ``"mlx"`` or ``"cuda"`` — the Qwen3-ASR backend this machine runs — or None.
+
+    Cached: the probe imports torch/qwen_asr (seconds) and is asked on every request.
+    """
     if _mlx_available():
         return "mlx"
     if _cuda_available():
@@ -119,11 +142,21 @@ def default_engine() -> str:
     return "qwen" if is_available() else "whisper"
 
 
+def _cuda_model_path(model_path: str) -> str:
+    """The PyTorch checkpoint for ``model_path`` on CUDA; raises for other MLX conversions."""
+    if model_path in _CUDA_MODEL_IDS:
+        return _CUDA_MODEL_IDS[model_path]
+    if model_path.startswith("mlx-community/"):
+        raise ValueError(
+            f"{model_path} is an MLX checkpoint; the CUDA backend needs a PyTorch one "
+            f"such as {_CUDA_MODEL_IDS[DEFAULT_QWEN_MODEL]}"
+        )
+    return model_path
+
+
 def resolve_model_path(model_path: str) -> str:
     """Map a default MLX repo id to the PyTorch checkpoint when running on CUDA."""
-    if backend() == "cuda":
-        return _CUDA_MODEL_IDS.get(model_path, model_path)
-    return model_path
+    return _cuda_model_path(model_path) if backend() == "cuda" else model_path
 
 
 def is_model_cached(model_path: str = DEFAULT_QWEN_MODEL) -> bool:
@@ -192,10 +225,11 @@ class _CudaAligner:
 
 
 # Qwen3-ASR-1.7B in bf16 takes ~4.7 GB of VRAM before activations, plus ~1.8 GB for the
-# aligner. Smaller cards load the text decoder in 4-bit NF4 (bitsandbytes) instead: measured
-# on an RTX 3050 4 GB, 2.5 GB peak and ~0.2 RTF with the same text. 8-bit fits too but runs
-# ~8x slower than NF4. The audio encoder and lm_head stay bf16.
-_CUDA_BF16_MIN_VRAM_GB = 8.0
+# aligner: ~6.5 GB, too close to what an "8 GB" card reports (7.6-8.0 GiB). Cards smaller than
+# a "10 GB" one (~9.8 GiB reported) load the text decoder in 4-bit NF4 (bitsandbytes): measured
+# on an RTX 3050 4 GB, 2.5 GB peak (3.3 GB with the aligner) and ~0.2 RTF with the same text.
+# 8-bit fits too but runs ~8x slower than NF4. The audio encoder and lm_head stay bf16.
+_CUDA_BF16_MIN_VRAM_GB = 9.5
 _NF4_SKIP_MODULES = ["audio_tower", "lm_head"]
 
 
@@ -208,9 +242,7 @@ def _cuda_quantization() -> str:
     forced = os.environ.get("TRANSCRIBE_QWEN_CUDA_QUANT", "").strip().lower()
     if forced in ("nf4", "bf16"):
         return forced
-    import torch
-
-    total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+    total_gb = gpu.cuda_total_gb() or 0.0
     return "nf4" if total_gb < _CUDA_BF16_MIN_VRAM_GB else "bf16"
 
 
@@ -235,6 +267,29 @@ def _load_cuda_model(model_path: str, aligner: bool):
     return _CudaASR(Qwen3ASRModel.from_pretrained(model_path, max_inference_batch_size=1, **kwargs))
 
 
+def release_gpu_models() -> None:
+    """Drop cached CUDA models and return their VRAM before another GPU stage loads.
+
+    Called before whisper.cpp and before diarization, under :func:`transcribe.gpu.exclusive`,
+    which keeps another job from using the models meanwhile. MLX models stay cached: unified
+    memory, and reloading them costs seconds.
+    """
+    cuda_models = [key for key, model in _MODEL_CACHE.items()
+                   if isinstance(model, (_CudaASR, _CudaAligner))]
+    for key in cuda_models:
+        del _MODEL_CACHE[key]
+    if cuda_models:
+        import gc
+
+        gc.collect()
+        logger.info("Released %d cached Qwen3-ASR model(s) from the GPU", len(cuda_models))
+    # torch's caching allocator keeps freed blocks (Qwen's, or pyannote's from a diarization)
+    # reserved; return them. Only when torch is loaded — importing it here would cost seconds.
+    torch = sys.modules.get("torch")
+    if torch is not None and gpu.cuda_total_gb() is not None:
+        torch.cuda.empty_cache()
+
+
 def load_qwen_model(model_path: str = DEFAULT_QWEN_MODEL, *, aligner: bool = False):
     """Load (and cache) a Qwen3-ASR model on the available backend.
 
@@ -242,7 +297,8 @@ def load_qwen_model(model_path: str = DEFAULT_QWEN_MODEL, *, aligner: bool = Fal
     MLX loads either kind with one call, qwen-asr needs a different wrapper.
     """
     on_cuda = backend() == "cuda"
-    model_path = resolve_model_path(model_path) if on_cuda else model_path
+    if on_cuda:
+        model_path = _cuda_model_path(model_path)
     cached = _MODEL_CACHE.get(model_path)
     if cached is None:
         cached = _load_cuda_model(model_path, aligner) if on_cuda else _load_mlx_model(model_path)
@@ -471,6 +527,7 @@ def transcribe_regions(
         ``(segments, detected_language)`` where each segment is
         ``{"start": float, "end": float, "text": str}``.
     """
+    requested_language, language = language, _supported_language(language)
     model = load_qwen_model(model_path)
     aligner = load_qwen_model(aligner_model, aligner=True) if align else None
 
@@ -568,7 +625,8 @@ def transcribe_regions(
     segments = _strip_prompt_echo(segments, system_prompt)
 
     if language:
-        detected_language = _normalize_language(language)
+        # The code as the caller gave it ("tl"), not Qwen's alias ("fil").
+        detected_language = _normalize_language(requested_language)
     elif lang_counts:
         detected_language = _normalize_language(max(lang_counts, key=lang_counts.get))
     else:

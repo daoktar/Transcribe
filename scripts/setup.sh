@@ -21,9 +21,13 @@ fi
 if [ "$CUDA" = 1 ]; then
     # Before requirements.txt, which would pull the default wheel: it targets the newest CUDA
     # and needs a newer driver than e.g. Debian 13's 550 (CUDA 12.4). cu126 runs on >= 525;
-    # 2.11 is the last release with a cu126 torchaudio.
-    .venv/bin/python -m pip install "torch==2.11.0" "torchaudio==2.11.0" \
-        --index-url "${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}"
+    # 2.11 is the last release with a cu126 torchaudio. TORCH_CUDA picks another build (cu128
+    # for RTX 50xx, which cu126 lacks kernels for); TORCH_INDEX_URL a mirror serving it. The
+    # +label makes pip replace a plain 2.11.0 already in the venv (a bare ==2.11.0 would count
+    # it as satisfied).
+    TORCH_CUDA="${TORCH_CUDA:-cu126}"
+    .venv/bin/python -m pip install "torch==2.11.0+$TORCH_CUDA" "torchaudio==2.11.0+$TORCH_CUDA" \
+        --index-url "${TORCH_INDEX_URL:-https://download.pytorch.org/whl/$TORCH_CUDA}"
 fi
 .venv/bin/python -m pip install -r requirements.txt
 if [ "$CUDA" = 1 ]; then

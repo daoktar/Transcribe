@@ -11,10 +11,10 @@ from fastapi import HTTPException, UploadFile
 from transcribe import web
 
 
-def _request(app, path, host="127.0.0.1:7860"):
-    """Drive one GET through the ASGI app; returns (status, headers, body)."""
+def _request(app, path, host="127.0.0.1:7860", method="GET", body=b""):
+    """Drive one request through the ASGI app; returns (status, headers, body)."""
     messages = []
-    pending = [{"type": "http.request", "body": b"", "more_body": False}]
+    pending = [{"type": "http.request", "body": body, "more_body": False}]
 
     async def receive():
         if pending:
@@ -29,12 +29,12 @@ def _request(app, path, host="127.0.0.1:7860"):
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
-        "method": "GET",
+        "method": method,
         "scheme": "http",
         "path": path,
         "raw_path": path.encode(),
         "query_string": b"",
-        "headers": [(b"host", host.encode())],
+        "headers": [(b"host", host.encode()), (b"content-type", b"application/json")],
         "client": ("127.0.0.1", 50000),
         "server": ("127.0.0.1", 7860),
     }
@@ -200,9 +200,58 @@ class TestDefaultEngine:
         assert status == 200
         assert json.loads(body)["default_engine"] == expected
 
-    @pytest.mark.parametrize("engine, expected", [(None, "qwen"), ("bogus", "qwen"), ("whisper", "whisper")])
-    def test_request_engine_resolves_to_default(self, engine, expected):
-        with patch("transcribe.qwen_engine.is_available", return_value=True):
+    @pytest.mark.parametrize("engine, expected", [(None, None), ("bogus", None), ("whisper", "whisper")])
+    def test_validator_never_probes_the_backend(self, engine, expected):
+        # Validation runs on the event loop; the default is resolved in start_transcription.
+        with patch("transcribe.qwen_engine.backend", side_effect=AssertionError("probed")):
             body = web.TranscribeRequest(**({} if engine is None else {"engine": engine}))
-            resolved = body.engine if body.engine in web.ENGINE_CHOICES else web.qwen_engine.default_engine()
-        assert resolved == expected
+        assert body.engine == expected
+
+
+def test_lifespan_probes_the_backend_in_the_background():
+    """Startup must not wait for the probe (the macOS app allows the server 30 s to bind)."""
+    import asyncio
+    import threading
+
+    release = threading.Event()
+    calls = []
+
+    def slow_probe():
+        calls.append(threading.current_thread().name)
+        release.wait(5)
+        return None
+
+    app = web.create_app()
+
+    async def run():
+        with patch("transcribe.qwen_engine.backend", side_effect=slow_probe):
+            async with app.router.lifespan_context(app):
+                started = app.state.backend_warmup  # startup finished while the probe blocks
+                assert started.is_alive()
+                release.set()
+                started.join(5)
+
+    asyncio.run(run())
+    assert calls == ["qwen-backend-probe"]
+
+
+@pytest.mark.parametrize("available, expected", [(True, "qwen"), (False, "whisper")])
+def test_start_without_engine_uses_the_default_probed_off_the_loop(registered, available, expected):
+    import json
+    import threading
+
+    job = registered(_make_job(["/m/a.mp3"]))
+    loop_thread = threading.main_thread()
+    probed_in = []
+
+    def probe():
+        probed_in.append(threading.current_thread())
+        return available
+
+    with patch("transcribe.qwen_engine.is_available", side_effect=probe), \
+         patch.object(web, "_run_transcription"):  # the job thread starts but does nothing
+        status, _, _ = _request(web.create_app(), f"/api/transcribe/{job.id}",
+                                method="POST", body=json.dumps({}).encode())
+    assert status == 200
+    assert job.settings["engine"] == expected
+    assert probed_in and all(t is not loop_thread for t in probed_in)

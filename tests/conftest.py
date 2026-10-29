@@ -27,7 +27,20 @@ def empty_result():
 
 
 @pytest.fixture(autouse=True)
-def _no_gpu_model_swap():
-    """Keep whisper model names as given: the real check imports torch and probes the GPU."""
-    with patch("transcribe.core._whisper_model_for_device", side_effect=lambda size: size):
+def _no_gpu_probing():
+    """Keep tests off the real GPU and the same on every machine.
+
+    No VRAM probe (so no GPU lock), whisper names as given, and neither Qwen backend probe —
+    so ``backend()`` is None on every machine (a Mac with mlx-audio installed included), as
+    in CI. Tests of those helpers restore the import-time originals. ``backend()`` is
+    memoized, so its cache is reset around every test.
+    """
+    from transcribe import qwen_engine
+
+    qwen_engine.backend.cache_clear()
+    with patch("transcribe.core._whisper_model_for_device", side_effect=lambda size: size), \
+         patch("transcribe.gpu.cuda_total_gb", return_value=None), \
+         patch("transcribe.qwen_engine._cuda_available", return_value=False), \
+         patch("transcribe.qwen_engine._mlx_available", return_value=False):
         yield
+    qwen_engine.backend.cache_clear()

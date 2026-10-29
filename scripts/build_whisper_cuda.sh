@@ -9,6 +9,16 @@ PY=.venv/bin/python
 VERSION="$("$PY" -c 'import importlib.metadata as m; print(m.version("pywhispercpp"))')"
 # Compute capability of the first GPU (8.6 -> 86): building for one arch is much faster.
 ARCH="${CUDA_ARCH:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)}"
+# A GPU newer than the toolkit (e.g. RTX 50xx, compute 12.0, needs nvcc >= 12.8; Debian 13
+# ships 12.4) would fail deep in a 15-minute build: say so up front.
+# Captured first: under pipefail, `nvcc | grep -q` can fail on SIGPIPE when grep exits early.
+NVCC_ARCHS="$(nvcc --list-gpu-arch)"
+if ! grep -qx "compute_$ARCH" <<<"$NVCC_ARCHS"; then
+    NEWEST="$(tail -1 <<<"$NVCC_ARCHS")"
+    echo "nvcc $(nvcc --version | sed -n 's/.*release \([0-9.]*\),.*/\1/p') cannot build for this GPU (compute_$ARCH)."
+    echo "Install a newer CUDA toolkit, or build PTX the driver can JIT: CUDA_ARCH=${NEWEST#compute_} $0"
+    exit 1
+fi
 
 GGML_CUDA=1 CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=$ARCH" \
     "$PY" -m pip install --no-binary pywhispercpp --no-deps --force-reinstall --no-cache-dir \
