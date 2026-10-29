@@ -6,7 +6,7 @@ import shutil
 from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 # Bundle version — kept in sync with scripts/build_macos.sh via the VERSION env var.
-_VERSION = os.environ.get("VERSION", "1.5.0")
+_VERSION = os.environ.get("VERSION", "1.6.0")
 
 # ---------------------------------------------------------------------------
 # Disable broken contrib hook for webrtcvad (incompatible with webrtcvad-wheels)
