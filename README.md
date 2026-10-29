@@ -50,7 +50,9 @@ passages where the engines disagreed most.
 
 ## Quick Start
 
-**Prerequisites:** Python 3.10+ and ffmpeg on your PATH.
+**Prerequisites:** Python 3.10–3.14 and ffmpeg on your PATH. Python 3.15 (Homebrew's current
+`python3`) does not work yet: torchcodec, which pyannote needs, has no wheels for it.
+`scripts/setup.sh` picks a supported interpreter by itself (`brew install python@3.14` if none).
 
 ```bash
 # macOS

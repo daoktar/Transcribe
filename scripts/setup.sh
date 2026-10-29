@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-# Create .venv in the project root and install requirements (needs Python 3.10+ and ffmpeg).
+# Create .venv in the project root and install requirements (needs Python 3.10-3.14 and ffmpeg).
 # On Linux with an NVIDIA GPU it also sets up the GPU path: CUDA torch, whisper.cpp built
 # with CUDA and the Qwen3-ASR CUDA backend (needs nvcc; TRANSCRIBE_CPU_ONLY=1 skips it).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 command -v ffmpeg >/dev/null || { echo "ffmpeg not found: brew install ffmpeg (macOS) / apt install ffmpeg"; exit 1; }
-PY="${PYTHON:-python3}"
+# Homebrew's python3 is 3.15, which torchcodec (needed by pyannote) has no wheels for, so pip
+# fails. Without $PYTHON take the first interpreter in 3.10-3.14.
+# ponytail: raise the 14 once torchcodec ships cp315 wheels.
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+    for cand in python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+        "$cand" -c 'import sys; sys.exit(not (3, 10) <= sys.version_info[:2] <= (3, 14))' \
+            2>/dev/null && { PY="$cand"; break; }
+    done
+    [ -n "$PY" ] || { echo "Python 3.10-3.14 not found (3.15 lacks torchcodec wheels): brew install python@3.14"; exit 1; }
+fi
 CUDA=0
 if [ "$(uname -s)" = Linux ] && [ "${TRANSCRIBE_CPU_ONLY:-0}" != 1 ] \
         && command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
