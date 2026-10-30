@@ -108,6 +108,11 @@ def diarize(
 
     if not segments:
         return [], 0
+    if not hf_token:
+        raise ValueError(
+            "no HuggingFace token: set HF_TOKEN in the environment or in .env, "
+            "or enter it in the web UI"
+        )
 
     # --- Load model ---
     # Qwen (with its aligner, since diarizing turns alignment on) peaks at 3.3 GB: on a 4 GB
