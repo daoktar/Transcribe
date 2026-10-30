@@ -167,6 +167,27 @@ def test_pyannote_telemetry_forced_off():
     assert os.environ["PYANNOTE_METRICS_ENABLED"] == "false"
 
 
+def test_torchcodec_import_warning_silenced(recwarn):
+    """pyannote's 'torchcodec is not installed correctly' warning is dropped; others are not."""
+    import types
+    import warnings
+
+    import transcribe.diarize as mod
+
+    fake = types.ModuleType("pyannote.audio")
+
+    def _getattr(name):
+        # pyannote's text starts with a newline, which a plain prefix filter misses
+        warnings.warn("\ntorchcodec is not installed correctly so built-in audio decoding will fail.")
+        warnings.warn("unrelated")
+        return MagicMock()
+
+    fake.__getattr__ = _getattr
+    with patch.dict(sys.modules, {"pyannote.audio": fake}), patch.object(mod, "_pipeline", None):
+        mod._load_pipeline("hf_abc")
+    assert [str(w.message) for w in recwarn] == ["unrelated"]
+
+
 # ---------------------------------------------------------------------------
 # TestDiarize
 # ---------------------------------------------------------------------------

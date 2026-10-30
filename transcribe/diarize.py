@@ -7,6 +7,7 @@ mapping speaker turns to segment timestamps via majority-vote overlap.
 
 import hashlib
 import os
+import warnings
 from collections import Counter
 from collections.abc import Callable
 
@@ -37,7 +38,12 @@ def _load_pipeline(hf_token: str):
     hash of the token is kept in memory for cache invalidation — the raw
     token is never stored beyond the ``Pipeline.from_pretrained`` call.
     """
-    from pyannote.audio import Pipeline
+    # pyannote warns on import when torchcodec can't load (the bundled app ships no
+    # torchcodec dylibs, and they need ffmpeg's shared libs). diarize() passes audio
+    # in memory, so its file decoding is never used.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed correctly")
+        from pyannote.audio import Pipeline
 
     import torch
 
