@@ -206,6 +206,16 @@ class TestDiarize:
         assert count == 0
         mock_load.assert_not_called()
 
+    @pytest.mark.parametrize("token", [None, ""])
+    @patch("transcribe.diarize._load_pipeline")
+    def test_missing_token_raises_clear_error(self, mock_load, token):
+        from transcribe.diarize import diarize
+
+        segs = [{"start": 0.0, "end": 1.0, "text": "hi"}]
+        with pytest.raises(ValueError, match="HF_TOKEN"):
+            diarize(self._make_audio(), segs, token)
+        mock_load.assert_not_called()
+
     @patch("transcribe.diarize._load_pipeline")
     def test_releases_qwen_gpu_models_before_loading(self, mock_load):
         from transcribe.diarize import diarize
